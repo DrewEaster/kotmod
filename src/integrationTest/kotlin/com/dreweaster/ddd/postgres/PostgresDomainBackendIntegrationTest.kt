@@ -1,0 +1,303 @@
+package com.dreweaster.ddd.postgres
+
+import app.cash.sqldelight.TransacterImpl
+import com.dreweaster.ddd.AggregateAlreadyExistsException
+import com.dreweaster.ddd.AggregateId
+import com.dreweaster.ddd.AggregateType
+import com.dreweaster.ddd.CommandId
+import com.dreweaster.ddd.CorrelationId
+import com.dreweaster.ddd.EventId
+import com.dreweaster.ddd.EventMetadata
+import com.dreweaster.ddd.OptimisticConcurrencyException
+import com.dreweaster.ddd.PendingEvent
+import com.dreweaster.ddd.postgres.support.IntegrationTest
+import com.dreweaster.ddd.postgres.support.orderEventSerialization
+import com.dreweaster.ddd.support.OrderCancelled
+import com.dreweaster.ddd.support.OrderEvent
+import com.dreweaster.ddd.support.OrderPlaced
+import kotlinx.coroutines.test.runTest
+import org.junit.jupiter.api.BeforeEach
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
+
+class PostgresDomainBackendIntegrationTest : IntegrationTest() {
+    private lateinit var backend: PostgresDomainPersistenceBackend<OrderEvent>
+    private lateinit var pollingBackend: PostgresDomainPollingBackend
+
+    @BeforeEach
+    fun createBackends() {
+        backend = PostgresDomainPersistenceBackend(driver, orderEventSerialization())
+        pollingBackend = PostgresDomainPollingBackend(driver)
+    }
+
+    private fun metadata(
+        eventId: String,
+        aggregateId: String = "o-1",
+        correlationId: CorrelationId? = null,
+    ) = EventMetadata(
+        eventId = EventId(eventId),
+        aggregateType = AggregateType("Order"),
+        aggregateId = AggregateId(aggregateId),
+        causationId = CommandId("cmd-1"),
+        correlationId = correlationId,
+        timestamp = kotlin.time.Instant.parse("2026-04-18T10:00:00Z"),
+    )
+
+    @Test
+    fun `loadMeta returns null when aggregate does not exist`() =
+        runTest {
+            val meta = backend.loadMeta(AggregateType("Order"), AggregateId("o-1"))
+            assertNull(meta)
+        }
+
+    @Test
+    fun `saveMeta with null expectedVersion inserts at version 1`() =
+        runTest {
+            val type = AggregateType("Order")
+            val id = AggregateId("o-1")
+            backend.saveMeta(type, id, expectedVersion = null)
+            val meta = backend.loadMeta(type, id)
+            assertNotNull(meta)
+            assertEquals(1L, meta.version)
+        }
+
+    @Test
+    fun `saveMeta with null expectedVersion twice throws AggregateAlreadyExistsException`() =
+        runTest {
+            val type = AggregateType("Order")
+            val id = AggregateId("o-1")
+            backend.saveMeta(type, id, expectedVersion = null)
+            assertFailsWith<AggregateAlreadyExistsException> {
+                backend.saveMeta(type, id, expectedVersion = null)
+            }
+        }
+
+    @Test
+    fun `saveMeta with matching expectedVersion increments version`() =
+        runTest {
+            val type = AggregateType("Order")
+            val id = AggregateId("o-1")
+            backend.saveMeta(type, id, expectedVersion = null)
+            backend.saveMeta(type, id, expectedVersion = 1L)
+            val meta = backend.loadMeta(type, id)
+            assertEquals(2L, meta!!.version)
+        }
+
+    @Test
+    fun `saveMeta with stale expectedVersion throws OptimisticConcurrencyException`() =
+        runTest {
+            val type = AggregateType("Order")
+            val id = AggregateId("o-1")
+            backend.saveMeta(type, id, expectedVersion = null)
+            assertFailsWith<OptimisticConcurrencyException> {
+                backend.saveMeta(type, id, expectedVersion = 99L)
+            }
+        }
+
+    @Test
+    fun `appendEvents writes rows with serialized payload and metadata`() =
+        runTest {
+            val type = AggregateType("Order")
+            val id = AggregateId("o-1")
+            val now = kotlin.time.Instant.parse("2026-04-18T10:00:00Z")
+
+            fun metadata(
+                eventId: String,
+                correlation: CorrelationId?,
+            ) = EventMetadata(
+                eventId = EventId(eventId),
+                aggregateType = type,
+                aggregateId = id,
+                causationId = CommandId("cmd-1"),
+                correlationId = correlation,
+                timestamp = now,
+            )
+            backend.appendEvents(
+                listOf(
+                    PendingEvent(metadata("e-1", CorrelationId("corr-1")), OrderPlaced("widgets")),
+                    PendingEvent(metadata("e-2", CorrelationId("corr-1")), OrderCancelled("widgets", "sold out")),
+                ),
+            )
+
+            dataSource.connection.use { conn ->
+                conn
+                    .createStatement()
+                    .executeQuery(
+                        "SELECT event_id, event_type, event_version, event_payload, causation_id, correlation_id " +
+                            "FROM ddd_domain_event ORDER BY global_offset",
+                    ).use { rs ->
+                        assertTrue(rs.next())
+                        assertEquals("e-1", rs.getString("event_id"))
+                        assertEquals("com.dreweaster.ddd.support.OrderPlaced", rs.getString("event_type"))
+                        assertEquals(1, rs.getInt("event_version"))
+                        assertEquals("""{"name":"widgets"}""", rs.getString("event_payload"))
+                        assertEquals("cmd-1", rs.getString("causation_id"))
+                        assertEquals("corr-1", rs.getString("correlation_id"))
+
+                        assertTrue(rs.next())
+                        assertEquals("e-2", rs.getString("event_id"))
+                        assertEquals("com.dreweaster.ddd.support.OrderCancelled", rs.getString("event_type"))
+                        assertEquals("""{"name":"widgets","reason":"sold out"}""", rs.getString("event_payload"))
+                    }
+            }
+        }
+
+    @Test
+    fun `appendEvents with null correlation writes NULL column`() =
+        runTest {
+            val type = AggregateType("Order")
+            val id = AggregateId("o-1")
+            val now = kotlin.time.Instant.parse("2026-04-18T10:00:00Z")
+
+            backend.appendEvents(
+                listOf(
+                    PendingEvent(
+                        metadata =
+                            EventMetadata(
+                                eventId = EventId("e-1"),
+                                aggregateType = type,
+                                aggregateId = id,
+                                causationId = CommandId("cmd-1"),
+                                correlationId = null,
+                                timestamp = now,
+                            ),
+                        event = OrderPlaced("widgets"),
+                    ),
+                ),
+            )
+
+            dataSource.connection.use { conn ->
+                conn
+                    .createStatement()
+                    .executeQuery(
+                        "SELECT correlation_id FROM ddd_domain_event",
+                    ).use { rs ->
+                        assertTrue(rs.next())
+                        rs.getString("correlation_id")
+                        assertTrue(rs.wasNull())
+                    }
+            }
+        }
+
+    @Test
+    fun `appendEvents with empty list is a no-op`() =
+        runTest {
+            backend.appendEvents(emptyList())
+
+            dataSource.connection.use { conn ->
+                conn.createStatement().executeQuery("SELECT COUNT(*) FROM ddd_domain_event").use { rs ->
+                    assertTrue(rs.next())
+                    assertEquals(0, rs.getInt(1))
+                }
+            }
+        }
+
+    @Test
+    fun `wasCommandHandled returns false when unseen`() =
+        runTest {
+            val seen = backend.wasCommandHandled(AggregateType("Order"), AggregateId("o-1"), CommandId("cmd-1"))
+            assertEquals(false, seen)
+        }
+
+    @Test
+    fun `recordCommandHandled then wasCommandHandled returns true`() =
+        runTest {
+            val type = AggregateType("Order")
+            val id = AggregateId("o-1")
+            val cmd = CommandId("cmd-1")
+
+            backend.recordCommandHandled(type, id, cmd)
+            val seen = backend.wasCommandHandled(type, id, cmd)
+
+            assertTrue(seen)
+        }
+
+    @Test
+    fun `wasCommandHandled is scoped per type, id, and commandId`() =
+        runTest {
+            backend.recordCommandHandled(AggregateType("Order"), AggregateId("o-1"), CommandId("cmd-1"))
+
+            assertEquals(false, backend.wasCommandHandled(AggregateType("Order"), AggregateId("o-2"), CommandId("cmd-1")))
+            assertEquals(false, backend.wasCommandHandled(AggregateType("Order"), AggregateId("o-1"), CommandId("cmd-2")))
+            assertEquals(false, backend.wasCommandHandled(AggregateType("Widget"), AggregateId("o-1"), CommandId("cmd-1")))
+        }
+
+    @Test
+    fun `backend operations inside a driver transaction roll back together`() =
+        runTest {
+            val type = AggregateType("Order")
+            val id = AggregateId("o-1")
+            val now = kotlin.time.Instant.parse("2026-04-18T10:00:00Z")
+
+            // Same shape as a SQLDelight-generated Database: a Transacter over the backend's driver.
+            val transacter = object : TransacterImpl(driver) {}
+
+            try {
+                transacter.transaction {
+                    backend.saveMeta(type, id, expectedVersion = null)
+                    backend.appendEvents(
+                        listOf(
+                            PendingEvent(
+                                metadata =
+                                    EventMetadata(
+                                        eventId = EventId("e-1"),
+                                        aggregateType = type,
+                                        aggregateId = id,
+                                        causationId = CommandId("cmd-1"),
+                                        correlationId = null,
+                                        timestamp = now,
+                                    ),
+                                event = OrderPlaced("widgets"),
+                            ),
+                        ),
+                    )
+                    backend.recordCommandHandled(type, id, CommandId("cmd-1"))
+                    throw RuntimeException("simulated failure")
+                }
+            } catch (e: RuntimeException) {
+                // expected
+            }
+
+            assertNull(backend.loadMeta(type, id))
+            dataSource.connection.use { conn ->
+                conn.createStatement().executeQuery("SELECT COUNT(*) FROM ddd_domain_event").use { rs ->
+                    assertTrue(rs.next())
+                    assertEquals(0, rs.getInt(1))
+                }
+                conn.createStatement().executeQuery("SELECT COUNT(*) FROM ddd_command_history").use { rs ->
+                    assertTrue(rs.next())
+                    assertEquals(0, rs.getInt(1))
+                }
+            }
+        }
+
+    @Test
+    fun `readEventsAfter returns events after the given offset in offset order`() =
+        runTest {
+            backend.appendEvents(
+                listOf(
+                    PendingEvent(metadata("e-1", correlationId = CorrelationId("corr-1")), OrderPlaced("widgets")),
+                    PendingEvent(metadata("e-2"), OrderCancelled("widgets", "sold out")),
+                    PendingEvent(metadata("e-3", aggregateId = "o-2"), OrderPlaced("gadgets")),
+                ),
+            )
+
+            val all = pollingBackend.readEventsAfter(lastOffset = -1, limit = 10)
+            assertEquals(listOf(1L, 2L, 3L), all.map { it.globalOffset })
+            assertEquals(listOf("e-1", "e-2", "e-3"), all.map { it.metadata.eventId.value })
+
+            val first = all.first()
+            assertEquals(metadata("e-1", correlationId = CorrelationId("corr-1")), first.metadata)
+            assertEquals("com.dreweaster.ddd.support.OrderPlaced", first.serialized.type)
+            assertEquals("""{"name":"widgets"}""", first.serialized.payload)
+            assertNull(all[1].metadata.correlationId)
+
+            assertEquals(listOf("e-2", "e-3"), pollingBackend.readEventsAfter(lastOffset = 1, limit = 10).map { it.metadata.eventId.value })
+            assertEquals(listOf("e-1", "e-2"), pollingBackend.readEventsAfter(lastOffset = -1, limit = 2).map { it.metadata.eventId.value })
+            assertEquals(emptyList(), pollingBackend.readEventsAfter(lastOffset = 3, limit = 10))
+        }
+}
