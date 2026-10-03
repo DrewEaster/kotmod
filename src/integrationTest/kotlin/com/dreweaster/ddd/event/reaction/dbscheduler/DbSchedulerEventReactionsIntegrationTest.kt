@@ -1,10 +1,23 @@
 package com.dreweaster.ddd.event.reaction.dbscheduler
 
+import com.dreweaster.ddd.AggregateId
+import com.dreweaster.ddd.AggregateType
+import com.dreweaster.ddd.CommandId
+import com.dreweaster.ddd.EventId
+import com.dreweaster.ddd.EventMetadata
+import com.dreweaster.ddd.PendingEvent
+import com.dreweaster.ddd.event.reaction.EventReaction
 import com.dreweaster.ddd.event.reaction.EventReactionCompletionResult
 import com.dreweaster.ddd.event.reaction.EventReactionExecutionResult
 import com.dreweaster.ddd.event.reaction.EventReactionId
 import com.dreweaster.ddd.event.reaction.RetrySignal
+import com.dreweaster.ddd.outbox.AggregateEventOutbox
+import com.dreweaster.ddd.postgres.PostgresDomainPersistenceBackend
+import com.dreweaster.ddd.postgres.PostgresDomainPollingBackend
+import com.dreweaster.ddd.postgres.PostgresOffsetManager
 import com.dreweaster.ddd.postgres.support.IntegrationTest
+import com.dreweaster.ddd.postgres.support.orderEventSerialization
+import com.dreweaster.ddd.support.OrderPlaced
 import com.github.kagkarlsson.scheduler.task.TaskInstance
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -223,5 +236,72 @@ class DbSchedulerEventReactionsIntegrationTest : IntegrationTest() {
                 setOf(TestTrigger("confirm"), TestTrigger("charge-receipt")),
                 notificationRecorder.attempts.map { it.trigger }.toSet(),
             )
+        }
+
+    @Test
+    fun `outbox delivers reactions end to end through db-scheduler and saves its offset`() =
+        runBlocking {
+            val persistence = PostgresDomainPersistenceBackend(driver, orderEventSerialization())
+            val offsets = PostgresOffsetManager(driver)
+            listOf("e-1", "e-2").forEachIndexed { index, eventId ->
+                persistence.appendEvents(
+                    listOf(
+                        PendingEvent(
+                            metadata =
+                                EventMetadata(
+                                    eventId = EventId(eventId),
+                                    aggregateType = AggregateType("Order"),
+                                    aggregateId = AggregateId("o-$index"),
+                                    causationId = CommandId("cmd-$eventId"),
+                                    correlationId = null,
+                                    timestamp = kotlin.time.Instant.parse("2026-10-03T10:00:00Z"),
+                                ),
+                            event = OrderPlaced("widgets-$index"),
+                        ),
+                    ),
+                )
+            }
+
+            val reactions = DbSchedulerEventReactions("order-reactions", TestTriggerSerializer)
+            val scheduler = testScheduler(dataSource, reactions.task)
+            val recorder = ReactionRecorder()
+            val executor = testExecutor(reactions, scheduler, recorder)
+            val outbox =
+                AggregateEventOutbox(
+                    backend = PostgresDomainPollingBackend(driver),
+                    executor = executor,
+                    eventToReactions = { event ->
+                        listOf(
+                            EventReaction(
+                                id = EventReactionId("charge-${event.metadata.eventId.value}"),
+                                trigger = TestTrigger("charge-${event.metadata.aggregateId.value}"),
+                            ),
+                        )
+                    },
+                    getOffset = { offsets.getOffset("order-outbox") },
+                    saveOffset = { offsets.saveOffset("order-outbox", it) },
+                    isLeader = { true },
+                    pollInterval = 50.milliseconds,
+                )
+
+            running(scheduler, executor) {
+                outbox.start()
+                try {
+                    eventually { recorder.completions.size == 2 }
+                } finally {
+                    outbox.stop()
+                }
+            }
+
+            assertEquals(
+                setOf(EventReactionId("charge-e-1"), EventReactionId("charge-e-2")),
+                recorder.completions.map { it.first }.toSet(),
+            )
+            assertEquals(
+                setOf(TestTrigger("charge-o-0"), TestTrigger("charge-o-1")),
+                recorder.attempts.map { it.trigger }.toSet(),
+            )
+            assertEquals(2L, offsets.getOffset("order-outbox"))
+            assertTrue(scheduler.getScheduledExecutionsForTask("order-reactions", String::class.java).isEmpty())
         }
 }
