@@ -13,11 +13,24 @@ private sealed class ReadPhaseResult {
     ) : ReadPhaseResult()
 }
 
+/**
+ * Records domain events for aggregates of one [AggregateType] that have no stored state.
+ *
+ * Use it where something needs an event log and idempotent commands but not a [Repository]. Each call
+ * is idempotent per command id, versions the aggregate with optimistic concurrency, and appends its
+ * events in one transaction.
+ */
 class EventProducer<E : DomainEvent>(
     private val aggregateType: AggregateType,
     private val backend: DomainPersistenceBackend<E>,
     private val transacter: Transacter,
 ) {
+    /**
+     * Appends [events] for aggregate [id], creating the aggregate's bookkeeping on first use.
+     *
+     * Does nothing if [commandId] has already been handled for [id]. Throws
+     * [OptimisticConcurrencyException] if another call changed the aggregate concurrently.
+     */
     suspend fun emit(
         id: AggregateId,
         events: List<E>,

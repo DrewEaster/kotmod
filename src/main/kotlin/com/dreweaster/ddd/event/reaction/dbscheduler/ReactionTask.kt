@@ -17,6 +17,7 @@ import kotlin.time.Duration.Companion.seconds
 
 private val log = LoggerFactory.getLogger("com.dreweaster.ddd.event.reaction.dbscheduler.ReactionTask")
 
+/** Builds the db-scheduler task that decodes each stored reaction and runs it through the subscribed executor. */
 internal fun <T : EventReactionTrigger> reactionTask(
     taskName: String,
     triggerSerializer: EventReactionTriggerSerializer<T>,

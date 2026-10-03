@@ -27,6 +27,12 @@ import kotlin.time.toJavaInstant
 import kotlin.time.toKotlinInstant
 import kotlin.use
 
+/**
+ * Postgres implementation of [DomainPersistenceBackend], using the tables in [DddSchema] and plain JDBC.
+ *
+ * Every call borrows a connection from [driver], so calls made inside a SQLDelight transaction on that
+ * driver share the transaction. Events are serialized with [serialization] as they are appended.
+ */
 class PostgresDomainPersistenceBackend<E : DomainEvent>(
     private val driver: JdbcDriver,
     private val serialization: DataSerializationContext<E>,
@@ -196,6 +202,7 @@ class PostgresDomainPersistenceBackend<E : DomainEvent>(
     }
 }
 
+/** Postgres implementation of [DomainEventPollingBackend], reading `ddd_domain_event` in `global_offset` order. */
 class PostgresDomainPollingBackend(
     private val driver: JdbcDriver,
     private val eventAttributeColumns: Set<String> = setOf(),

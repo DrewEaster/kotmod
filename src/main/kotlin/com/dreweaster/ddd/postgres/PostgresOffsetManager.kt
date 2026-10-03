@@ -4,11 +4,9 @@ import app.cash.sqldelight.driver.jdbc.JdbcDriver
 import java.sql.Connection
 
 /**
- * Persists the last processed `global_offset` for named event consumers (e.g. an
- * [com.dreweaster.ddd.outbox.AggregateEventOutbox] or a
- * [com.dreweaster.ddd.contract.PublicEventContract]) in the `ddd_consumer_offset` table.
+ * Remembers how far each event consumer has read through the event log, in `ddd_consumer_offset`.
  *
- * Wire into a poller with:
+ * Each poller uses its own consumer name:
  * ```
  * getOffset = { offsets.getOffset("orders-outbox") },
  * saveOffset = { offsets.saveOffset("orders-outbox", it) },
@@ -17,7 +15,7 @@ import java.sql.Connection
 class PostgresOffsetManager(
     private val driver: JdbcDriver,
 ) {
-    /** Returns the last saved offset for [consumerName], or [INITIAL_OFFSET] if none has been saved. */
+    /** Returns the last offset saved for [consumerName], or [INITIAL_OFFSET] if it has never saved one. */
     fun getOffset(consumerName: String): Long =
         useConnection { conn ->
             conn
@@ -31,6 +29,7 @@ class PostgresOffsetManager(
                 }
         }
 
+    /** Saves [offset] as the last offset processed by [consumerName], replacing any previous value. */
     fun saveOffset(
         consumerName: String,
         offset: Long,
@@ -60,7 +59,7 @@ class PostgresOffsetManager(
     }
 
     companion object {
-        /** Offset returned for a consumer with no saved offset; `global_offset` starts at 1. */
+        /** Offset for a consumer that has not processed anything yet; lower than any real `global_offset`. */
         const val INITIAL_OFFSET: Long = -1L
     }
 }

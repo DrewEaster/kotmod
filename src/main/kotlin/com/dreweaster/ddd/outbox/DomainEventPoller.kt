@@ -15,6 +15,11 @@ import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
 import kotlin.time.Duration
 
+/**
+ * The polling loop shared by [AggregateEventOutbox] and [com.dreweaster.ddd.contract.PublicEventContract]:
+ * reads events after the saved offset, hands each one to [handleEvent], and saves the offset after each
+ * event. An exception stops the current batch; the next poll resumes from the last saved offset.
+ */
 internal class DomainEventPoller(
     private val backend: DomainEventPollingBackend,
     private val getOffset: () -> Long,

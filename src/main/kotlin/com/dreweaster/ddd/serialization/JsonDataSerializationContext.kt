@@ -11,6 +11,14 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 
+/**
+ * A [DataSerializationContext] that stores events as JSON and can read every historical version of
+ * each registered event type.
+ *
+ * Events are always written at their latest version. When reading, a payload stored at an older
+ * version is decoded to JSON and passed through each later migration in order before being decoded
+ * into the current class. Build one with [jsonDataSerializationContext].
+ */
 class JsonDataSerializationContext<E : DomainEvent> internal constructor(
     serializers: List<DataSerializer<out E>>,
     private val json: Json,
@@ -60,7 +68,7 @@ class JsonDataSerializationContext<E : DomainEvent> internal constructor(
         return entry(serialized.payload)
     }
 
-    /** Returns the full `(className, version)` history chain for the current event type — oldest first, newest last. */
+    /** Returns the versions an event type has been stored under, oldest first; empty if [currentEventType] is not registered. */
     fun historyFor(currentEventType: String): List<VersionMetadata> = history[currentEventType] ?: emptyList()
 
     private inner class MappingConfiguration(
@@ -166,14 +174,28 @@ class JsonDataSerializationContext<E : DomainEvent> internal constructor(
     ) : Migration
 }
 
+/** Collects the event serializers for [jsonDataSerializationContext]. */
 class JsonDataSerializationContextBuilder<E : DomainEvent> {
     internal val serializers = mutableListOf<DataSerializer<out E>>()
 
+    /** Registers this event serializer, e.g. `+OrderPlaced.serializer().toEventSerializer()`. */
     operator fun DataSerializer<out E>.unaryPlus() {
         serializers.add(this)
     }
 }
 
+/**
+ * Builds a [JsonDataSerializationContext] from the event serializers registered in [init]:
+ * ```
+ * jsonDataSerializationContext<OrderEvent> {
+ *     +OrderPlaced.serializer().toEventSerializer()
+ *     +OrderCancelled.serializer().toEventSerializer {
+ *         migrateFormat { json -> JsonObject(json + ("reason" to JsonPrimitive("unknown"))) }
+ *     }
+ * }
+ * ```
+ * @param json the kotlinx `Json` instance used for encoding and decoding.
+ */
 fun <E : DomainEvent> jsonDataSerializationContext(
     json: Json = Json,
     init: JsonDataSerializationContextBuilder<E>.() -> Unit,

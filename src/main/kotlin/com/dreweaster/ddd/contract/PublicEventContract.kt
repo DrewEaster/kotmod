@@ -16,6 +16,17 @@ import org.slf4j.LoggerFactory
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 
+/**
+ * Publishes a bounded context's internal domain events to other contexts as public events.
+ *
+ * While running, it polls the event log, deserializes each event with [serialization], maps it with
+ * [internalToPublic] (returning `null` keeps an event private) and passes the public event to every
+ * subscriber. Each subscriber turns it into event reactions for its own executor. Offsets, leadership
+ * and redelivery work as in [com.dreweaster.ddd.outbox.AggregateEventOutbox].
+ *
+ * @param I the internal domain event type.
+ * @param E the public event type.
+ */
 class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
     private val backend: DomainEventPollingBackend,
     private val serialization: DataSerializationContext<I>,
@@ -52,6 +63,10 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
     private val subscriptions = mutableListOf<Subscription<*, E>>()
     private var started = false
 
+    /**
+     * Registers a subscriber: [block] maps each public event to reactions dispatched to [executor].
+     * Must be called before [start].
+     */
     fun <T : EventReactionTrigger> subscribe(
         executor: EventReactionExecutor<T, *>,
         block: (PublicEventEnvelope<E>) -> List<EventReaction<T>>,
@@ -72,14 +87,16 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
             handleEvent = ::handleEvent,
         )
 
+    /** Starts polling in the background. No further subscribers can be added afterwards. */
     fun start() {
         started = true
         poller.start()
     }
 
+    /** Stops polling and waits for the current poll to finish. */
     suspend fun stop() = poller.stop()
 
-    /** Visible for unit tests. Runs a single poll cycle without the loop wrapper. */
+    /** Runs a single poll. For tests only. */
     internal suspend fun tickForTest() = poller.tickForTest()
 
     private suspend fun handleEvent(envelope: PersistedEvent) {

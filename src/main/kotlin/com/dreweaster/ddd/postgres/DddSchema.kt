@@ -1,13 +1,12 @@
 package com.dreweaster.ddd.postgres
 
 /**
- * SQL schema required by [PostgresDomainPersistenceBackend] and [PostgresOffsetManager]. Consuming apps copy these
- * statements verbatim into their own Flyway migrations.
- *
- * The library's integration tests use this string directly to set up their
- * test databases.
+ * The Postgres tables the library's Postgres classes rely on: aggregate bookkeeping, the domain event
+ * log, handled-command history and consumer offsets. Apps copy [ddl] into their own migrations; the
+ * library's integration tests apply it directly.
  */
 object DddSchema {
+    /** The `CREATE TABLE` / `CREATE INDEX` statements, as one script. */
     val ddl: String =
         """
         CREATE TABLE ddd_aggregate_root (

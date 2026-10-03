@@ -5,12 +5,38 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlin.time.toKotlinInstant
 
+/**
+ * Runs commands against aggregates of one [AggregateType] whose state is stored by a [Repository].
+ *
+ * Each command runs in three phases:
+ * 1. **Read:** if the command id has already been handled, return the current state without doing
+ *    anything else (commands are idempotent). Otherwise load the aggregate's version and state.
+ * 2. **Command:** call the app's block, which returns the new state and the events it raised. No
+ *    database work happens during this phase.
+ * 3. **Write:** in one transaction, advance the aggregate's version (optimistic concurrency), save the
+ *    new state, append the events and record the command as handled.
+ *
+ * Events appended here are later picked up by [com.dreweaster.ddd.outbox.AggregateEventOutbox] and
+ * [com.dreweaster.ddd.contract.PublicEventContract].
+ *
+ * @param S the aggregate's state type.
+ * @param E the aggregate's domain event type.
+ */
 class AggregateManager<S : Any, E : DomainEvent>(
     @PublishedApi internal val aggregateType: AggregateType,
     private val repository: Repository<S>,
     private val backend: DomainPersistenceBackend<E>,
     private val transacter: Transacter,
 ) {
+    /**
+     * Creates aggregate [id] from the state and events returned by [block].
+     *
+     * If [commandId] has already been handled for [id], the stored state is returned and [block] is not
+     * called. Throws [AggregateAlreadyExistsException] if the aggregate already exists. A random command id
+     * is used when none is given, which makes the call non-idempotent.
+     *
+     * @return the new state.
+     */
     suspend fun create(
         id: AggregateId,
         commandId: CommandId? = null,
@@ -57,6 +83,16 @@ class AggregateManager<S : Any, E : DomainEvent>(
         return newState
     }
 
+    /**
+     * Applies a command to existing aggregate [id]: [block] receives the current state and returns the new
+     * state and the events it raised.
+     *
+     * If [commandId] has already been handled for [id], the stored state is returned and [block] is not
+     * called. Throws [AggregateNotFoundException] if the aggregate does not exist and
+     * [OptimisticConcurrencyException] if it changed concurrently.
+     *
+     * @return the new state.
+     */
     suspend fun execute(
         id: AggregateId,
         commandId: CommandId? = null,
@@ -64,6 +100,11 @@ class AggregateManager<S : Any, E : DomainEvent>(
         block: suspend (S) -> Pair<S, List<E>>,
     ): S = executeCore(id, commandId, correlationId) { current -> block(current) }
 
+    /**
+     * Like [execute], but only applies the command when the current state is of subtype [T], throwing
+     * [UnexpectedAggregateStateException] otherwise. Useful for state machines, e.g. a command that only
+     * applies to a pending order.
+     */
     @JvmName("executeNarrowed")
     suspend inline fun <reified T : S> execute(
         id: AggregateId,

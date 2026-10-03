@@ -11,6 +11,7 @@ import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
 import java.time.Instant
 
+/** Schedules each dispatched reaction as a db-scheduler task instance, unless one with the same id is already pending. */
 internal class DbSchedulerTriggerSink<T : EventReactionTrigger>(
     private val taskName: String,
     private val triggerSerializer: EventReactionTriggerSerializer<T>,

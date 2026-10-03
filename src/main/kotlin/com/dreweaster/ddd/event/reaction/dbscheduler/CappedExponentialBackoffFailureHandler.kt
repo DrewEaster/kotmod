@@ -8,10 +8,8 @@ import kotlin.time.Duration
 import kotlin.time.toJavaDuration
 
 /**
- * Handles failures that happen *outside* the subscribed reaction handler (undecodable task data,
- * a trigger the app's serializer rejects, a handler that throws). Retries indefinitely with
- * exponential backoff capped at [maximumDelay], so rows recover once a fix is deployed.
- * db-scheduler's own ExponentialBackoffFailureHandler has no cap, hence this class.
+ * Retries task executions that failed outside the reaction handler (e.g. unreadable task data), doubling
+ * the delay from [initialDelay] up to [maximumDelay] and never giving up.
  */
 internal class CappedExponentialBackoffFailureHandler(
     private val initialDelay: Duration,

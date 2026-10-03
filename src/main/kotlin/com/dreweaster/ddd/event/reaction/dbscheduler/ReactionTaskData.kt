@@ -3,10 +3,7 @@ package com.dreweaster.ddd.event.reaction.dbscheduler
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
-/**
- * The payload stored in db-scheduler's `task_data` column. Always a plain [String] as far as
- * db-scheduler is concerned, so it works with whichever db-scheduler serializer the app configures.
- */
+/** The data stored with each db-scheduler task instance: the serialized trigger and its retry count, encoded as a JSON string. */
 @Serializable
 internal data class ReactionTaskData(
     val trigger: String,

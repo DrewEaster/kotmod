@@ -10,10 +10,7 @@ import com.dreweaster.ddd.event.reaction.RetrySignal
 
 internal typealias ReactionHandler<T> = suspend (EventReactionId, EventReactionExecutionId, T, RetryCount) -> RetrySignal.Retry?
 
-/**
- * Holds the handler of the single [com.dreweaster.ddd.event.reaction.EventReactionExecutor] subscribed
- * to this task. The db-scheduler task reads [handler] on every execution.
- */
+/** Holds the handler of the one executor subscribed to a db-scheduler task; the task reads it on every execution. */
 internal class DbSchedulerTriggerSource<T : EventReactionTrigger> : EventReactionTriggerSource<T> {
     @Volatile
     var handler: ReactionHandler<T>? = null

@@ -6,13 +6,10 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
 import kotlin.time.toJavaDuration
 
-/**
- * Longest delay a retry is rescheduled by. Larger delays (including [Duration.INFINITE]) cannot be represented
- * as an [Instant] or stored by db-scheduler, so they are capped rather than failing an already-executed reaction.
- */
+/** Longest retry delay the task will reschedule by; larger delays (including infinite ones) are capped to it. */
 internal val MAX_RETRY_DELAY: Duration = 3650.days
 
-/** What the db-scheduler task should do with its row once an execution has finished. */
+/** What the db-scheduler task does with its row after an execution: remove it, or reschedule it with new data. */
 internal sealed interface ReactionOutcome {
     data object Remove : ReactionOutcome
 
@@ -22,6 +19,7 @@ internal sealed interface ReactionOutcome {
     ) : ReactionOutcome
 }
 
+/** Removes the row if the reaction finished, or reschedules it after the requested delay with the retry count incremented. */
 internal fun outcomeAfterExecution(
     result: RetrySignal.Retry?,
     data: ReactionTaskData,
@@ -36,6 +34,7 @@ internal fun outcomeAfterExecution(
             )
     }
 
+/** Reschedules the row after [delay] with its data unchanged, for executions that arrive before an executor has subscribed. */
 internal fun outcomeWhenUnsubscribed(
     rawTaskData: String,
     now: Instant,

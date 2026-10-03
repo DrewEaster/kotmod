@@ -9,6 +9,18 @@ import org.slf4j.LoggerFactory
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 
+/**
+ * Turns domain events into event reactions (the transactional outbox pattern).
+ *
+ * While running, it polls the event log after the offset returned by [getOffset], calls
+ * [eventToReactions] for each event and dispatches the resulting reactions to [executor]. The offset is
+ * saved after all of an event's reactions are dispatched, so an event is never skipped; after a crash
+ * it may be dispatched again, which is why reaction ids should be deterministic. Polling only happens
+ * while [isLeader] returns `true`, so run one instance per cluster.
+ *
+ * @param pollInterval pause between polls.
+ * @param batchSize maximum number of events read per poll.
+ */
 class AggregateEventOutbox<T : EventReactionTrigger>(
     private val backend: DomainEventPollingBackend,
     private val executor: EventReactionExecutor<T, *>,
@@ -44,10 +56,12 @@ class AggregateEventOutbox<T : EventReactionTrigger>(
             },
         )
 
+    /** Starts polling in the background. Does nothing if already started. */
     fun start() = poller.start()
 
+    /** Stops polling and waits for the current poll to finish. */
     suspend fun stop() = poller.stop()
 
-    /** Visible for unit tests. Runs a single poll cycle without the loop wrapper. */
+    /** Runs a single poll. For tests only. */
     internal suspend fun tickForTest() = poller.tickForTest()
 }
