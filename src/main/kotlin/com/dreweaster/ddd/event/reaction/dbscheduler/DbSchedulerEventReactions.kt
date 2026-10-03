@@ -32,6 +32,11 @@ import kotlin.time.Duration.Companion.seconds
  *
  * Delivery is at-least-once: reaction ids must be deterministic per (event, reaction kind) so that
  * duplicate dispatches are absorbed while pending, and handlers must be idempotent.
+ *
+ * If `scheduler.stop()` interrupts a reaction that is still running, the executor's
+ * `failureRetryHandler` receives a [kotlinx.coroutines.CancellationException]; return
+ * `RetrySignal.Retry` for it. The interrupted reaction is retried by db-scheduler either way, so
+ * reporting it as a permanent failure would be wrong.
  * The app must create db-scheduler's `scheduled_tasks` table itself.
  */
 class DbSchedulerEventReactions<T : EventReactionTrigger>(

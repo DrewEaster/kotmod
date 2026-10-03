@@ -146,7 +146,10 @@ db-scheduler guarantees a row is executed by one node at a time; no extra lockin
    The executor is not changed as part of this work.
 3. **Crash or forced shutdown mid-execution** — the row becomes a dead execution and db-scheduler's default
    dead-execution handler revives it with the same `retryCount`. Graceful `scheduler.stop()` waits for running
-   executions first; executions interrupted at the deadline cancel their `runBlocking` and are revived later.
+   executions first; executions interrupted at the deadline cancel their `runBlocking`. The executor sees the
+   resulting `CancellationException` as an `EventReactionFailed` and calls `failureRetryHandler` (which should
+   return `Retry` for it — documented on `DbSchedulerEventReactions`); the interrupted `runBlocking` then throws,
+   so db-scheduler's failure handler reschedules the row with the same `retryCount`.
 4. **Failure in `remove` / `reschedule`** — the row is left picked, becomes a dead execution and is re-run;
    `onCompletion` may run more than once (covered by the idempotency rule).
 5. **`publish` failure** (`scheduleIfNotExists` throws) — propagates to the poller, which halts the batch without
