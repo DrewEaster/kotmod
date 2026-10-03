@@ -5,11 +5,14 @@ import com.dreweaster.ddd.event.reaction.EventReactionExecutionResult
 import com.dreweaster.ddd.event.reaction.EventReactionId
 import com.dreweaster.ddd.event.reaction.RetrySignal
 import com.dreweaster.ddd.postgres.support.IntegrationTest
+import com.github.kagkarlsson.scheduler.task.TaskInstance
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import java.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.milliseconds
 
 class DbSchedulerEventReactionsIntegrationTest : IntegrationTest() {
     private fun rowExists(
@@ -115,5 +118,110 @@ class DbSchedulerEventReactionsIntegrationTest : IntegrationTest() {
             assertEquals(1, recorder.attempts.size)
             assertEquals(listOf(EventReactionId("r-1") to failure), recorder.completions.toList())
             assertTrue(scheduler.getScheduledExecutionsForTask("test-reactions", String::class.java).isEmpty())
+        }
+
+    @Test
+    fun `reaction picked up before the executor subscribes is rescheduled and runs once it does`() =
+        runBlocking {
+            val reactions = DbSchedulerEventReactions("test-reactions", TestTriggerSerializer, unsubscribedRetryDelay = 300.milliseconds)
+            val scheduler = testScheduler(dataSource, reactions.task)
+            val recorder = ReactionRecorder()
+            val executor = testExecutor(reactions, scheduler, recorder)
+            val dispatchedAt = Instant.now()
+            executor.dispatch(EventReactionId("r-1"), TestTrigger("early"))
+
+            scheduler.start() // wrong order on purpose: no executor subscribed yet
+            try {
+                eventually {
+                    val execution = scheduler.getScheduledExecution(reactions.task.instanceId("r-1")).get()
+                    execution.executionTime.isAfter(dispatchedAt.plusMillis(250))
+                }
+                val execution = scheduler.getScheduledExecution(reactions.task.instanceId("r-1")).get()
+                assertEquals(0, execution.consecutiveFailures)
+                assertTrue(recorder.attempts.isEmpty())
+
+                executor.start()
+                eventually { recorder.completions.isNotEmpty() }
+            } finally {
+                scheduler.stop()
+                executor.stop()
+            }
+
+            assertEquals(listOf(0), recorder.attempts.map { it.retryCount })
+        }
+
+    @Test
+    fun `undecodable task data or an undeserializable trigger is retried by the failure handler without reaching the executor`() =
+        runBlocking {
+            val reactions = DbSchedulerEventReactions("test-reactions", TestTriggerSerializer)
+            val scheduler = testScheduler(dataSource, reactions.task)
+            val recorder = ReactionRecorder()
+            val executor = testExecutor(reactions, scheduler, recorder)
+
+            // Garbage envelope, written directly with db-scheduler's own API.
+            scheduler.schedule(TaskInstance("test-reactions", "garbage", "not json"), Instant.now())
+            // Valid envelope, but TestTriggerSerializer rejects triggers starting with "poison".
+            executor.dispatch(EventReactionId("poisoned"), TestTrigger("poison-pill"))
+
+            running(scheduler, executor) {
+                eventually {
+                    listOf("garbage", "poisoned").all { id ->
+                        scheduler.getScheduledExecution(reactions.task.instanceId(id)).get().consecutiveFailures >= 1
+                    }
+                }
+            }
+
+            assertTrue(recorder.attempts.isEmpty())
+            assertTrue(recorder.completions.isEmpty())
+        }
+
+    @Test
+    fun `createExecutionContext throwing goes to the failure handler without consuming a retry`() =
+        runBlocking {
+            val reactions = DbSchedulerEventReactions("test-reactions", TestTriggerSerializer)
+            val scheduler = testScheduler(dataSource, reactions.task)
+            val recorder = ReactionRecorder()
+            val executor =
+                testExecutor(
+                    reactions,
+                    scheduler,
+                    recorder,
+                    createExecutionContext = { _, _ -> error("context unavailable") },
+                )
+
+            running(scheduler, executor) {
+                executor.dispatch(EventReactionId("r-1"), TestTrigger("needs-context"))
+                eventually { scheduler.getScheduledExecution(reactions.task.instanceId("r-1")).get().consecutiveFailures >= 1 }
+            }
+
+            val data = scheduler.getScheduledExecution(reactions.task.instanceId("r-1")).get().data as String
+            assertTrue(data.contains("\"retryCount\":0"), "retry count should be untouched, was $data")
+            assertTrue(recorder.attempts.isEmpty())
+        }
+
+    @Test
+    fun `two executors on one scheduler each receive only their own reactions`() =
+        runBlocking {
+            val billing = DbSchedulerEventReactions("billing-reactions", TestTriggerSerializer)
+            val notifications = DbSchedulerEventReactions("notification-reactions", TestTriggerSerializer)
+            val scheduler = testScheduler(dataSource, billing.task, notifications.task)
+            val billingRecorder = ReactionRecorder()
+            val notificationRecorder = ReactionRecorder()
+            val billingExecutor = testExecutor(billing, scheduler, billingRecorder)
+            val notificationExecutor = testExecutor(notifications, scheduler, notificationRecorder)
+
+            running(scheduler, billingExecutor, notificationExecutor) {
+                billingExecutor.dispatch(EventReactionId("charge-e-1"), TestTrigger("charge"))
+                notificationExecutor.dispatch(EventReactionId("confirm-e-1"), TestTrigger("confirm"))
+                // Same id under a different task name is a different reaction.
+                notificationExecutor.dispatch(EventReactionId("charge-e-1"), TestTrigger("charge-receipt"))
+                eventually { billingRecorder.completions.size == 1 && notificationRecorder.completions.size == 2 }
+            }
+
+            assertEquals(listOf(TestTrigger("charge")), billingRecorder.attempts.map { it.trigger })
+            assertEquals(
+                setOf(TestTrigger("confirm"), TestTrigger("charge-receipt")),
+                notificationRecorder.attempts.map { it.trigger }.toSet(),
+            )
         }
 }
