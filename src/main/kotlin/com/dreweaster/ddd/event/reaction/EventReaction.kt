@@ -15,6 +15,12 @@ interface EventReactionTrigger {
     val timeout: Duration?
 }
 
+/**
+ * A reaction to dispatch for an event. [id] must be deterministic for a given (event, reaction kind) —
+ * typically built from the event's `eventId` plus a label, e.g. `EventReactionId("charge-${eventId}")` —
+ * so that re-dispatching the same event after a crash is recognised as a duplicate. A random id would
+ * create a second reaction.
+ */
 data class EventReaction<T : EventReactionTrigger>(
     val id: EventReactionId,
     val trigger: T,
