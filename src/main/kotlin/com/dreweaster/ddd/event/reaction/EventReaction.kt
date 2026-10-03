@@ -3,6 +3,7 @@ package com.dreweaster.ddd.event.reaction
 import com.dreweaster.ddd.event.reaction.EventReactionExecutionResult.EventReactionCancelled
 import com.dreweaster.ddd.event.reaction.EventReactionExecutionResult.EventReactionExecutionCompleted
 import com.dreweaster.ddd.event.reaction.EventReactionExecutionResult.EventReactionFailed
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withTimeout
 import org.slf4j.LoggerFactory
@@ -132,6 +133,9 @@ class EventReactionExecutor<T : EventReactionTrigger, ExecutionContext>(
                 }.getOrElse { ex ->
                     when (ex) {
                         is TimeoutCancellationException -> EventReactionExecutionResult.EventReactionTimedOut
+                        // The reaction itself was cancelled (e.g. the scheduler interrupted it on shutdown):
+                        // not an outcome to report — let the source deal with the interrupted execution.
+                        is CancellationException -> throw ex
                         else -> EventReactionFailed(ex)
                     }
                 }.let { result ->

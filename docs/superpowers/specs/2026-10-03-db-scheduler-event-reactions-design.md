@@ -143,13 +143,12 @@ db-scheduler guarantees a row is executed by one node at a time; no extra lockin
    deployed; operators can remove a row with `SchedulerClient.cancel(...)`.
 2. **Handler throws** (notably `createExecutionContext`, which `EventReactionExecutor` calls outside its
    `runCatching`) — same failure path; `retryCount` is not incremented, db-scheduler's `consecutiveFailures` is.
-   The executor is not changed as part of this work.
+   The executor is not changed for this gap (its only change is rethrowing non-timeout cancellation; see point 3).
 3. **Crash or forced shutdown mid-execution** — the row becomes a dead execution and db-scheduler's default
    dead-execution handler revives it with the same `retryCount`. Graceful `scheduler.stop()` waits for running
-   executions first; executions interrupted at the deadline cancel their `runBlocking`. The executor sees the
-   resulting `CancellationException` as an `EventReactionFailed` and calls `failureRetryHandler` (which should
-   return `Retry` for it — documented on `DbSchedulerEventReactions`); the interrupted `runBlocking` then throws,
-   so db-scheduler's failure handler reschedules the row with the same `retryCount`.
+   executions first; executions interrupted at the deadline cancel their `runBlocking`. `EventReactionExecutor`
+   rethrows the resulting (non-timeout) `CancellationException` without calling its retry or completion
+   handlers, so db-scheduler's failure handler reschedules the row with the same `retryCount`.
 4. **Failure in `remove` / `reschedule`** — the row is left picked, becomes a dead execution and is re-run;
    `onCompletion` may run more than once (covered by the idempotency rule).
 5. **`publish` failure** (`scheduleIfNotExists` throws) — propagates to the poller, which halts the batch without
@@ -193,5 +192,5 @@ Existing outbox and contract integration tests keep their `recordingExecutor` st
 
 - Storing permanently failed reactions or a manual-retry API.
 - A dispatch/dedup log beyond `scheduleIfNotExists`.
-- Changes to `EventReactionExecutor` (including the `createExecutionContext` exception gap).
+- Other changes to `EventReactionExecutor`, including the `createExecutionContext` exception gap.
 - Adding db-scheduler's table to `DddSchema`.
