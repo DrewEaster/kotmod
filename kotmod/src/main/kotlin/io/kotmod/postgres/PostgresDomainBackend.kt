@@ -245,51 +245,47 @@ class PostgresDomainPollingBackend(
         position: EventLogPosition,
     ): SequenceCheck =
         jdbc.withConnection { conn ->
+            // One statement: the highest sequence already passed (always returned, even with no earlier events
+            // ahead) left-joined to the earlier events of the aggregate that sit after the saved position.
             conn
                 .prepareStatement(
                     "SELECT $EVENT_COLUMNS, " +
-                        "transaction_id < pg_snapshot_xmin(pg_current_snapshot()) AS readable " +
-                        "FROM ddd_domain_event " +
-                        "WHERE aggregate_type = ? AND aggregate_id = ? AND (" +
-                        "(aggregate_sequence < ? AND (transaction_id, global_offset) > (?::text::xid8, ?)) OR " +
-                        "(aggregate_sequence <> ? AND (transaction_id, global_offset) <= (?::text::xid8, ?))) " +
-                        "ORDER BY aggregate_sequence",
+                        "e.transaction_id < pg_snapshot_xmin(pg_current_snapshot()) AS readable, " +
+                        "hp.highest_passed " +
+                        "FROM (SELECT max(aggregate_sequence) AS highest_passed FROM ddd_domain_event " +
+                        "WHERE aggregate_type = ? AND aggregate_id = ? " +
+                        "AND (transaction_id, global_offset) <= (?::text::xid8, ?)) hp " +
+                        "LEFT JOIN ddd_domain_event e ON e.aggregate_type = ? AND e.aggregate_id = ? " +
+                        "AND e.aggregate_sequence < ? AND (e.transaction_id, e.global_offset) > (?::text::xid8, ?) " +
+                        "ORDER BY e.aggregate_sequence",
                 ).use { ps ->
                     val m = event.metadata
                     ps.setString(1, m.aggregateType.value)
                     ps.setString(2, m.aggregateId.value)
-                    ps.setLong(3, m.sequence)
-                    ps.setLong(4, position.transactionId)
-                    ps.setLong(5, position.globalOffset)
-                    ps.setLong(6, m.sequence)
-                    ps.setLong(7, position.transactionId)
-                    ps.setLong(8, position.globalOffset)
+                    ps.setLong(3, position.transactionId)
+                    ps.setLong(4, position.globalOffset)
+                    ps.setString(5, m.aggregateType.value)
+                    ps.setString(6, m.aggregateId.value)
+                    ps.setLong(7, m.sequence)
+                    ps.setLong(8, position.transactionId)
+                    ps.setLong(9, position.globalOffset)
                     ps.executeQuery().use { rs ->
-                        val ahead = mutableListOf<PersistedEvent>()
-                        val readable = mutableMapOf<Long, Boolean>()
                         var highestPassed = 0L
+                        val candidates = mutableListOf<Pair<PersistedEvent, Boolean>>()
                         while (rs.next()) {
-                            val found = rs.toPublishedEvent()
-                            val passed =
-                                found.position.transactionId < position.transactionId ||
-                                    (found.position.transactionId == position.transactionId &&
-                                        found.position.globalOffset <= position.globalOffset)
-                            if (passed) {
-                                highestPassed = maxOf(highestPassed, found.metadata.sequence)
-                            } else {
-                                ahead += found
-                                readable[found.metadata.sequence] = rs.getBoolean("readable")
+                            highestPassed = rs.getLong("highest_passed") // NULL (nothing passed) reads as 0
+                            if (rs.getString("event_id") != null) {
+                                candidates += rs.toPublishedEvent() to rs.getBoolean("readable")
                             }
                         }
                         // Earlier events at or below the highest sequence already passed were handled when
                         // that event was reached; pulling them forward again would re-deliver them.
-                        val earlier = ahead.filter { it.metadata.sequence > highestPassed }
-                        val allReadable = earlier.all { readable.getValue(it.metadata.sequence) }
+                        val earlier = candidates.filter { it.first.metadata.sequence > highestPassed }
                         when {
                             highestPassed > m.sequence -> SequenceCheck.AlreadyHandled
                             earlier.isEmpty() -> SequenceCheck.InOrder
-                            !allReadable -> SequenceCheck.WaitForEarlier
-                            else -> SequenceCheck.HandleEarlierFirst(earlier)
+                            earlier.any { !it.second } -> SequenceCheck.WaitForEarlier
+                            else -> SequenceCheck.HandleEarlierFirst(earlier.map { it.first })
                         }
                     }
                 }

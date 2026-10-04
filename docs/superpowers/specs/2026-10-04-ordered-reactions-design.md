@@ -90,17 +90,20 @@ order. For each event `e` read (in position order), before handling it:
 Both checks are one indexed query on `(aggregate_type, aggregate_id, aggregate_sequence)`:
 
 ```sql
-SELECT aggregate_sequence, transaction_id::text::bigint, global_offset, …
-FROM ddd_domain_event
-WHERE aggregate_type = ? AND aggregate_id = ?
-  AND (   (aggregate_sequence < ? AND (transaction_id, global_offset) > (?::text::xid8, ?))
-       OR (aggregate_sequence > ? AND (transaction_id, global_offset) <= (?::text::xid8, ?)) )
-ORDER BY aggregate_sequence
+SELECT <event columns>, e.transaction_id < pg_snapshot_xmin(pg_current_snapshot()) AS readable, hp.highest_passed
+FROM (SELECT max(aggregate_sequence) AS highest_passed FROM ddd_domain_event
+      WHERE aggregate_type = ? AND aggregate_id = ? AND (transaction_id, global_offset) <= (?::text::xid8, ?)) hp
+LEFT JOIN ddd_domain_event e
+  ON e.aggregate_type = ? AND e.aggregate_id = ? AND e.aggregate_sequence < ?
+ AND (e.transaction_id, e.global_offset) > (?::text::xid8, ?)
+ORDER BY e.aggregate_sequence
 ```
 
-It normally returns no rows; the plan may batch it per poll. No extra state is stored: both checks derive
-from the event log and the saved position, so restarts are correct, and a crash mid-way only repeats a
-dispatch (at-least-once). This runs for every subscription (cheap, harmless for unordered ones).
+It is one statement per event and returns only the earlier events still ahead (normally none, so one row
+of NULLs) plus the scalar `highest_passed`, so its cost does not grow with the aggregate's history. No extra
+state is stored: both checks derive from the event log and the saved position, so restarts are correct, and
+a crash mid-way only repeats a dispatch (at-least-once). This runs for every subscription (cheap, harmless
+for unordered ones).
 
 `DomainEventPollingBackend` gains the operation needed for this check (e.g.
 `outOfOrderNeighbours(event, position): List<PersistedEvent>` with a readability flag); the plan fixes the
