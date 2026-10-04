@@ -1,8 +1,10 @@
 package io.kotmod.event.reaction.dbscheduler
 
+import io.kotmod.event.reaction.DispatchOrdering
 import io.kotmod.event.reaction.EventReactionId
 import io.kotmod.event.reaction.EventReactionTrigger
 import io.kotmod.event.reaction.EventReactionTriggerSerializer
+import io.kotmod.event.reaction.OnGiveUp
 import com.github.kagkarlsson.scheduler.SchedulerClient
 import com.github.kagkarlsson.scheduler.task.TaskInstance
 import io.mockk.every
@@ -59,6 +61,34 @@ class DbSchedulerTriggerSinkTest {
     fun `serializer failure propagates and nothing is scheduled`() {
         assertFailsWith<IllegalArgumentException> {
             runBlocking { sink.publish(EventReactionId("charge-e-1"), FakeTrigger("unserializable"), null) }
+        }
+        verify(exactly = 0) { client.scheduleIfNotExists(any<TaskInstance<String>>(), any<Instant>()) }
+    }
+    @Test
+    fun `ordered publish uses a sortable instance id and stamps the ordering`() {
+        val orderedSink = DbSchedulerTriggerSink("billing-reactions", FakeTriggerSerializer, client, clock = { now }, supportsOrdering = true)
+        val instance = slot<TaskInstance<String>>()
+        every { client.scheduleIfNotExists(capture(instance), any<Instant>()) } returns true
+
+        runBlocking {
+            orderedSink.publish(EventReactionId("charge-e-1"), FakeTrigger("charge"), DispatchOrdering("Order/o-1", 3, 1, OnGiveUp.BlockAggregate))
+        }
+
+        assertEquals(orderedInstanceId("Order/o-1", 3, 1, "charge-e-1"), instance.captured.id)
+        assertEquals(
+            ReactionTaskData(
+                trigger = "charge",
+                retryCount = 0,
+                ordering = OrderingStamp("Order/o-1", 3, 1, "BlockAggregate", "charge-e-1"),
+            ),
+            ReactionTaskData.decode(instance.captured.data),
+        )
+    }
+
+    @Test
+    fun `ordered publish is rejected when ordering is not supported`() {
+        assertFailsWith<IllegalArgumentException> {
+            runBlocking { sink.publish(EventReactionId("charge-e-1"), FakeTrigger("charge"), DispatchOrdering("Order/o-1", 3, 0, OnGiveUp.ContinueWithNext)) }
         }
         verify(exactly = 0) { client.scheduleIfNotExists(any<TaskInstance<String>>(), any<Instant>()) }
     }

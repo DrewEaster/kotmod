@@ -12,12 +12,16 @@ import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
 import java.time.Instant
 
-/** Schedules each dispatched reaction as a db-scheduler task instance, unless one with the same id is already pending. */
+/**
+ * Schedules each dispatched reaction as a db-scheduler task instance, unless one with the same id is already pending.
+ * Ordered reactions get an instance id that sorts by aggregate, sequence and ordinal (see [orderedInstanceId]).
+ */
 internal class DbSchedulerTriggerSink<T : EventReactionTrigger>(
     private val taskName: String,
     private val triggerSerializer: EventReactionTriggerSerializer<T>,
     private val client: SchedulerClient,
     private val clock: () -> Instant = Instant::now,
+    override val supportsOrdering: Boolean = false,
 ) : EventReactionTriggerSink<T> {
     private val log = LoggerFactory.getLogger(DbSchedulerTriggerSink::class.java)
 
@@ -26,14 +30,18 @@ internal class DbSchedulerTriggerSink<T : EventReactionTrigger>(
         trigger: T,
         ordering: DispatchOrdering?,
     ) {
-        require(ordering == null) { "Ordered reactions are not supported yet" }
-        val taskData = ReactionTaskData(trigger = triggerSerializer.serialize(trigger), retryCount = 0).encode()
+        require(ordering == null || supportsOrdering) {
+            "Ordered reactions need DbSchedulerEventReactions to be created with a JdbcContext"
+        }
+        val stamp = ordering?.let { OrderingStamp(it.key, it.sequence, it.ordinal, it.onGiveUp.name, id.value) }
+        val instanceId = stamp?.let { orderedInstanceId(it.key, it.sequence, it.ordinal, id.value) } ?: id.value
+        val taskData = ReactionTaskData(trigger = triggerSerializer.serialize(trigger), retryCount = 0, ordering = stamp).encode()
         val scheduled =
             withContext(Dispatchers.IO) {
-                client.scheduleIfNotExists(TaskInstance(taskName, id.value, taskData), clock())
+                client.scheduleIfNotExists(TaskInstance(taskName, instanceId, taskData), clock())
             }
         if (!scheduled) {
-            log.debug("Event reaction {} already scheduled for task {}; ignoring duplicate dispatch", id.value, taskName)
+            log.debug("Event reaction {} already scheduled for task {}; ignoring duplicate dispatch", instanceId, taskName)
         }
     }
 }
