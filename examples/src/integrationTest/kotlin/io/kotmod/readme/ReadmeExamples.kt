@@ -49,9 +49,7 @@ suspend fun cancelOrder(
     requestId: String,
 ): Order =
     try {
-        orders.execute<PendingOrder>(orderId, commandId = CommandId(requestId)) { order ->
-            CancelledOrder(order.item, reason) to listOf(OrderCancelled(order.item, reason))
-        }
+        orders.execute<PendingOrder>(orderId, commandId = CommandId(requestId)) { it.cancel(reason) }
     } catch (e: UnexpectedAggregateStateException) {
         throw IllegalStateException("Only pending orders can be cancelled", e)
     }
@@ -77,12 +75,8 @@ suspend fun shipAndInvoice(
     orderId: AggregateId,
 ) {
     jdbc.transaction {
-        orders.execute<PendingOrder>(orderId) { order ->
-            ShippedOrder(order.item) to listOf(OrderShipped(order.item))
-        }
-        invoices.create(AggregateId("invoice-${orderId.value}")) {
-            PendingOrder("invoice") to listOf(OrderPlaced("invoice"))
-        }
+        orders.execute<PendingOrder>(orderId) { it.ship() }
+        invoices.create(AggregateId("invoice-${orderId.value}")) { placeOrder("invoice") }
     }
 }
 

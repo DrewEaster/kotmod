@@ -74,14 +74,9 @@ class QuickstartTest : IntegrationTest() {
 
             val orderId = AggregateId("order-1")
 
-            orders.create(orderId) {
-                PendingOrder("book") to listOf(OrderPlaced("book"))
-            }
+            orders.create(orderId) { placeOrder("book") }
 
-            val shipped =
-                orders.execute<PendingOrder>(orderId) { order ->
-                    ShippedOrder(order.item) to listOf(OrderShipped(order.item))
-                }
+            val shipped = orders.execute<PendingOrder>(orderId) { it.ship() }
 
             val notifications = DbSchedulerEventReactions("order-notifications", OrderNotificationSerializer)
 

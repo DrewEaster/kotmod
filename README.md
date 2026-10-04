@@ -106,7 +106,7 @@ offsets. Event reactions run on db-scheduler, which needs its `scheduled_tasks` 
 db-scheduler's
 [`postgresql_tables.sql`](https://github.com/kagkarlsson/db-scheduler/blob/v16.12.0/db-scheduler/src/test/resources/postgresql_tables.sql).
 
-### 2. Define state and events
+### 2. Define state, events and commands
 
 An aggregate's **state** is whatever your application needs to make decisions — here, an order is
 pending, shipped or cancelled:
@@ -149,6 +149,21 @@ data class OrderCancelled(
     val item: String,
     val reason: String,
 ) : OrderEvent
+```
+
+Write each **command** as a plain function: it takes the current state and returns the new state plus the
+events it raised. Extension functions on the state types read naturally and keep your domain decisions in
+pure code you can unit-test without a database; kotmod only runs them:
+
+```kotlin
+fun placeOrder(item: String): Pair<PendingOrder, List<OrderEvent>> =
+    PendingOrder(item) to listOf(OrderPlaced(item))
+
+fun PendingOrder.ship(): Pair<ShippedOrder, List<OrderEvent>> =
+    ShippedOrder(item) to listOf(OrderShipped(item))
+
+fun PendingOrder.cancel(reason: String): Pair<CancelledOrder, List<OrderEvent>> =
+    CancelledOrder(item, reason) to listOf(OrderCancelled(item, reason))
 ```
 
 ### 3. Wire up persistence
@@ -232,21 +247,16 @@ class OrderRepository(
 
 ### 4. Run commands
 
-A command takes the current state and returns the new state plus the events it raised. `create` starts
-a new aggregate; `execute<PendingOrder>` only runs if the order is still pending. Both are `suspend`
-functions:
+Run the commands from step 2 through the aggregate manager. `create` starts a new aggregate;
+`execute<PendingOrder>` loads the order and only runs the command if it is still pending, so `ship()` can
+only ever be called on a `PendingOrder`. Both are `suspend` functions:
 
 ```kotlin
 val orderId = AggregateId("order-1")
 
-orders.create(orderId) {
-    PendingOrder("book") to listOf(OrderPlaced("book"))
-}
+orders.create(orderId) { placeOrder("book") }
 
-val shipped =
-    orders.execute<PendingOrder>(orderId) { order ->
-        ShippedOrder(order.item) to listOf(OrderShipped(order.item))
-    }
+val shipped = orders.execute<PendingOrder>(orderId) { it.ship() }
 ```
 
 Each call saves the order's state, appends its events to the event log and records the command, all in
@@ -431,9 +441,7 @@ suspend fun cancelOrder(
     requestId: String,
 ): Order =
     try {
-        orders.execute<PendingOrder>(orderId, commandId = CommandId(requestId)) { order ->
-            CancelledOrder(order.item, reason) to listOf(OrderCancelled(order.item, reason))
-        }
+        orders.execute<PendingOrder>(orderId, commandId = CommandId(requestId)) { it.cancel(reason) }
     } catch (e: UnexpectedAggregateStateException) {
         throw IllegalStateException("Only pending orders can be cancelled", e)
     }
@@ -486,12 +494,8 @@ suspend fun shipAndInvoice(
     orderId: AggregateId,
 ) {
     jdbc.transaction {
-        orders.execute<PendingOrder>(orderId) { order ->
-            ShippedOrder(order.item) to listOf(OrderShipped(order.item))
-        }
-        invoices.create(AggregateId("invoice-${orderId.value}")) {
-            PendingOrder("invoice") to listOf(OrderPlaced("invoice"))
-        }
+        orders.execute<PendingOrder>(orderId) { it.ship() }
+        invoices.create(AggregateId("invoice-${orderId.value}")) { placeOrder("invoice") }
     }
 }
 ```

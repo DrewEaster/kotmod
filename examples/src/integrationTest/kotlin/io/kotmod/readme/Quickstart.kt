@@ -46,6 +46,15 @@ data class OrderCancelled(
     val reason: String,
 ) : OrderEvent
 
+fun placeOrder(item: String): Pair<PendingOrder, List<OrderEvent>> =
+    PendingOrder(item) to listOf(OrderPlaced(item))
+
+fun PendingOrder.ship(): Pair<ShippedOrder, List<OrderEvent>> =
+    ShippedOrder(item) to listOf(OrderShipped(item))
+
+fun PendingOrder.cancel(reason: String): Pair<CancelledOrder, List<OrderEvent>> =
+    CancelledOrder(item, reason) to listOf(OrderCancelled(item, reason))
+
 class OrderRepository(
     private val jdbc: JdbcContext,
 ) : Repository<Order> {
