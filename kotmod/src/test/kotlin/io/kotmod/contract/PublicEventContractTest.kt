@@ -1,5 +1,6 @@
 package io.kotmod.contract
 
+import io.kotmod.EventLogPosition
 import io.kotmod.DataSerializationContext
 import io.kotmod.DomainEvent
 import io.kotmod.PublicDomainEvent
@@ -81,10 +82,10 @@ class PublicEventContractTest {
     private val backend: DomainEventPollingBackend = mockk()
     private val executorA: EventReactionExecutor<FakeTrigger, Any> = mockk(relaxed = true)
     private val executorB: EventReactionExecutor<FakeTrigger, Any> = mockk(relaxed = true)
-    private val offsets = RecordingOffsets(initial = 9L)
+    private val offsets = RecordingOffsets(initial = EventLogPosition(1, 9))
 
     private fun givenEvents(vararg events: PersistedEvent) {
-        every { backend.readEventsAfter(9L, any()) } returns events.toList()
+        every { backend.readEventsAfter(EventLogPosition(1, 9), any()) } returns events.toList()
     }
 
     private fun newContract(
@@ -101,8 +102,8 @@ class PublicEventContractTest {
         backend = backend,
         serialization = serialization,
         internalToPublic = internalToPublic,
-        getOffset = offsets::get,
-        saveOffset = offsets::save,
+        getPosition = offsets::get,
+        savePosition = offsets::save,
         isLeader = isLeader,
         pollInterval = 50.milliseconds,
         batchSize = 100,
@@ -148,7 +149,7 @@ class PublicEventContractTest {
             executorA.dispatch(EventReactionId("reaction-e-10-a"), FakeTrigger("a"))
             executorA.dispatch(EventReactionId("reaction-e-10-b"), FakeTrigger("b"))
         }
-        assertEquals(listOf(10L), offsets.saved)
+        assertEquals(listOf(10L), offsets.saved.map { it.globalOffset })
     }
 
     @Test
@@ -185,7 +186,7 @@ class PublicEventContractTest {
             executorB.dispatch(EventReactionId("B-e-10-1"), FakeTrigger("B1"))
             executorB.dispatch(EventReactionId("B-e-10-2"), FakeTrigger("B2"))
         }
-        assertEquals(listOf(10L), offsets.saved)
+        assertEquals(listOf(10L), offsets.saved.map { it.globalOffset })
     }
 
     @Test
@@ -199,7 +200,7 @@ class PublicEventContractTest {
         kotlinx.coroutines.runBlocking { contract.tickForTest() }
 
         coVerify(exactly = 0) { executorA.dispatch(any(), any()) }
-        assertEquals(listOf(10L), offsets.saved)
+        assertEquals(listOf(10L), offsets.saved.map { it.globalOffset })
     }
 
     @Test
@@ -218,7 +219,7 @@ class PublicEventContractTest {
         kotlinx.coroutines.runBlocking { contract.tickForTest() }
 
         coVerify(exactly = 0) { executorA.dispatch(any(), any()) }
-        assertEquals(listOf(10L), offsets.saved)
+        assertEquals(listOf(10L), offsets.saved.map { it.globalOffset })
     }
 
     @Test
@@ -234,7 +235,7 @@ class PublicEventContractTest {
         assertFalse(caught.isSuccess)
 
         coVerify(exactly = 0) { executorA.dispatch(any(), any()) }
-        assertEquals(emptyList(), offsets.saved)
+        assertEquals(emptyList(), offsets.saved.map { it.globalOffset })
     }
 
     @Test
@@ -254,7 +255,7 @@ class PublicEventContractTest {
 
         coVerify(exactly = 1) { executorA.dispatch(EventReactionId("A"), FakeTrigger("A")) }
         coVerify(exactly = 1) { executorB.dispatch(EventReactionId("B"), FakeTrigger("B")) }
-        assertEquals(emptyList(), offsets.saved)
+        assertEquals(emptyList(), offsets.saved.map { it.globalOffset })
     }
 
     @Test

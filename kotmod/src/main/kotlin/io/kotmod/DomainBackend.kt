@@ -57,11 +57,11 @@ interface DomainPersistenceBackend<E : DomainEvent> {
 /**
  * A domain event as read back from the event log, still in serialized form.
  *
- * @property globalOffset position in the log across all aggregates; strictly increasing.
+ * @property position where the event sits in the log; consumers resume after it.
  * @property attributes extra columns a backend chose to expose with the event.
  */
 data class PersistedEvent(
-    val globalOffset: Long,
+    val position: EventLogPosition,
     val metadata: EventMetadata,
     val serialized: SerializedEvent,
     val attributes: Map<String, String> = emptyMap(),
@@ -69,9 +69,13 @@ data class PersistedEvent(
 
 /** Reads the event log in order, for consumers such as [io.kotmod.outbox.AggregateEventOutbox] and [io.kotmod.contract.PublicEventContract]. */
 interface DomainEventPollingBackend {
-    /** Returns up to [limit] events whose global offset is greater than [lastOffset], oldest first. */
+    /**
+     * Returns up to [limit] events after [position], in log order, from transactions that have finished.
+     * Events from transactions still in progress (and anything after them) are held back until those
+     * transactions end, so no event is ever skipped.
+     */
     fun readEventsAfter(
-        lastOffset: Long,
+        position: EventLogPosition,
         limit: Int,
     ): List<PersistedEvent>
 }

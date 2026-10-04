@@ -14,6 +14,7 @@ import io.kotmod.jdbc.JdbcContext
 import io.kotmod.CorrelationId
 import io.kotmod.DomainEventPollingBackend
 import io.kotmod.EventId
+import io.kotmod.EventLogPosition
 import io.kotmod.EventMetadata
 import io.kotmod.PersistedEvent
 import io.kotmod.SerializedEvent
@@ -198,29 +199,32 @@ class PostgresDomainPersistenceBackend<E : DomainEvent>(
     }
 }
 
-/** Postgres implementation of [DomainEventPollingBackend], reading `ddd_domain_event` in `global_offset` order. */
+/** Postgres implementation of [DomainEventPollingBackend], reading `ddd_domain_event` in
+ * `(transaction_id, global_offset)` order, only past transactions that have finished. */
 class PostgresDomainPollingBackend(
     private val jdbc: JdbcContext,
     private val eventAttributeColumns: Set<String> = setOf(),
 ): DomainEventPollingBackend {
 
     override fun readEventsAfter(
-        lastOffset: Long,
-        limit: Int
-    ): List<PersistedEvent> {
-        return jdbc.withConnection { conn ->
+        position: EventLogPosition,
+        limit: Int,
+    ): List<PersistedEvent> =
+        jdbc.withConnection { conn ->
             conn
                 .prepareStatement(
-                    "SELECT global_offset, aggregate_type, aggregate_id, " +
-                            "causation_id, correlation_id, event_id, event_type, event_version, " +
-                            "event_payload, event_timestamp " +
-                            "FROM ddd_domain_event " +
-                            "WHERE global_offset > ? " +
-                            "ORDER BY global_offset ASC " +
-                            "LIMIT ?",
+                    "SELECT global_offset, transaction_id::text::bigint AS transaction_id_value, " +
+                        "aggregate_type, aggregate_id, causation_id, correlation_id, event_id, event_type, " +
+                        "event_version, event_payload, event_timestamp " +
+                        "FROM ddd_domain_event " +
+                        "WHERE (transaction_id, global_offset) > (?::text::xid8, ?) " +
+                        "AND transaction_id < pg_snapshot_xmin(pg_current_snapshot()) " +
+                        "ORDER BY transaction_id, global_offset " +
+                        "LIMIT ?",
                 ).use { ps ->
-                    ps.setLong(1, lastOffset)
-                    ps.setInt(2, limit)
+                    ps.setLong(1, position.transactionId)
+                    ps.setLong(2, position.globalOffset)
+                    ps.setInt(3, limit)
                     ps.executeQuery().use { rs ->
                         val result = mutableListOf<PersistedEvent>()
                         while (rs.next()) result += rs.toPublishedEvent()
@@ -228,7 +232,6 @@ class PostgresDomainPollingBackend(
                     }
                 }
         }
-    }
 
     private fun ResultSet.toPublishedEvent(): PersistedEvent {
         // PostgreSQL JDBC returns null for SQL NULL values, so we don't need wasNull()
@@ -236,7 +239,7 @@ class PostgresDomainPollingBackend(
         // column's null state anyway.
         val correlation: String? = getString("correlation_id")
         return PersistedEvent(
-            globalOffset = getLong("global_offset"),
+            position = EventLogPosition(getLong("transaction_id_value"), getLong("global_offset")),
             metadata =
                 EventMetadata(
                     eventId = EventId(getString("event_id")),

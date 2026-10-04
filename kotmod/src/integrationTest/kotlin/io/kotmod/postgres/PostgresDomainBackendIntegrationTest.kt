@@ -6,6 +6,7 @@ import io.kotmod.AggregateType
 import io.kotmod.CommandId
 import io.kotmod.CorrelationId
 import io.kotmod.EventId
+import io.kotmod.EventLogPosition
 import io.kotmod.EventMetadata
 import io.kotmod.OptimisticConcurrencyException
 import io.kotmod.PendingEvent
@@ -282,8 +283,8 @@ class PostgresDomainBackendIntegrationTest : IntegrationTest() {
                 ),
             )
 
-            val all = pollingBackend.readEventsAfter(lastOffset = -1, limit = 10)
-            assertEquals(listOf(1L, 2L, 3L), all.map { it.globalOffset })
+            val all = pollingBackend.readEventsAfter(EventLogPosition.START, limit = 10)
+            assertEquals(listOf(1L, 2L, 3L), all.map { it.position.globalOffset })
             assertEquals(listOf("e-1", "e-2", "e-3"), all.map { it.metadata.eventId.value })
 
             val first = all.first()
@@ -292,8 +293,8 @@ class PostgresDomainBackendIntegrationTest : IntegrationTest() {
             assertEquals("""{"name":"widgets"}""", first.serialized.payload)
             assertNull(all[1].metadata.correlationId)
 
-            assertEquals(listOf("e-2", "e-3"), pollingBackend.readEventsAfter(lastOffset = 1, limit = 10).map { it.metadata.eventId.value })
-            assertEquals(listOf("e-1", "e-2"), pollingBackend.readEventsAfter(lastOffset = -1, limit = 2).map { it.metadata.eventId.value })
-            assertEquals(emptyList(), pollingBackend.readEventsAfter(lastOffset = 3, limit = 10))
+            assertEquals(listOf("e-2", "e-3"), pollingBackend.readEventsAfter(all[0].position, limit = 10).map { it.metadata.eventId.value })
+            assertEquals(listOf("e-1", "e-2"), pollingBackend.readEventsAfter(EventLogPosition.START, limit = 2).map { it.metadata.eventId.value })
+            assertEquals(emptyList(), pollingBackend.readEventsAfter(all[2].position, limit = 10))
         }
 }

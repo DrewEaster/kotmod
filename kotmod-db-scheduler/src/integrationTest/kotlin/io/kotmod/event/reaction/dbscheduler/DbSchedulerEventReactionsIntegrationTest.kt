@@ -279,8 +279,8 @@ class DbSchedulerEventReactionsIntegrationTest : IntegrationTest() {
                             ),
                         )
                     },
-                    getOffset = { offsets.getOffset("order-outbox") },
-                    saveOffset = { offsets.saveOffset("order-outbox", it) },
+                    getPosition = { offsets.getPosition("order-outbox") },
+                    savePosition = { offsets.savePosition("order-outbox", it) },
                     isLeader = { true },
                     pollInterval = 50.milliseconds,
                 )
@@ -302,7 +302,7 @@ class DbSchedulerEventReactionsIntegrationTest : IntegrationTest() {
                 setOf(TestTrigger("charge-o-0"), TestTrigger("charge-o-1")),
                 recorder.attempts.map { it.trigger }.toSet(),
             )
-            assertEquals(2L, offsets.getOffset("order-outbox"))
+            assertEquals(2L, offsets.getPosition("order-outbox").globalOffset)
             assertTrue(scheduler.getScheduledExecutionsForTask("order-reactions", String::class.java).isEmpty())
         }
 }

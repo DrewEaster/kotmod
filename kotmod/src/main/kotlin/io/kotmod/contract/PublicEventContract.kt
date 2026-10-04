@@ -6,6 +6,7 @@ import io.kotmod.PublicDomainEvent
 import io.kotmod.PublicEventEnvelope
 import io.kotmod.outbox.DomainEventPoller
 import io.kotmod.DomainEventPollingBackend
+import io.kotmod.EventLogPosition
 import io.kotmod.PersistedEvent
 import io.kotmod.event.reaction.EventReaction
 import io.kotmod.event.reaction.EventReactionExecutor
@@ -20,7 +21,7 @@ import kotlin.time.Duration.Companion.milliseconds
  *
  * While running, it polls the event log, deserializes each event with [serialization], maps it with
  * [internalToPublic] (returning `null` keeps an event private) and passes the public event to every
- * subscriber. Each subscriber turns it into event reactions for its own executor. Offsets, leadership
+ * subscriber. Each subscriber turns it into event reactions for its own executor. Positions, leadership
  * and redelivery work as in [io.kotmod.outbox.AggregateEventOutbox].
  *
  * @param I the internal domain event type.
@@ -30,8 +31,8 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
     private val backend: DomainEventPollingBackend,
     private val serialization: DataSerializationContext<I>,
     private val internalToPublic: (I) -> E?,
-    getOffset: () -> Long,
-    saveOffset: (Long) -> Unit,
+    getPosition: () -> EventLogPosition,
+    savePosition: (EventLogPosition) -> Unit,
     isLeader: () -> Boolean,
     pollInterval: Duration = 500.milliseconds,
     batchSize: Int = 100,
@@ -42,16 +43,16 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
     ) {
         suspend fun fanOut(
             envelope: PublicEventEnvelope<E>,
-            globalOffset: Long,
+            position: EventLogPosition,
             log: Logger,
         ) {
             val reactions = block(envelope)
             for (reaction in reactions) {
                 log.debug(
-                    "Dispatching event reaction {} for DDD event {} [offset={}]",
+                    "Dispatching event reaction {} for DDD event {} [position={}]",
                     reaction.id.value,
                     envelope.metadata.eventId.value,
-                    globalOffset,
+                    position,
                 )
                 executor.dispatch(reaction.id, reaction.trigger)
             }
@@ -77,8 +78,8 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
     private val poller =
         DomainEventPoller(
             backend = backend,
-            getOffset = getOffset,
-            saveOffset = saveOffset,
+            getPosition = getPosition,
+            savePosition = savePosition,
             isLeader = isLeader,
             pollInterval = pollInterval,
             batchSize = batchSize,
@@ -103,7 +104,7 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
         val public: E = internalToPublic(internal) ?: return
         val publicEnvelope = PublicEventEnvelope(envelope.metadata, public)
         for (subscription in subscriptions) {
-            subscription.fanOut(publicEnvelope, envelope.globalOffset, log)
+            subscription.fanOut(publicEnvelope, envelope.position, log)
         }
     }
 }

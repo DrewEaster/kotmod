@@ -5,6 +5,7 @@ import io.kotmod.AggregateType
 import io.kotmod.CommandId
 import io.kotmod.CorrelationId
 import io.kotmod.EventId
+import io.kotmod.EventLogPosition
 import io.kotmod.EventMetadata
 import io.kotmod.PersistedEvent
 import io.kotmod.SerializedEvent
@@ -22,7 +23,7 @@ internal fun persistedEvent(
     eventPayload: String = "{}",
     timestamp: Instant = Instant.parse("2026-04-18T10:00:00Z"),
 ) = PersistedEvent(
-    globalOffset = globalOffset,
+    position = EventLogPosition(transactionId = 1, globalOffset = globalOffset),
     metadata =
         EventMetadata(
             eventId = EventId(eventId),
@@ -35,18 +36,18 @@ internal fun persistedEvent(
     serialized = SerializedEvent(eventType, eventVersion, eventPayload),
 )
 
-/** In-memory stand-in for getOffset/saveOffset that records every save. */
+/** In-memory stand-in for getPosition/savePosition that records every save. */
 internal class RecordingOffsets(
-    initial: Long,
+    initial: EventLogPosition,
 ) {
-    var current: Long = initial
+    var current: EventLogPosition = initial
         private set
-    val saved = mutableListOf<Long>()
+    val saved = mutableListOf<EventLogPosition>()
 
-    fun get(): Long = current
+    fun get(): EventLogPosition = current
 
-    fun save(offset: Long) {
-        saved += offset
-        current = offset
+    fun save(position: EventLogPosition) {
+        saved += position
+        current = position
     }
 }

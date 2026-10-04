@@ -188,8 +188,8 @@ fun orderContract(
                     else -> null
                 }
             },
-            getOffset = { offsets.getOffset("order-contract") },
-            saveOffset = { offsets.saveOffset("order-contract", it) },
+            getPosition = { offsets.getPosition("order-contract") },
+            savePosition = { offsets.savePosition("order-contract", it) },
             isLeader = { true },
         )
 

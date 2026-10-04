@@ -143,8 +143,8 @@ class QuickstartTest : IntegrationTest() {
                             }
                         }
                     },
-                    getOffset = { offsets.getOffset("order-notifications") },
-                    saveOffset = { offsets.saveOffset("order-notifications", it) },
+                    getPosition = { offsets.getPosition("order-notifications") },
+                    savePosition = { offsets.savePosition("order-notifications", it) },
                     isLeader = { true },
                 )
 

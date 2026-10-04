@@ -1,5 +1,6 @@
 package io.kotmod.outbox
 
+import io.kotmod.EventLogPosition
 import io.kotmod.DomainEventPollingBackend
 import io.kotmod.PersistedEvent
 import io.kotmod.event.reaction.EventReaction
@@ -27,10 +28,10 @@ class AggregateEventOutboxTest {
 
     private val backend: DomainEventPollingBackend = mockk()
     private val executor: EventReactionExecutor<FakeTrigger, Any> = mockk(relaxed = true)
-    private val offsets = RecordingOffsets(initial = 9L)
+    private val offsets = RecordingOffsets(initial = EventLogPosition(1, 9))
 
     private fun givenEvents(vararg events: PersistedEvent) {
-        every { backend.readEventsAfter(9L, any()) } returns events.toList()
+        every { backend.readEventsAfter(EventLogPosition(1, 9), any()) } returns events.toList()
     }
 
     private fun newOutbox(
@@ -40,8 +41,8 @@ class AggregateEventOutboxTest {
         backend = backend,
         executor = executor,
         eventToReactions = eventToReactions,
-        getOffset = offsets::get,
-        saveOffset = offsets::save,
+        getPosition = offsets::get,
+        savePosition = offsets::save,
         isLeader = isLeader,
     )
 
@@ -89,10 +90,10 @@ class AggregateEventOutboxTest {
         givenEvents(persistedEvent(globalOffset = 10), persistedEvent(globalOffset = 11), persistedEvent(globalOffset = 12))
 
         val outbox =
-            newOutbox(eventToReactions = { listOf(EventReaction(EventReactionId("t-${it.globalOffset}"), FakeTrigger("t"))) })
+            newOutbox(eventToReactions = { listOf(EventReaction(EventReactionId("t-${it.position.globalOffset}"), FakeTrigger("t"))) })
         kotlinx.coroutines.runBlocking { outbox.tickForTest() }
 
-        assertEquals(listOf(10L, 11L, 12L), offsets.saved)
+        assertEquals(listOf(10L, 11L, 12L), offsets.saved.map { it.globalOffset })
     }
 
     @Test
@@ -103,7 +104,7 @@ class AggregateEventOutboxTest {
         kotlinx.coroutines.runBlocking { outbox.tickForTest() }
 
         coVerify(exactly = 0) { executor.dispatch(any(), any()) }
-        assertEquals(listOf(10L), offsets.saved)
+        assertEquals(listOf(10L), offsets.saved.map { it.globalOffset })
     }
 
     @Test
@@ -131,8 +132,8 @@ class AggregateEventOutboxTest {
         coVerify(exactly = 0) { executor.dispatch(EventReactionId("t-e-1-c"), any()) }
         coVerify(exactly = 0) { executor.dispatch(EventReactionId("t-e-2-a"), any()) }
 
-        // Offset never advanced (dispatch threw before the per-event saveOffset call)
-        assertEquals(emptyList(), offsets.saved)
+        // Position never advanced (dispatch threw before the per-event savePosition call)
+        assertEquals(emptyList(), offsets.saved.map { it.globalOffset })
     }
 
     @Test
@@ -145,6 +146,6 @@ class AggregateEventOutboxTest {
         assertFalse(caught.isSuccess)
 
         coVerify(exactly = 0) { executor.dispatch(any(), any()) }
-        assertEquals(emptyList(), offsets.saved)
+        assertEquals(emptyList(), offsets.saved.map { it.globalOffset })
     }
 }

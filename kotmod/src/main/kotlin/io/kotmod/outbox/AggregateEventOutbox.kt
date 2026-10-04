@@ -1,6 +1,7 @@
 package io.kotmod.outbox
 
 import io.kotmod.DomainEventPollingBackend
+import io.kotmod.EventLogPosition
 import io.kotmod.PersistedEvent
 import io.kotmod.event.reaction.EventReaction
 import io.kotmod.event.reaction.EventReactionExecutor
@@ -12,8 +13,8 @@ import kotlin.time.Duration.Companion.milliseconds
 /**
  * Turns domain events into event reactions (the transactional outbox pattern).
  *
- * While running, it polls the event log after the offset returned by [getOffset], calls
- * [eventToReactions] for each event and dispatches the resulting reactions to [executor]. The offset is
+ * While running, it polls the event log after the position returned by [getPosition], calls
+ * [eventToReactions] for each event and dispatches the resulting reactions to [executor]. The position is
  * saved after all of an event's reactions are dispatched, so an event is never skipped; after a crash
  * it may be dispatched again, which is why reaction ids should be deterministic. Polling only happens
  * while [isLeader] returns `true`, so run one instance per cluster.
@@ -25,8 +26,8 @@ class AggregateEventOutbox<T : EventReactionTrigger>(
     private val backend: DomainEventPollingBackend,
     private val executor: EventReactionExecutor<T, *>,
     private val eventToReactions: (PersistedEvent) -> List<EventReaction<T>>,
-    getOffset: () -> Long,
-    saveOffset: (Long) -> Unit,
+    getPosition: () -> EventLogPosition,
+    savePosition: (EventLogPosition) -> Unit,
     isLeader: () -> Boolean,
     pollInterval: Duration = 500.milliseconds,
     batchSize: Int = 100,
@@ -37,8 +38,8 @@ class AggregateEventOutbox<T : EventReactionTrigger>(
         DomainEventPoller(
             backend = backend,
             batchSize = batchSize,
-            getOffset = getOffset,
-            saveOffset = saveOffset,
+            getPosition = getPosition,
+            savePosition = savePosition,
             isLeader = isLeader,
             pollInterval = pollInterval,
             loggerName = "AggregateEventOutbox",
@@ -46,10 +47,10 @@ class AggregateEventOutbox<T : EventReactionTrigger>(
                 val reactions = eventToReactions(envelope)
                 for ((id, trigger) in reactions) {
                     log.debug(
-                        "Dispatching event reaction {} for DDD event {} [offset={}]",
+                        "Dispatching event reaction {} for DDD event {} [position={}]",
                         id.value,
                         envelope.metadata.eventId.value,
-                        envelope.globalOffset,
+                        envelope.position,
                     )
                     executor.dispatch(id, trigger)
                 }

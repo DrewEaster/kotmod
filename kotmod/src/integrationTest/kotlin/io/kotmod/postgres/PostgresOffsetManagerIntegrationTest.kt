@@ -1,5 +1,6 @@
 package io.kotmod.postgres
 
+import io.kotmod.EventLogPosition
 import io.kotmod.postgres.support.IntegrationTest
 import org.junit.jupiter.api.BeforeEach
 import kotlin.test.Test
@@ -14,30 +15,30 @@ class PostgresOffsetManagerIntegrationTest : IntegrationTest() {
     }
 
     @Test
-    fun `getOffset returns INITIAL_OFFSET for an unknown consumer`() {
-        assertEquals(PostgresOffsetManager.INITIAL_OFFSET, offsets.getOffset("orders-outbox"))
+    fun `getPosition returns START for an unknown consumer`() {
+        assertEquals(EventLogPosition.START, offsets.getPosition("orders-outbox"))
     }
 
     @Test
-    fun `saveOffset then getOffset round-trips`() {
-        offsets.saveOffset("orders-outbox", 10)
-        assertEquals(10L, offsets.getOffset("orders-outbox"))
+    fun `savePosition then getPosition round-trips`() {
+        offsets.savePosition("orders-outbox", EventLogPosition(7, 10))
+        assertEquals(EventLogPosition(7, 10), offsets.getPosition("orders-outbox"))
     }
 
     @Test
-    fun `saveOffset overwrites the previous offset`() {
-        offsets.saveOffset("orders-outbox", 10)
-        offsets.saveOffset("orders-outbox", 42)
-        assertEquals(42L, offsets.getOffset("orders-outbox"))
+    fun `savePosition overwrites the previous position`() {
+        offsets.savePosition("orders-outbox", EventLogPosition(7, 10))
+        offsets.savePosition("orders-outbox", EventLogPosition(9, 42))
+        assertEquals(EventLogPosition(9, 42), offsets.getPosition("orders-outbox"))
     }
 
     @Test
-    fun `offsets are independent per consumer`() {
-        offsets.saveOffset("orders-outbox", 42)
-        offsets.saveOffset("public-contract", 3)
+    fun `positions are independent per consumer`() {
+        offsets.savePosition("orders-outbox", EventLogPosition(9, 42))
+        offsets.savePosition("public-contract", EventLogPosition(3, 3))
 
-        assertEquals(42L, offsets.getOffset("orders-outbox"))
-        assertEquals(3L, offsets.getOffset("public-contract"))
-        assertEquals(PostgresOffsetManager.INITIAL_OFFSET, offsets.getOffset("someone-else"))
+        assertEquals(EventLogPosition(9, 42), offsets.getPosition("orders-outbox"))
+        assertEquals(EventLogPosition(3, 3), offsets.getPosition("public-contract"))
+        assertEquals(EventLogPosition.START, offsets.getPosition("someone-else"))
     }
 }

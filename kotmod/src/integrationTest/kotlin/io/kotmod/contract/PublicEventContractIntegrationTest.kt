@@ -139,8 +139,8 @@ class PublicEventContractIntegrationTest : IntegrationTest() {
                             is TestInternalEvent.InternalNote -> null
                         }
                     },
-                    getOffset = { offsets.getOffset(CONSUMER) },
-                    saveOffset = { offsets.saveOffset(CONSUMER, it) },
+                    getPosition = { offsets.getPosition(CONSUMER) },
+                    savePosition = { offsets.savePosition(CONSUMER, it) },
                     isLeader = { true },
                     pollInterval = 50.milliseconds,
                     batchSize = 10,
@@ -163,7 +163,7 @@ class PublicEventContractIntegrationTest : IntegrationTest() {
             try {
                 // The filtered event still advances the cursor, so offset 3 means all three were handled.
                 withTimeout(5.seconds) {
-                    while (offsets.getOffset(CONSUMER) < 3) delay(50)
+                    while (offsets.getPosition(CONSUMER).globalOffset < 3) delay(50)
                 }
             } finally {
                 contract.stop()

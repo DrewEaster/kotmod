@@ -1,6 +1,7 @@
 package io.kotmod.outbox
 
 import io.kotmod.DomainEventPollingBackend
+import io.kotmod.EventLogPosition
 import io.kotmod.PersistedEvent
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -17,13 +18,13 @@ import kotlin.time.Duration
 
 /**
  * The polling loop shared by [AggregateEventOutbox] and [io.kotmod.contract.PublicEventContract]:
- * reads events after the saved offset, hands each one to [handleEvent], and saves the offset after each
- * event. An exception stops the current batch; the next poll resumes from the last saved offset.
+ * reads events after the saved position, hands each one to [handleEvent], and saves the position after each
+ * event. An exception stops the current batch; the next poll resumes from the last saved position.
  */
 internal class DomainEventPoller(
     private val backend: DomainEventPollingBackend,
-    private val getOffset: () -> Long,
-    private val saveOffset: (Long) -> Unit,
+    private val getPosition: () -> EventLogPosition,
+    private val savePosition: (EventLogPosition) -> Unit,
     private val isLeader: () -> Boolean,
     private val pollInterval: Duration,
     private val batchSize: Int,
@@ -65,24 +66,24 @@ internal class DomainEventPoller(
     private suspend fun tick() {
         if (!isLeader()) return
 
-        val lastOffset =
+        val position =
             withContext(Dispatchers.IO) {
-                getOffset()
+                getPosition()
             }
         val rows =
             withContext(Dispatchers.IO) {
-                backend.readEventsAfter(lastOffset, batchSize)
+                backend.readEventsAfter(position, batchSize)
             }
 
         for (envelope in rows) {
             log.debug(
-                "Handling DDD event {} [offset={}]",
+                "Handling DDD event {} [position={}]",
                 envelope.metadata.eventId.value,
-                envelope.globalOffset
+                envelope.position
             )
             handleEvent(envelope)
             withContext(Dispatchers.IO) {
-                saveOffset(envelope.globalOffset)
+                savePosition(envelope.position)
             }
         }
     }
