@@ -44,7 +44,7 @@ class QuickstartTest : IntegrationTest() {
     }
 
     @Test
-    fun `quickstart places and ships an order and sends one confirmation`() =
+    fun `quickstart places and ships an order and sends one confirmation, ignoring other aggregate types`() =
         runBlocking {
             val sentConfirmations = CopyOnWriteArrayList<String>()
 
@@ -61,13 +61,18 @@ class QuickstartTest : IntegrationTest() {
                     +OrderCancelled.serializer().toEventSerializer()
                 }
 
+            val orderType = AggregateType("Order")
+
             val orders =
                 AggregateManager(
-                    aggregateType = AggregateType("Order"),
+                    aggregateType = orderType,
                     repository = OrderRepository(driver),
                     backend = PostgresDomainPersistenceBackend(driver, serialization),
                     transacter = object : TransacterImpl(driver) {},
                 )
+
+            // Another aggregate type writing to the same event log, as an app with an audit log would.
+            recordView(auditLog(driver), AggregateId("order-1"), viewer = "support", requestId = "view-1")
 
             val orderId = AggregateId("order-1")
 
@@ -124,15 +129,20 @@ class QuickstartTest : IntegrationTest() {
                     backend = PostgresDomainPollingBackend(driver),
                     executor = executor,
                     eventToReactions = { event ->
-                        when (serialization.deserialize(event.serialized)) {
-                            is OrderPlaced ->
-                                listOf(
-                                    EventReaction(
-                                        id = EventReactionId("confirmation-${event.metadata.eventId.value}"),
-                                        trigger = SendOrderConfirmation(orderId = event.metadata.aggregateId.value),
-                                    ),
-                                )
-                            else -> emptyList()
+                        if (event.metadata.aggregateType != orderType) {
+                            // The event log holds every aggregate type's events; only order events can be read here.
+                            emptyList()
+                        } else {
+                            when (serialization.deserialize(event.serialized)) {
+                                is OrderPlaced ->
+                                    listOf(
+                                        EventReaction(
+                                            id = EventReactionId("confirmation-${event.metadata.eventId.value}"),
+                                            trigger = SendOrderConfirmation(orderId = event.metadata.aggregateId.value),
+                                        ),
+                                    )
+                                else -> emptyList()
+                            }
                         }
                     },
                     getOffset = { offsets.getOffset("order-notifications") },

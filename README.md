@@ -41,12 +41,25 @@ your own application, on the Postgres database you already have.
 
 <!-- not-compiled -->
 ```kotlin
+plugins {
+    kotlin("jvm") version "2.4.20"
+    kotlin("plugin.serialization") version "2.4.20" // for @Serializable events and triggers
+}
+
 dependencies {
     implementation("io.kotmod:kotmod:<version>")
+
+    // Used directly by the code in this README:
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+    implementation("app.cash.sqldelight:jdbc-driver:2.4.0")
+    implementation("org.postgresql:postgresql:42.7.13")
 }
 ```
 
 > kotmod is not yet published to Maven Central — publishing is coming soon.
+
+You also need a `javax.sql.DataSource` for your database, for example from HikariCP.
 
 Requirements:
 
@@ -60,6 +73,13 @@ Requirements:
 This walks through a tiny orders domain: you place an order, ship it, and send a confirmation email
 whenever an order is placed. It uses kotmod's Postgres backends and runs event reactions on
 db-scheduler.
+
+Snippets leave out imports. The complete, compiled code is in
+[`Quickstart.kt`](src/integrationTest/kotlin/io/kotmod/readme/Quickstart.kt) and
+[`QuickstartTest.kt`](src/integrationTest/kotlin/io/kotmod/readme/QuickstartTest.kt). Two names to
+watch: `Duration` is `kotlin.time.Duration`, and `EventReactionFailed` and `EventReactionCancelled` exist
+in both `EventReactionExecutionResult` and `EventReactionCompletionResult`, so use the qualified forms
+shown.
 
 ### 1. Create the tables
 
@@ -140,9 +160,11 @@ val serialization =
         +OrderCancelled.serializer().toEventSerializer()
     }
 
+val orderType = AggregateType("Order")
+
 val orders =
     AggregateManager(
-        aggregateType = AggregateType("Order"),
+        aggregateType = orderType,
         repository = OrderRepository(driver),
         backend = PostgresDomainPersistenceBackend(driver, serialization),
         transacter = object : TransacterImpl(driver) {},
@@ -310,8 +332,11 @@ val executor =
 ```
 
 Finally, the `AggregateEventOutbox` reads the event log and turns each `OrderPlaced` into a confirmation
-reaction. The reaction id is built from the event id, so if the same event is ever dispatched twice it is
-recognised as the same reaction. `PostgresOffsetManager` remembers how far the outbox has read:
+reaction. The event log holds the events of *every* aggregate type, so the outbox skips anything that
+isn't an order before deserializing — an event it can't deserialize would stop it in its tracks. The
+reaction id is built from the event id, so if the same event is dispatched again while its reaction is
+still pending, it is recognised as the same reaction. `PostgresOffsetManager` remembers how far the
+outbox has read:
 
 ```kotlin
 val offsets = PostgresOffsetManager(driver)
@@ -321,15 +346,20 @@ val outbox =
         backend = PostgresDomainPollingBackend(driver),
         executor = executor,
         eventToReactions = { event ->
-            when (serialization.deserialize(event.serialized)) {
-                is OrderPlaced ->
-                    listOf(
-                        EventReaction(
-                            id = EventReactionId("confirmation-${event.metadata.eventId.value}"),
-                            trigger = SendOrderConfirmation(orderId = event.metadata.aggregateId.value),
-                        ),
-                    )
-                else -> emptyList()
+            if (event.metadata.aggregateType != orderType) {
+                // The event log holds every aggregate type's events; only order events can be read here.
+                emptyList()
+            } else {
+                when (serialization.deserialize(event.serialized)) {
+                    is OrderPlaced ->
+                        listOf(
+                            EventReaction(
+                                id = EventReactionId("confirmation-${event.metadata.eventId.value}"),
+                                trigger = SendOrderConfirmation(orderId = event.metadata.aggregateId.value),
+                            ),
+                        )
+                    else -> emptyList()
+                }
             }
         },
         getOffset = { offsets.getOffset("order-notifications") },
@@ -413,7 +443,7 @@ suspend fun cancelOrder(
 ```
 
 **Idempotency.** Pass a `CommandId` you control — a request id, a message id — and a retried command
-returns the result of its first run instead of applying twice. Without one, kotmod generates a random
+returns the aggregate's current state without running again. Without one, kotmod generates a random
 id and the call is not idempotent. Pass a `CorrelationId` to tie together all the events of one wider
 flow; it is stored with every event.
 
@@ -477,8 +507,9 @@ suspend fun recordView(
 ```
 
 `emit` creates the aggregate's bookkeeping the first time it is called for an id. Command ids and
-optimistic concurrency work exactly as they do for `AggregateManager`, and the events flow through the
-outbox like any others.
+optimistic concurrency work exactly as they do for `AggregateManager`. Its events go into the same event
+log as everything else, so an outbox that deserializes with your order serialization must skip them by
+aggregate type, as the quickstart's outbox does.
 
 ### Event serialization and schema migrations
 
@@ -540,7 +571,8 @@ consumer name.
 `AggregateEventOutbox` is the outbox: while running it reads events after its saved offset, maps each
 one to event reactions with `eventToReactions`, dispatches them to an `EventReactionExecutor`, and saves
 the offset after each event. If dispatching fails, the batch stops and the next poll starts again from
-the last saved offset, so no event is skipped.
+the last saved offset. (Under concurrent writes there is one case where an event can be missed; see
+[Running in production](#running-in-production).)
 
 `EventReactionExecutor` runs each reaction:
 
@@ -683,13 +715,24 @@ fun orderContract(
 - A contract can have several subscribers, each with its own executor. Subscribe before calling
   `start()`.
 - A contract reads the event log independently of the outbox, so give it its own consumer name.
+- A contract deserializes **every** event in the log before mapping it, so its `serialization` must be
+  able to read every event type your application writes. If you have several event families (orders and
+  audit events, say), register them all in one `jsonDataSerializationContext<DomainEvent>` and use
+  `DomainEvent` as the contract's internal type.
 
 ## Running in production
 
-**Delivery is at-least-once.** Events are never lost: they are committed with the state change, and the
-outbox only moves past an event once all of its reactions are dispatched. But a reaction can run more
-than once — for example if the process dies after dispatching but before saving the offset, or if a
-shutdown interrupts a running reaction. Make `execute` and `onCompletion` idempotent.
+**Delivery is at-least-once.** Events are committed with the state change that produced them, and the
+outbox only moves past an event once all of its reactions are dispatched. A reaction can run more than
+once — for example if the process dies after dispatching but before saving the offset, or if a shutdown
+interrupts a running reaction. Make `execute` and `onCompletion` idempotent.
+
+**Known limitation: concurrent writes can cause missed events.** Event offsets come from a Postgres
+sequence, and two transactions can commit in a different order from the offsets they were given. If the
+outbox (or a public contract) reads the later event before the earlier transaction commits, it saves an
+offset past the earlier event and never reads it, so that event's reactions never run. This can happen
+whenever commands commit concurrently. Until it is fixed, take it into account before relying on kotmod
+for reactions that must never be missed.
 
 **Use deterministic reaction ids.** Build each reaction id from the event id plus a label, as in
 `"confirmation-${event.metadata.eventId.value}"`. Then a re-dispatched event is recognised as a
@@ -713,6 +756,7 @@ needs no such care: it is safe to run on every node, and each reaction runs on o
 | A reaction's stored data can't be read | Retried with backoff from 10 seconds up to 1 hour |
 | A node crashes mid-reaction | db-scheduler notices the missing heartbeat and runs it again |
 | The database is down while dispatching | The outbox batch stops and resumes from the last saved offset on the next poll |
+| The outbox can't deserialize an event (e.g. another aggregate type's) | The batch stops and is retried every poll, so later events wait — filter by aggregate type as the quickstart does |
 | A command loses a concurrent update | `OptimisticConcurrencyException` — run the command again |
 
 **Tune throughput.** The outbox and contracts poll every 500ms (`pollInterval`) and read up to 100
