@@ -583,7 +583,7 @@ kotmod's Postgres classes use plain JDBC through a `JdbcContext`. For a plain `D
 
 | Table | Holds |
 |---|---|
-| `ddd_aggregate_root` | Each aggregate's version and timestamps |
+| `ddd_aggregate_root` | Each aggregate's version, sequence counter and timestamps, and whether it has events out of order in the log |
 | `ddd_domain_event` | The event log, ordered by `(transaction_id, global_offset)`, with each event's `aggregate_sequence` |
 | `ddd_command_history` | Which commands each aggregate has handled |
 | `ddd_consumer_offset` | How far each outbox or contract has read (a transaction id and offset) |
@@ -720,7 +720,9 @@ anything else that must apply an aggregate's changes in order. For those, ask fo
 Set it with `ordering = ReactionOrdering.PerAggregate(…)` on `AggregateEventOutbox`, or on
 `PublicEventContract.subscribe(executor, ordering = …) { … }`. The outbox dispatches each aggregate's
 events in sequence order (see `event.metadata.sequence`), even in the rare case where the order in the
-log differs because a transaction changed several aggregates.
+log differs because a transaction changed several aggregates. To do this, every outbox and contract checks
+each event it reads; for an aggregate that has never been written out of order this check is a single
+primary-key lookup.
 
 Ordering needs support from the queue. With db-scheduler, pass `jdbc` to `DbSchedulerEventReactions`; an
 ordered outbox or subscription whose sink does not support ordering fails with an

@@ -100,10 +100,19 @@ ORDER BY e.aggregate_sequence
 ```
 
 It is one statement per event and returns only the earlier events still ahead (normally none, so one row
-of NULLs) plus the scalar `highest_passed`, so its cost does not grow with the aggregate's history. No extra
-state is stored: both checks derive from the event log and the saved position, so restarts are correct, and
-a crash mid-way only repeats a dispatch (at-least-once). This runs for every subscription (cheap, harmless
-for unordered ones).
+of NULLs) plus the scalar `highest_passed`. Its cost can grow with the aggregate's history (e.g. on replay,
+when the saved position is far behind the aggregate's newest events), so it only runs for aggregates that have
+had an out-of-order write. `ddd_aggregate_root` gains `last_transaction_id XID8 NOT NULL DEFAULT
+pg_current_xact_id()` and `has_out_of_order_events BOOLEAN NOT NULL DEFAULT FALSE`; `saveMeta` sets
+`last_transaction_id = pg_current_xact_id()` and, on update, `has_out_of_order_events = has_out_of_order_events
+OR pg_current_xact_id() < last_transaction_id`. Under the row lock the last writer has committed, and while the
+flag is false writers' ids rise with the sequence, so an inversion can only come from a writer whose id is below
+the last writer's: any event that needs more than `InOrder` has its flagging write committed by the time the
+poller checks it. The check therefore first reads the flag (a primary-key lookup) and returns `InOrder` when it
+is false or the row is missing; the full query runs only for flagged aggregates, whose replay cost grows with
+their history. Both checks derive from the event log, the flag and the saved position, so restarts are correct,
+and a crash mid-way only repeats a dispatch (at-least-once). This runs for every subscription (cheap for
+normal aggregates, harmless for unordered ones).
 
 `DomainEventPollingBackend` gains the operation needed for this check (e.g.
 `outOfOrderNeighbours(event, position): List<PersistedEvent>` with a readability flag); the plan fixes the

@@ -87,8 +87,9 @@ class PostgresDomainPersistenceBackend<E : DomainEvent>(
                     conn
                         .prepareStatement(
                             "INSERT INTO ddd_aggregate_root " +
-                                "(aggregate_type, aggregate_id, aggregate_version, last_sequence, created_at, updated_at) " +
-                                "VALUES (?, ?, 1, ?, ?, ?) RETURNING last_sequence",
+                                "(aggregate_type, aggregate_id, aggregate_version, last_sequence, last_transaction_id, " +
+                                "created_at, updated_at) " +
+                                "VALUES (?, ?, 1, ?, pg_current_xact_id(), ?, ?) RETURNING last_sequence",
                         ).use { ps ->
                             ps.setString(1, type.value)
                             ps.setString(2, id.value)
@@ -105,10 +106,17 @@ class PostgresDomainPersistenceBackend<E : DomainEvent>(
                     throw e
                 }
             } else {
+                // Flag the aggregate when this writer's transaction id is below the last writer's. The row lock
+                // means the last writer has committed. While unflagged, writers' ids rise with the sequence, so
+                // the last writer's id is the highest; an event read before an earlier-sequence event of the same
+                // aggregate can only come from a writer whose id is below it. So any event that needs more than
+                // InOrder from checkSequence was preceded by a committed flagging write. (SET sees old values.)
                 conn
                     .prepareStatement(
                         "UPDATE ddd_aggregate_root " +
-                            "SET aggregate_version = ?, last_sequence = last_sequence + ?, updated_at = ? " +
+                            "SET aggregate_version = ?, last_sequence = last_sequence + ?, updated_at = ?, " +
+                            "has_out_of_order_events = has_out_of_order_events OR pg_current_xact_id() < last_transaction_id, " +
+                            "last_transaction_id = pg_current_xact_id() " +
                             "WHERE aggregate_type = ? AND aggregate_id = ? AND aggregate_version = ? " +
                             "RETURNING last_sequence",
                     ).use { ps ->
@@ -245,6 +253,9 @@ class PostgresDomainPollingBackend(
         position: EventLogPosition,
     ): SequenceCheck =
         jdbc.withConnection { conn ->
+            // Fast path: an aggregate never written out of transaction order (see saveMeta) is read in sequence
+            // order, so this primary-key lookup is all most events need.
+            if (!hasOutOfOrderEvents(conn, event)) return@withConnection SequenceCheck.InOrder
             // One statement: the highest sequence already passed (always returned, even with no earlier events
             // ahead) left-joined to the earlier events of the aggregate that sit after the saved position.
             conn
@@ -290,6 +301,19 @@ class PostgresDomainPollingBackend(
                     }
                 }
         }
+
+    private fun hasOutOfOrderEvents(
+        conn: Connection,
+        event: PersistedEvent,
+    ): Boolean =
+        conn
+            .prepareStatement(
+                "SELECT has_out_of_order_events FROM ddd_aggregate_root WHERE aggregate_type = ? AND aggregate_id = ?",
+            ).use { ps ->
+                ps.setString(1, event.metadata.aggregateType.value)
+                ps.setString(2, event.metadata.aggregateId.value)
+                ps.executeQuery().use { rs -> rs.next() && rs.getBoolean(1) }
+            }
 
     /**
      * A saved position whose transaction id is at or beyond the server's next transaction id can only come from

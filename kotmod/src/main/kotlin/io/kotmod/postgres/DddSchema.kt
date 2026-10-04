@@ -14,6 +14,8 @@ object DddSchema {
             aggregate_id      VARCHAR(72)  NOT NULL,
             aggregate_version BIGINT       NOT NULL,
             last_sequence     BIGINT       NOT NULL,
+            last_transaction_id XID8       NOT NULL DEFAULT pg_current_xact_id(),
+            has_out_of_order_events BOOLEAN NOT NULL DEFAULT FALSE,
             created_at        TIMESTAMPTZ  NOT NULL,
             updated_at        TIMESTAMPTZ  NOT NULL,
             PRIMARY KEY (aggregate_type, aggregate_id)

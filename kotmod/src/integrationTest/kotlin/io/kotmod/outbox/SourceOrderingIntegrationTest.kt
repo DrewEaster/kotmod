@@ -1,12 +1,17 @@
 package io.kotmod.outbox
 
+import io.kotmod.AggregateId
+import io.kotmod.AggregateType
 import io.kotmod.EventLogPosition
 import io.kotmod.event.reaction.EventReaction
 import io.kotmod.event.reaction.EventReactionId
 import io.kotmod.event.reaction.EventReactionTrigger
+import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.PostgresDomainPollingBackend
+import io.kotmod.postgres.support.ConnectionJdbcContext
 import io.kotmod.postgres.support.IntegrationTest
 import io.kotmod.postgres.support.eventually
+import io.kotmod.postgres.support.orderEventSerialization
 import io.kotmod.postgres.support.recordingExecutor
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -30,11 +35,16 @@ class SourceOrderingIntegrationTest : IntegrationTest() {
         conn.createStatement().use { it.executeQuery("SELECT pg_current_xact_id()").close() }
     }
 
+    /** Writes [aggregateId]'s next event on [conn] through the real saveMeta, as a command would. */
     private fun insert(
         conn: Connection,
         aggregateId: String,
         sequence: Long,
     ) {
+        val backend = PostgresDomainPersistenceBackend(ConnectionJdbcContext(conn), orderEventSerialization())
+        val type = AggregateType("Order")
+        val id = AggregateId(aggregateId)
+        assertEquals(sequence, backend.saveMeta(type, id, expectedVersion = backend.loadMeta(type, id)?.version, eventCount = 1))
         conn
             .prepareStatement(
                 "INSERT INTO ddd_domain_event (aggregate_type, aggregate_id, aggregate_sequence, causation_id, " +
@@ -47,6 +57,16 @@ class SourceOrderingIntegrationTest : IntegrationTest() {
                 ps.executeUpdate()
             }
     }
+
+    private fun flagged(aggregateId: String): Boolean =
+        dataSource.connection.use { conn ->
+            conn
+                .prepareStatement("SELECT has_out_of_order_events FROM ddd_aggregate_root WHERE aggregate_type = 'Order' AND aggregate_id = ?")
+                .use { ps ->
+                    ps.setString(1, aggregateId)
+                    ps.executeQuery().use { rs -> rs.next() && rs.getBoolean(1) }
+                }
+        }
 
     private fun outbox(dispatched: MutableList<String>): AggregateEventOutbox<Seen> {
         val position = AtomicReference(EventLogPosition.START)
@@ -77,6 +97,7 @@ class SourceOrderingIntegrationTest : IntegrationTest() {
             insert(t1, "A", 3) // later in A's history, earlier transaction id
             t1.commit()
             t1.close()
+            assertEquals(true, flagged("A"), "the inverted write flags the aggregate")
 
             val dispatched = CopyOnWriteArrayList<String>()
             val outbox = outbox(dispatched)
