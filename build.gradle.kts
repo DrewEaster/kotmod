@@ -37,7 +37,7 @@ dependencies {
 sqldelight {
     databases {
         create("InfrastructureDatabase") {
-            packageName.set("com.dreweaster.infrastructureservices.db.sqldelight")
+            packageName.set("io.kotmod.db")
             srcDirs("src/main/sqldelight/global")
             dialect("app.cash.sqldelight:postgresql-dialect:2.4.0")
         }
