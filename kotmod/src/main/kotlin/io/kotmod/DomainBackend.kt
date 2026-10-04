@@ -13,6 +13,12 @@ interface DomainPersistenceBackend<E : DomainEvent> {
      */
     fun <R> inTransaction(block: () -> R): R
 
+    /**
+     * Returns whether a transaction is open on the current thread, so a command called from inside one (for
+     * example the app's own SQLDelight transaction) joins it instead of opening its own.
+     */
+    fun isInTransaction(): Boolean = false
+
     /** Returns the bookkeeping for aggregate [type]/[id], or `null` if it does not exist. */
     fun loadMeta(
         type: AggregateType,

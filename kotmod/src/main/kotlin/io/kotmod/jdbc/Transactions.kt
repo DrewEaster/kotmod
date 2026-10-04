@@ -1,12 +1,12 @@
 package io.kotmod.jdbc
 
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.ContinuationInterceptor
 import kotlin.coroutines.CoroutineContext
 
 /**
@@ -27,6 +27,7 @@ class KotmodTransaction internal constructor(
          */
         fun requireCompatible(jdbc: JdbcContext) {
             val open = current.get() ?: return
+            open.requireOwningThread()
             check(open.jdbc == jdbc) {
                 "A kotmod transaction is open on this thread for a different JdbcContext; " +
                     "use the same JdbcContext for everything inside jdbc.transaction { }"
@@ -58,8 +59,9 @@ class KotmodTransaction internal constructor(
  * [block] returns and rolls back if it throws or is cancelled.
  *
  * Run commands one after another inside [block], never in parallel, and don't switch threads (e.g. with
- * `withContext`) — doing so throws [IllegalStateException]. Keep [block] short: it holds a database
- * transaction open.
+ * `withContext`) — doing so throws [IllegalStateException]. [block] keeps the caller's coroutine context.
+ * If something inside fails and you catch it and carry on, the transaction is rolled back anyway and
+ * [TransactionRolledBackException] is thrown. Keep [block] short: it holds a database transaction open.
  */
 suspend fun <R> JdbcContext.transaction(block: suspend () -> R): R {
     val open = currentCoroutineContext()[KotmodTransaction]
@@ -68,34 +70,55 @@ suspend fun <R> JdbcContext.transaction(block: suspend () -> R): R {
             "A kotmod transaction is open for a different JdbcContext; use the same JdbcContext for everything inside jdbc.transaction { }"
         }
         open.requireOwningThread()
-        return block()
+        return failuresMarkRollbackOnly { block() }
     }
 
     if (isInTransaction()) {
         val joined = KotmodTransaction(this, Thread.currentThread())
-        return withContext(joined + KotmodTransaction.current.asContextElement(joined)) { block() }
+        return withContext(joined + KotmodTransaction.current.asContextElement(joined)) {
+            failuresMarkRollbackOnly { block() }
+        }
     }
 
     return withContext(Dispatchers.IO) {
-        val parentJob = currentCoroutineContext()[Job]
+        // Keep the caller's context (job, name, tracing/MDC elements) but run on this thread, not a dispatcher.
+        val callerContext = currentCoroutineContext().minusKey(ContinuationInterceptor)
         inTransaction {
             val opened = KotmodTransaction(this@transaction, Thread.currentThread())
-            val context = opened + KotmodTransaction.current.asContextElement(opened)
-            runBlocking(if (parentJob != null) context + parentJob else context) { block() }
+            runBlocking(callerContext + opened + KotmodTransaction.current.asContextElement(opened)) { block() }
         }
     }
 }
 
 /**
- * Runs kotmod's blocking database work for a command: on the owning thread inside an outer
- * [transaction], otherwise on [Dispatchers.IO].
+ * Runs [block] inside an already-open transaction. If it throws, the enclosing transaction is marked
+ * rollback-only (by letting the failure escape a nested [JdbcContext.inTransaction]), so catching the
+ * failure further out can't lead to a partial commit.
  */
-internal suspend fun <R> databaseWork(block: () -> R): R {
-    val open = currentCoroutineContext()[KotmodTransaction]
-    return if (open == null) {
-        withContext(Dispatchers.IO) { block() }
-    } else {
-        open.requireOwningThread()
+private suspend fun <R> JdbcContext.failuresMarkRollbackOnly(block: suspend () -> R): R =
+    try {
         block()
+    } catch (failure: Throwable) {
+        inTransaction { throw failure }
+    }
+
+/**
+ * Runs kotmod's blocking database work for a command. Inside an outer [transaction] it runs on the owning
+ * thread; if [inTransactionOnThisThread] reports a transaction already open on the calling thread (for
+ * example the app's own SQLDelight transaction, called from blocking code) it joins it there; otherwise it
+ * switches to [Dispatchers.IO].
+ */
+internal suspend fun <R> databaseWork(
+    inTransactionOnThisThread: () -> Boolean,
+    block: () -> R,
+): R {
+    val open = currentCoroutineContext()[KotmodTransaction]
+    return when {
+        open != null -> {
+            open.requireOwningThread()
+            block()
+        }
+        inTransactionOnThisThread() -> block()
+        else -> withContext(Dispatchers.IO) { block() }
     }
 }

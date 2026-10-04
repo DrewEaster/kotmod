@@ -38,7 +38,7 @@ class EventProducer<E : DomainEvent>(
 
         // Phase 1: Read — dedup check, load existing version
         val readResult =
-            databaseWork {
+            databaseWork(backend::isInTransaction) {
                 if (backend.wasCommandHandled(aggregateType, id, resolvedCommandId)) {
                     ReadPhaseResult.Dedup
                 } else {
@@ -49,7 +49,7 @@ class EventProducer<E : DomainEvent>(
         val existingVersion = (readResult as ReadPhaseResult.Proceed).existingVersion
 
         // Phase 2: Write — tight transaction
-        databaseWork {
+        databaseWork(backend::isInTransaction) {
             backend.inTransaction {
                 backend.saveMeta(aggregateType, id, expectedVersion = existingVersion)
                 if (events.isNotEmpty()) {

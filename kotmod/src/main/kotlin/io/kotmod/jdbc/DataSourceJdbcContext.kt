@@ -11,23 +11,38 @@ import javax.sql.DataSource
 class DataSourceJdbcContext(
     private val dataSource: DataSource,
 ) : JdbcContext {
-    private val transactionConnection = ThreadLocal<Connection?>()
+    private class OpenTransaction(
+        val connection: Connection,
+    ) {
+        var rollbackOnly = false
+    }
+
+    private val openTransaction = ThreadLocal<OpenTransaction?>()
 
     override fun <R> withConnection(block: (Connection) -> R): R {
         KotmodTransaction.requireCompatible(this)
-        val open = transactionConnection.get()
-        return if (open != null) block(open) else dataSource.connection.use(block)
+        val open = openTransaction.get()
+        return if (open != null) block(open.connection) else dataSource.connection.use(block)
     }
 
     override fun <R> inTransaction(block: () -> R): R {
         KotmodTransaction.requireCompatible(this)
-        if (transactionConnection.get() != null) return block()
+        val enclosing = openTransaction.get()
+        if (enclosing != null) {
+            try {
+                return block()
+            } catch (failure: Throwable) {
+                enclosing.rollbackOnly = true
+                throw failure
+            }
+        }
 
         val connection = dataSource.connection
         val previousAutoCommit = connection.autoCommit
         try {
             connection.autoCommit = false
-            transactionConnection.set(connection)
+            val transaction = OpenTransaction(connection)
+            openTransaction.set(transaction)
             val result =
                 try {
                     block()
@@ -39,10 +54,14 @@ class DataSourceJdbcContext(
                     }
                     throw failure
                 }
+            if (transaction.rollbackOnly) {
+                connection.rollback()
+                throw TransactionRolledBackException(ROLLBACK_ONLY_MESSAGE)
+            }
             connection.commit()
             return result
         } finally {
-            transactionConnection.remove()
+            openTransaction.remove()
             try {
                 connection.autoCommit = previousAutoCommit
             } finally {
@@ -51,5 +70,5 @@ class DataSourceJdbcContext(
         }
     }
 
-    override fun isInTransaction(): Boolean = transactionConnection.get() != null
+    override fun isInTransaction(): Boolean = openTransaction.get() != null
 }

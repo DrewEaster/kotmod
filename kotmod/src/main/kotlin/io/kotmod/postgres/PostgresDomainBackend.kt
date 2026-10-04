@@ -39,6 +39,8 @@ class PostgresDomainPersistenceBackend<E : DomainEvent>(
 ) : DomainPersistenceBackend<E> {
     override fun <R> inTransaction(block: () -> R): R = jdbc.inTransaction(block)
 
+    override fun isInTransaction(): Boolean = jdbc.isInTransaction()
+
     override fun loadMeta(
         type: AggregateType,
         id: AggregateId,

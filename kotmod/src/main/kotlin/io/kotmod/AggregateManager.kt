@@ -45,7 +45,7 @@ class AggregateManager<S : Any, E : DomainEvent>(
 
         // Phase 1: Read — dedup check
         val dedupResult: S? =
-            databaseWork {
+            databaseWork(backend::isInTransaction) {
                 if (backend.wasCommandHandled(aggregateType, id, resolvedCommandId)) {
                     repository.get(id) ?: throw AggregateNotFoundException(
                         aggregateType,
@@ -61,7 +61,7 @@ class AggregateManager<S : Any, E : DomainEvent>(
         val (newState, events) = block()
 
         // Phase 3: Write — tight transaction
-        databaseWork {
+        databaseWork(backend::isInTransaction) {
             backend.inTransaction {
                 backend.saveMeta(aggregateType, id, expectedVersion = null)
                 repository.save(id, newState)
@@ -133,7 +133,7 @@ class AggregateManager<S : Any, E : DomainEvent>(
 
         // Phase 1: Read — dedup check, load meta, load state
         val readResult =
-            databaseWork {
+            databaseWork(backend::isInTransaction) {
                 if (backend.wasCommandHandled(aggregateType, id, resolvedCommandId)) {
                     val current = repository.get(id) ?: throw AggregateNotFoundException(
                         aggregateType,
@@ -160,7 +160,7 @@ class AggregateManager<S : Any, E : DomainEvent>(
                 val (newState, events) = block(currentState)
 
                 // Phase 3: Write — tight transaction
-                databaseWork {
+                databaseWork(backend::isInTransaction) {
                     backend.inTransaction {
                         backend.saveMeta(aggregateType, id, expectedVersion = meta.version)
                         repository.save(id, newState)

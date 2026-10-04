@@ -14,12 +14,14 @@ import io.kotmod.support.OrderShipped
 import io.kotmod.support.PendingOrder
 import io.kotmod.support.ShippedOrder
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.currentCoroutineContext
 import io.kotmod.postgres.support.IntegrationTest
 import org.junit.jupiter.api.BeforeEach
 import javax.sql.DataSource
@@ -328,4 +330,89 @@ abstract class JdbcContextContract : IntegrationTest() {
             assertEquals(0, count("ddd_domain_event"))
             assertEquals(0, count("outer_tx_state"))
         }
+
+    @Test
+    fun `switching threads inside a transaction for your own SQL fails loudly and commits nothing`() =
+        runBlocking {
+            assertFailsWith<IllegalStateException> {
+                context.transaction {
+                    insertProbe("a")
+                    withContext(Dispatchers.IO) { insertProbe("b") }
+                }
+            }
+
+            assertEquals(emptyList(), committedProbes())
+        }
+
+    @Test
+    fun `transaction keeps the caller's coroutine context`() =
+        runBlocking {
+            val name =
+                withContext(CoroutineName("request-42")) {
+                    context.transaction { currentCoroutineContext()[CoroutineName]?.name }
+                }
+
+            assertEquals("request-42", name)
+        }
+
+    @Test
+    fun `carrying on after a nested inTransaction failed rolls back and fails loudly`() {
+        assertFailsWith<TransactionRolledBackException> {
+            context.inTransaction {
+                try {
+                    context.inTransaction {
+                        insertProbe("a")
+                        error("inner fails")
+                    }
+                } catch (_: IllegalStateException) {
+                    // carry on regardless
+                }
+                insertProbe("b")
+            }
+        }
+
+        assertEquals(emptyList(), committedProbes())
+    }
+
+    @Test
+    fun `carrying on after a command failed inside transaction rolls back and fails loudly`() =
+        runBlocking {
+            val orders = manager("Order")
+            val invoices = manager("Invoice")
+            invoices.create(AggregateId("i-1")) { PendingOrder("invoice") to listOf(OrderPlaced("invoice")) }
+
+            assertFailsWith<TransactionRolledBackException> {
+                context.transaction {
+                    orders.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book")) }
+                    try {
+                        invoices.create(AggregateId("i-1")) { PendingOrder("again") to listOf(OrderPlaced("again")) }
+                    } catch (_: AggregateAlreadyExistsException) {
+                        // carry on regardless
+                    }
+                }
+            }
+
+            assertEquals(1, count("ddd_domain_event"))
+            assertEquals(1, count("outer_tx_state"))
+        }
+
+    @Test
+    fun `a command called from blocking code inside an open inTransaction joins it`() {
+        val orders = manager("Order")
+
+        val failure =
+            assertFailsWith<IllegalStateException> {
+                context.inTransaction {
+                    insertProbe("app")
+                    runBlocking {
+                        orders.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book")) }
+                    }
+                    error("app fails after kotmod ran")
+                }
+            }
+
+        assertEquals("app fails after kotmod ran", failure.message)
+        assertEquals(emptyList(), committedProbes())
+        assertEquals(0, count("ddd_domain_event"))
+    }
 }

@@ -490,10 +490,13 @@ suspend fun shipAndInvoice(
 ```
 
 - If any command fails — including an `OptimisticConcurrencyException` on one aggregate — everything rolls
-  back, including the other aggregates' events.
+  back, including the other aggregates' events. Let the exception propagate: if you catch it and carry on,
+  the transaction is still rolled back and kotmod throws `TransactionRolledBackException` rather than commit
+  a partial result.
 - Commands inside the block see each other's uncommitted writes.
 - Run commands one after another, never in parallel, and don't switch threads inside the block (for
-  example with `withContext`); kotmod throws `IllegalStateException` if you do.
+  example with `withContext`) — for kotmod commands or your own SQL; kotmod throws `IllegalStateException`
+  if you do. The block keeps your coroutine context (name, tracing, MDC).
 - Every kotmod class inside the block must use the same `JdbcContext`.
 - Keep the block short: it holds a database transaction open.
 
@@ -598,8 +601,11 @@ generated database. kotmod then runs its transactions through SQLDelight's, so y
 kotmod's writes share one transaction whichever side opens it:
 
 - Inside `jdbc.transaction { }`, call your SQLDelight queries as usual — they join kotmod's transaction.
-- Inside your own `database.transaction { }`, wrap kotmod calls in `runBlocking { jdbc.transaction { … } }`
-  (SQLDelight's block can't suspend); they join your transaction.
+- Inside your own `database.transaction { }`, call kotmod from blocking code (SQLDelight's block can't
+  suspend), e.g. `runBlocking { orders.create(…) }`; commands join your transaction. Wrap several in
+  `runBlocking { jdbc.transaction { … } }` to get kotmod's thread checks too. In a transaction SQLDelight
+  opened, SQLDelight's rules apply: if a kotmod call fails and you catch it, SQLDelight rolls your
+  transaction back when it ends.
 
 Repositories implemented with SQLDelight queries need no changes: they already run inside the transaction.
 
