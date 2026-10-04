@@ -1,6 +1,8 @@
 package io.kotmod.postgres.support
 
 import io.kotmod.event.reaction.Cancellable
+import io.kotmod.event.reaction.DispatchOrdering
+import io.kotmod.event.reaction.ReactionOutcome
 import io.kotmod.event.reaction.EventReactionCompletionResult
 import io.kotmod.event.reaction.EventReactionExecutionId
 import io.kotmod.event.reaction.EventReactionExecutionResult
@@ -25,11 +27,12 @@ fun <T : EventReactionTrigger> recordingExecutor(onDispatch: suspend (EventReact
             override suspend fun publish(
                 id: EventReactionId,
                 trigger: T,
+                ordering: DispatchOrdering?,
             ) = onDispatch(id, trigger)
         }
     val source =
         object : EventReactionTriggerSource<T> {
-            override fun subscribe(block: suspend (EventReactionId, EventReactionExecutionId, T, RetryCount) -> RetrySignal.Retry?) =
+            override fun subscribe(block: suspend (EventReactionId, EventReactionExecutionId, T, RetryCount) -> ReactionOutcome) =
                 object : Cancellable {
                     override fun cancel() {}
                 }

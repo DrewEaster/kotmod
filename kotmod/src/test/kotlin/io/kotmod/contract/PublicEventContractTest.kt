@@ -8,10 +8,13 @@ import io.kotmod.SerializedEvent
 import io.kotmod.DomainEventPollingBackend
 import io.kotmod.PersistedEvent
 import io.kotmod.SequenceCheck
+import io.kotmod.event.reaction.DispatchOrdering
 import io.kotmod.event.reaction.EventReaction
 import io.kotmod.event.reaction.EventReactionExecutor
 import io.kotmod.event.reaction.EventReactionId
 import io.kotmod.event.reaction.EventReactionTrigger
+import io.kotmod.event.reaction.OnGiveUp
+import io.kotmod.event.reaction.ReactionOrdering
 import io.kotmod.support.RecordingOffsets
 import io.kotmod.support.persistedEvent
 import io.mockk.coEvery
@@ -121,7 +124,7 @@ class PublicEventContractTest {
         kotlinx.coroutines.runBlocking { contract.tickForTest() }
 
         verify(exactly = 0) { backend.readEventsAfter(any(), any()) }
-        coVerify(exactly = 0) { executorA.dispatch(any(), any()) }
+        coVerify(exactly = 0) { executorA.dispatch(any(), any(), any()) }
     }
 
     @Test
@@ -148,8 +151,8 @@ class PublicEventContractTest {
 
         assertEquals<List<TestPublicEvent>>(listOf(TestPublicEvent.OpenedPublic("doc-1")), seen)
         coVerifySequence {
-            executorA.dispatch(EventReactionId("reaction-e-10-a"), FakeTrigger("a"))
-            executorA.dispatch(EventReactionId("reaction-e-10-b"), FakeTrigger("b"))
+            executorA.dispatch(EventReactionId("reaction-e-10-a"), FakeTrigger("a"), null)
+            executorA.dispatch(EventReactionId("reaction-e-10-b"), FakeTrigger("b"), null)
         }
         assertEquals(listOf(10L), offsets.saved.map { it.globalOffset })
     }
@@ -181,12 +184,12 @@ class PublicEventContractTest {
         kotlinx.coroutines.runBlocking { contract.tickForTest() }
 
         coVerifySequence {
-            executorA.dispatch(EventReactionId("A-e-10-1"), FakeTrigger("A1"))
-            executorA.dispatch(EventReactionId("A-e-10-2"), FakeTrigger("A2"))
+            executorA.dispatch(EventReactionId("A-e-10-1"), FakeTrigger("A1"), null)
+            executorA.dispatch(EventReactionId("A-e-10-2"), FakeTrigger("A2"), null)
         }
         coVerifySequence {
-            executorB.dispatch(EventReactionId("B-e-10-1"), FakeTrigger("B1"))
-            executorB.dispatch(EventReactionId("B-e-10-2"), FakeTrigger("B2"))
+            executorB.dispatch(EventReactionId("B-e-10-1"), FakeTrigger("B1"), null)
+            executorB.dispatch(EventReactionId("B-e-10-2"), FakeTrigger("B2"), null)
         }
         assertEquals(listOf(10L), offsets.saved.map { it.globalOffset })
     }
@@ -201,7 +204,7 @@ class PublicEventContractTest {
         contract.subscribe(executorA) { emptyList() }
         kotlinx.coroutines.runBlocking { contract.tickForTest() }
 
-        coVerify(exactly = 0) { executorA.dispatch(any(), any()) }
+        coVerify(exactly = 0) { executorA.dispatch(any(), any(), any()) }
         assertEquals(listOf(10L), offsets.saved.map { it.globalOffset })
     }
 
@@ -220,7 +223,7 @@ class PublicEventContractTest {
         contract.subscribe(executorA) { error("should not be invoked — event filtered out") }
         kotlinx.coroutines.runBlocking { contract.tickForTest() }
 
-        coVerify(exactly = 0) { executorA.dispatch(any(), any()) }
+        coVerify(exactly = 0) { executorA.dispatch(any(), any(), any()) }
         assertEquals(listOf(10L), offsets.saved.map { it.globalOffset })
     }
 
@@ -236,7 +239,7 @@ class PublicEventContractTest {
         val caught = runCatching { kotlinx.coroutines.runBlocking { contract.tickForTest() } }
         assertFalse(caught.isSuccess)
 
-        coVerify(exactly = 0) { executorA.dispatch(any(), any()) }
+        coVerify(exactly = 0) { executorA.dispatch(any(), any(), any()) }
         assertEquals(emptyList(), offsets.saved.map { it.globalOffset })
     }
 
@@ -246,8 +249,8 @@ class PublicEventContractTest {
             persistedEvent(globalOffset = 10, eventId = "e-10", eventType = "Opened", eventPayload = "Opened(id=doc-1)"),
         )
 
-        coEvery { executorA.dispatch(any(), any()) } returns Unit
-        coEvery { executorB.dispatch(any(), any()) } throws RuntimeException("sink offline")
+        coEvery { executorA.dispatch(any(), any(), any()) } returns Unit
+        coEvery { executorB.dispatch(any(), any(), any()) } throws RuntimeException("sink offline")
 
         val contract = newContract()
         contract.subscribe(executorA) { listOf(EventReaction(EventReactionId("A"), FakeTrigger("A"))) }
@@ -255,8 +258,8 @@ class PublicEventContractTest {
         val caught = runCatching { kotlinx.coroutines.runBlocking { contract.tickForTest() } }
         assertFalse(caught.isSuccess)
 
-        coVerify(exactly = 1) { executorA.dispatch(EventReactionId("A"), FakeTrigger("A")) }
-        coVerify(exactly = 1) { executorB.dispatch(EventReactionId("B"), FakeTrigger("B")) }
+        coVerify(exactly = 1) { executorA.dispatch(EventReactionId("A"), FakeTrigger("A"), null) }
+        coVerify(exactly = 1) { executorB.dispatch(EventReactionId("B"), FakeTrigger("B"), null) }
         assertEquals(emptyList(), offsets.saved.map { it.globalOffset })
     }
 
@@ -283,5 +286,18 @@ class PublicEventContractTest {
         kotlinx.coroutines.runBlocking { contract.tickForTest() }
 
         assertEquals(1, counting.deserializeCalls)
+    }
+
+    @Test
+    fun `a contract stamps only its ordered subscriptions`() {
+        every { executorA.supportsOrdering } returns true
+        givenEvents(persistedEvent(globalOffset = 10, aggregateId = "o-1", sequence = 2, eventType = "Opened", eventPayload = "Opened(id=doc-1)"))
+        val contract = newContract()
+        contract.subscribe(executorA, ordering = ReactionOrdering.PerAggregate()) { listOf(EventReaction(EventReactionId("A"), FakeTrigger("A"))) }
+        contract.subscribe(executorB) { listOf(EventReaction(EventReactionId("B"), FakeTrigger("B"))) }
+        kotlinx.coroutines.runBlocking { contract.tickForTest() }
+
+        coVerify { executorA.dispatch(EventReactionId("A"), FakeTrigger("A"), DispatchOrdering("Order/o-1", 2, 0, OnGiveUp.ContinueWithNext)) }
+        coVerify { executorB.dispatch(EventReactionId("B"), FakeTrigger("B"), null) }
     }
 }

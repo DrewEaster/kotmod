@@ -6,6 +6,8 @@ import io.kotmod.PersistedEvent
 import io.kotmod.event.reaction.EventReaction
 import io.kotmod.event.reaction.EventReactionExecutor
 import io.kotmod.event.reaction.EventReactionTrigger
+import io.kotmod.event.reaction.ReactionOrdering
+import io.kotmod.event.reaction.stampFor
 import org.slf4j.LoggerFactory
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
@@ -21,6 +23,8 @@ import kotlin.time.Duration.Companion.milliseconds
  *
  * @param pollInterval pause between polls.
  * @param batchSize maximum number of events read per poll.
+ * @param ordering whether reactions for the same aggregate run in event order; ordered outboxes need an
+ *   executor whose sink supports ordering.
  */
 class AggregateEventOutbox<T : EventReactionTrigger>(
     private val backend: DomainEventPollingBackend,
@@ -31,7 +35,14 @@ class AggregateEventOutbox<T : EventReactionTrigger>(
     isLeader: () -> Boolean,
     pollInterval: Duration = 500.milliseconds,
     batchSize: Int = 100,
+    private val ordering: ReactionOrdering = ReactionOrdering.Unordered,
 ) {
+    init {
+        require(ordering == ReactionOrdering.Unordered || executor.supportsOrdering) {
+            "An ordered outbox needs an executor whose sink supports ordering"
+        }
+    }
+
     private val log = LoggerFactory.getLogger(AggregateEventOutbox::class.java)
 
     private val poller =
@@ -45,14 +56,14 @@ class AggregateEventOutbox<T : EventReactionTrigger>(
             loggerName = "AggregateEventOutbox",
             handleEvent = { envelope ->
                 val reactions = eventToReactions(envelope)
-                for ((id, trigger) in reactions) {
+                reactions.forEachIndexed { ordinal, (id, trigger) ->
                     log.debug(
                         "Dispatching event reaction {} for DDD event {} [position={}]",
                         id.value,
                         envelope.metadata.eventId.value,
                         envelope.position,
                     )
-                    executor.dispatch(id, trigger)
+                    executor.dispatch(id, trigger, ordering.stampFor(envelope.metadata, ordinal))
                 }
             },
         )

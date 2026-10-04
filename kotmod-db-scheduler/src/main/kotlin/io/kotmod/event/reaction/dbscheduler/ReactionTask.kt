@@ -64,10 +64,10 @@ internal fun <T : EventReactionTrigger> reactionTask(
             outcome.toCompletionHandler()
         }
 
-private fun ReactionOutcome.toCompletionHandler(): CompletionHandler<String> =
+private fun TaskRowOutcome.toCompletionHandler(): CompletionHandler<String> =
     CompletionHandler { executionComplete, executionOperations ->
         when (this) {
-            ReactionOutcome.Remove -> executionOperations.remove()
-            is ReactionOutcome.Reschedule -> executionOperations.reschedule(executionComplete, at, taskData)
+            TaskRowOutcome.Remove -> executionOperations.remove()
+            is TaskRowOutcome.Reschedule -> executionOperations.reschedule(executionComplete, at, taskData)
         }
     }

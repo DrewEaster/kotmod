@@ -1,6 +1,7 @@
 package io.kotmod.event.reaction.dbscheduler
 
 import io.kotmod.event.reaction.EventReactionTrigger
+import io.kotmod.event.reaction.ReactionOutcome
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
@@ -13,8 +14,8 @@ class DbSchedulerTriggerSourceTest {
     ) : EventReactionTrigger
 
     private val source = DbSchedulerTriggerSource<FakeTrigger>()
-    private val first: ReactionHandler<FakeTrigger> = { _, _, _, _ -> null }
-    private val second: ReactionHandler<FakeTrigger> = { _, _, _, _ -> null }
+    private val first: ReactionHandler<FakeTrigger> = { _, _, _, _ -> ReactionOutcome.Finished(false) }
+    private val second: ReactionHandler<FakeTrigger> = { _, _, _, _ -> ReactionOutcome.Finished(false) }
 
     @Test
     fun `subscribe stores the handler`() {

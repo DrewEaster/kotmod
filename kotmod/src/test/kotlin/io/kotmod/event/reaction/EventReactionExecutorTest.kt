@@ -18,14 +18,14 @@ class EventReactionExecutorTest {
         override val timeout: Duration? = null,
     ) : EventReactionTrigger
 
-    private lateinit var subscribed: suspend (EventReactionId, EventReactionExecutionId, FakeTrigger, RetryCount) -> RetrySignal.Retry?
+    private lateinit var subscribed: suspend (EventReactionId, EventReactionExecutionId, FakeTrigger, RetryCount) -> ReactionOutcome
     private val failureRetryCalls = AtomicInteger()
     private val timeoutRetryCalls = AtomicInteger()
 
     private val source =
         object : EventReactionTriggerSource<FakeTrigger> {
             override fun subscribe(
-                block: suspend (EventReactionId, EventReactionExecutionId, FakeTrigger, RetryCount) -> RetrySignal.Retry?,
+                block: suspend (EventReactionId, EventReactionExecutionId, FakeTrigger, RetryCount) -> ReactionOutcome,
             ): Cancellable {
                 subscribed = block
                 return object : Cancellable {
@@ -39,6 +39,7 @@ class EventReactionExecutorTest {
             override suspend fun publish(
                 id: EventReactionId,
                 trigger: FakeTrigger,
+                ordering: DispatchOrdering?,
             ) {}
         }
 
@@ -61,6 +62,20 @@ class EventReactionExecutorTest {
 
     private suspend fun runReaction(trigger: FakeTrigger = FakeTrigger()) =
         subscribed(EventReactionId("r-1"), EventReactionExecutionId("x-1"), trigger, 0)
+
+    @Test
+    fun `a completed reaction finishes without giving up`() =
+        runBlocking {
+            startExecutor { EventReactionExecutionResult.EventReactionExecutionCompleted }
+            assertEquals(ReactionOutcome.Finished(gaveUp = false), runReaction())
+        }
+
+    @Test
+    fun `a failed reaction that is not retried finishes as given up`() =
+        runBlocking {
+            startExecutor { EventReactionExecutionResult.EventReactionFailed(RuntimeException("boom")) }
+            assertEquals(ReactionOutcome.Finished(gaveUp = true), runReaction())
+        }
 
     @Test
     fun `cancelling a running reaction propagates instead of being reported as a failure`() =
@@ -88,7 +103,7 @@ class EventReactionExecutorTest {
 
             val result = runReaction(FakeTrigger(timeout = 50.milliseconds))
 
-            assertEquals(RetrySignal.Retry(1.seconds), result)
+            assertEquals(ReactionOutcome.Retry(1.seconds), result)
             assertEquals(1, timeoutRetryCalls.get())
             assertEquals(0, failureRetryCalls.get())
         }

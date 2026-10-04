@@ -1,5 +1,6 @@
 package io.kotmod.event.reaction.dbscheduler
 
+import io.kotmod.event.reaction.DispatchOrdering
 import io.kotmod.event.reaction.EventReactionId
 import io.kotmod.event.reaction.EventReactionTrigger
 import io.kotmod.event.reaction.EventReactionTriggerSerializer
@@ -23,7 +24,9 @@ internal class DbSchedulerTriggerSink<T : EventReactionTrigger>(
     override suspend fun publish(
         id: EventReactionId,
         trigger: T,
+        ordering: DispatchOrdering?,
     ) {
+        require(ordering == null) { "Ordered reactions are not supported yet" }
         val taskData = ReactionTaskData(trigger = triggerSerializer.serialize(trigger), retryCount = 0).encode()
         val scheduled =
             withContext(Dispatchers.IO) {

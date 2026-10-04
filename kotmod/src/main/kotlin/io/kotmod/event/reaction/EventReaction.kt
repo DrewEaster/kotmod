@@ -102,10 +102,18 @@ sealed interface RetrySignal {
 
 /** Accepts dispatched reactions for later execution, e.g. by storing them in a durable queue. */
 interface EventReactionTriggerSink<T : EventReactionTrigger> {
-    /** Queues reaction [id] with [trigger]. Publishing an id that is already queued must not queue it twice. */
+    /** Whether this sink can run reactions in order; only such sinks are passed an [ordering] stamp. */
+    val supportsOrdering: Boolean get() = false
+
+    /**
+     * Queues reaction [id] with [trigger]. Publishing an id that is already queued must not queue it twice.
+     * An ordering stamp is only passed to sinks that support ordering; such sinks must run reactions with the
+     * same key one at a time, in (sequence, ordinal) order.
+     */
     suspend fun publish(
         id: EventReactionId,
         trigger: T,
+        ordering: DispatchOrdering?,
     )
 }
 
@@ -118,10 +126,11 @@ interface Cancellable {
 /** Delivers queued reactions to the [EventReactionExecutor] that subscribed to it. */
 interface EventReactionTriggerSource<T : EventReactionTrigger> {
     /**
-     * Starts delivering reactions to [block], which runs one attempt and returns a [RetrySignal.Retry] if the
-     * reaction should run again, or `null` once it is finished. Returns a handle that stops delivery.
+     * Starts delivering reactions to [block], which runs one attempt and returns a [ReactionOutcome]:
+     * [ReactionOutcome.Retry] if the reaction should run again, or [ReactionOutcome.Finished] once it is done.
+     * Returns a handle that stops delivery.
      */
-    fun subscribe(block: suspend (EventReactionId, EventReactionExecutionId, T, RetryCount) -> RetrySignal.Retry?): Cancellable
+    fun subscribe(block: suspend (EventReactionId, EventReactionExecutionId, T, RetryCount) -> ReactionOutcome): Cancellable
 }
 
 /** Exponential backoff for retries the executor schedules itself: 1s, 2s, 4s… capped at [maximumDuration]. */
@@ -169,9 +178,13 @@ class EventReactionExecutor<T : EventReactionTrigger, ExecutionContext>(
 
     private var subscribeJob: Cancellable? = null
 
-    /** Queues reaction [id] with [trigger] for execution. */
-    suspend fun dispatch(id: EventReactionId, trigger: T) {
-        sink.publish(id, trigger)
+    /** Whether this executor's sink can run reactions in order. */
+    val supportsOrdering: Boolean get() = sink.supportsOrdering
+
+    /** Queues reaction [id] with [trigger] for execution, stamped with [ordering] if given. */
+    suspend fun dispatch(id: EventReactionId, trigger: T, ordering: DispatchOrdering? = null) {
+        require(ordering == null || sink.supportsOrdering) { "This executor's sink does not support ordering" }
+        sink.publish(id, trigger, ordering)
     }
 
     /** Subscribes to the [source] so reactions start executing. */
@@ -199,13 +212,13 @@ class EventReactionExecutor<T : EventReactionTrigger, ExecutionContext>(
                             runCatching {
                                 onCompletion(id, executionId, trigger, retryCount, executionContext,
                                     EventReactionCompletionResult.EventReactionCompleted)
-                                null
+                                ReactionOutcome.Finished(gaveUp = false)
                             }.getOrElse { ex ->
                                 log.error(
                                     "Exception when executing completion handler for event reaction ${id.value} [ totalRetries=$retryCount ]",
                                     ex,
                                 )
-                                RetrySignal.Retry(defaultBackoffStrategy.calculateBackoff(retryCount))
+                                ReactionOutcome.Retry(defaultBackoffStrategy.calculateBackoff(retryCount))
                             }
                         }
                         is EventReactionCancelled -> {
@@ -218,7 +231,7 @@ class EventReactionExecutor<T : EventReactionTrigger, ExecutionContext>(
                                     ex,
                                 )
                             }
-                            null
+                            ReactionOutcome.Finished(gaveUp = false)
                         }
                         is EventReactionFailed -> {
                             log.error("Event reaction ${id.value} failed [ totalRetries=$retryCount ]", result.ex)
@@ -227,7 +240,7 @@ class EventReactionExecutor<T : EventReactionTrigger, ExecutionContext>(
                                     when (retryHandlingResult) {
                                         is RetrySignal.Retry -> {
                                             log.warn("Event reaction ${id.value} will be retried after failure [ totalRetries=$retryCount ]")
-                                            retryHandlingResult
+                                            ReactionOutcome.Retry(retryHandlingResult.delay)
                                         }
                                         is RetrySignal.DoNotRetry -> {
                                             log.warn("Event reaction ${id.value} will not be retried after failure [ totalRetries=$retryCount ]")
@@ -239,7 +252,9 @@ class EventReactionExecutor<T : EventReactionTrigger, ExecutionContext>(
                                                 executionContext,
                                                 retryHandlingResult.completionResult,
                                             )
-                                            null
+                                            ReactionOutcome.Finished(
+                                                gaveUp = retryHandlingResult.completionResult is EventReactionCompletionResult.EventReactionFailed,
+                                            )
                                         }
                                     }
                                 }.getOrElse { ex ->
@@ -247,7 +262,7 @@ class EventReactionExecutor<T : EventReactionTrigger, ExecutionContext>(
                                         "Exception when applying event reaction ${id.value} retry handling logic. Event reaction will be retried [ totalRetries=$retryCount ]",
                                         ex,
                                     )
-                                    RetrySignal.Retry(defaultBackoffStrategy.calculateBackoff(retryCount))
+                                    ReactionOutcome.Retry(defaultBackoffStrategy.calculateBackoff(retryCount))
                                 }
                         }
                         is EventReactionExecutionResult.EventReactionTimedOut -> {
@@ -257,7 +272,7 @@ class EventReactionExecutor<T : EventReactionTrigger, ExecutionContext>(
                                     when (retryHandlingResult) {
                                         is RetrySignal.Retry -> {
                                             log.warn("Event reaction ${id.value} will be retried after timeout [ totalRetries=$retryCount ]")
-                                            retryHandlingResult
+                                            ReactionOutcome.Retry(retryHandlingResult.delay)
                                         }
                                         is RetrySignal.DoNotRetry -> {
                                             log.warn("Event reaction ${id.value} will not be retried after timeout [ totalRetries=$retryCount ]")
@@ -269,7 +284,9 @@ class EventReactionExecutor<T : EventReactionTrigger, ExecutionContext>(
                                                 executionContext,
                                                 retryHandlingResult.completionResult,
                                             )
-                                            null
+                                            ReactionOutcome.Finished(
+                                                gaveUp = retryHandlingResult.completionResult is EventReactionCompletionResult.EventReactionFailed,
+                                            )
                                         }
                                     }
                                 }.getOrElse { ex ->
@@ -277,7 +294,7 @@ class EventReactionExecutor<T : EventReactionTrigger, ExecutionContext>(
                                         "Exception when applying event reaction ${id.value} timeout retry handling logic. Event reaction will be retried [ totalRetries=$retryCount ]",
                                         ex,
                                     )
-                                    RetrySignal.Retry(defaultBackoffStrategy.calculateBackoff(retryCount))
+                                    ReactionOutcome.Retry(defaultBackoffStrategy.calculateBackoff(retryCount))
                                 }
                         }
                     }

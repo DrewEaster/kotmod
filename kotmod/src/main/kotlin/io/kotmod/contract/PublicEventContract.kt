@@ -11,6 +11,8 @@ import io.kotmod.PersistedEvent
 import io.kotmod.event.reaction.EventReaction
 import io.kotmod.event.reaction.EventReactionExecutor
 import io.kotmod.event.reaction.EventReactionTrigger
+import io.kotmod.event.reaction.ReactionOrdering
+import io.kotmod.event.reaction.stampFor
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import kotlin.time.Duration
@@ -39,6 +41,7 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
 ) {
     private data class Subscription<T : EventReactionTrigger, E : PublicDomainEvent>(
         val executor: EventReactionExecutor<T, *>,
+        val ordering: ReactionOrdering,
         val block: (PublicEventEnvelope<E>) -> List<EventReaction<T>>,
     ) {
         suspend fun fanOut(
@@ -47,14 +50,14 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
             log: Logger,
         ) {
             val reactions = block(envelope)
-            for (reaction in reactions) {
+            reactions.forEachIndexed { ordinal, reaction ->
                 log.debug(
                     "Dispatching event reaction {} for DDD event {} [position={}]",
                     reaction.id.value,
                     envelope.metadata.eventId.value,
                     position,
                 )
-                executor.dispatch(reaction.id, reaction.trigger)
+                executor.dispatch(reaction.id, reaction.trigger, ordering.stampFor(envelope.metadata, ordinal))
             }
         }
     }
@@ -65,14 +68,19 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
 
     /**
      * Registers a subscriber: [block] maps each public event to reactions dispatched to [executor].
-     * Must be called before [start].
+     * Reactions are stamped per [ordering]; ordered subscriptions need an executor whose sink supports
+     * ordering. Must be called before [start].
      */
     fun <T : EventReactionTrigger> subscribe(
         executor: EventReactionExecutor<T, *>,
+        ordering: ReactionOrdering = ReactionOrdering.Unordered,
         block: (PublicEventEnvelope<E>) -> List<EventReaction<T>>,
     ) {
         check(!started) { "subscribe() must be called before start()" }
-        subscriptions += Subscription(executor, block)
+        require(ordering == ReactionOrdering.Unordered || executor.supportsOrdering) {
+            "An ordered subscription needs an executor whose sink supports ordering"
+        }
+        subscriptions += Subscription(executor, ordering, block)
     }
 
     private val poller =
