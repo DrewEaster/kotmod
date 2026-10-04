@@ -4,11 +4,12 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import org.slf4j.LoggerFactory
 import java.sql.Connection
 import java.util.concurrent.Executor
@@ -45,14 +46,15 @@ class PostgresLeaderElection internal constructor(
     private val lockName = "kotmod-leader:$name"
     private val leaseNanos = (checkInterval * 2).inWholeNanoseconds
     private val queryTimeoutSeconds = maxOf(1, ((checkInterval.inWholeMilliseconds + 999) / 1000).toInt())
+    private val networkTimeoutMillis = (checkInterval * 2).inWholeMilliseconds.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
     private val abortExecutor = Executor { it.run() }
 
     @Volatile private var leading = false
 
     @Volatile private var lastConfirmedAt = 0L
 
-    // Touched only by the loop, and by stop() after the loop has finished.
-    private var connection: Connection? = null
+    // Written by the loop; stop() reads it to release the lock, or to abort a call the loop is stuck in.
+    @Volatile private var connection: Connection? = null
     private var failing = false
     private var job: Job? = null
 
@@ -77,7 +79,15 @@ class PostgresLeaderElection internal constructor(
         val running = synchronized(this) { job.also { job = null } } ?: return
         val wasLeading = leading
         leading = false
-        running.cancelAndJoin()
+        running.cancel()
+        // Blocking JDBC calls ignore cancellation. The network timeout bounds them; if the loop is still stuck after
+        // that, abort its connection (Postgres releases the lock when the session ends) instead of waiting longer.
+        if (withTimeoutOrNull(checkInterval * 2) { running.join() } == null) {
+            log.warn("Leader election for '{}' did not stop in time; abandoning its connection", name)
+            connection?.let(::drop)
+            connection = null
+            return
+        }
         leading = false
         val conn = connection ?: return
         connection = null
@@ -91,20 +101,22 @@ class PostgresLeaderElection internal constructor(
             if (wasLeading) log.info("Stepped down as leader for '{}'", name)
         } catch (ex: Exception) {
             log.warn("Could not release leadership of '{}' cleanly", name, ex)
-            abort(conn)
+            drop(conn)
         }
     }
 
     /** Blocking [stop], for shutdown hooks and `use {}`. */
     override fun close() = runBlocking { stop() }
 
-    private fun tick() {
+    private suspend fun tick() {
         val conn = connection ?: openConnection() ?: return
         try {
             if (leading) {
                 conn.querySingle("SELECT 1")
                 lastConfirmedAt = nanoTime()
-            } else if (conn.querySingle("SELECT pg_try_advisory_lock(hashtextextended(?, 0))", lockName)) {
+            } else if (conn.querySingle("SELECT pg_try_advisory_lock(hashtextextended(?, 0))", lockName) &&
+                currentCoroutineContext().isActive
+            ) {
                 lastConfirmedAt = nanoTime()
                 leading = true
                 log.info("Became leader for '{}'", name)
@@ -117,22 +129,48 @@ class PostgresLeaderElection internal constructor(
             } else {
                 failed("Leader election check for '{}' failed", ex)
             }
-            abort(conn)
+            drop(conn)
             connection = null
         }
     }
 
-    private fun openConnection(): Connection? =
-        try {
-            connect().also {
-                it.autoCommit = true
-                connection = it
-                recovered()
+    private suspend fun openConnection(): Connection? {
+        val conn =
+            try {
+                connect()
+            } catch (ex: Exception) {
+                failed("Could not connect for leader election '{}'", ex)
+                return null
             }
-        } catch (ex: Exception) {
-            failed("Could not connect for leader election '{}'", ex)
-            null
+        if (!currentCoroutineContext().isActive) {
+            // stop() gave up waiting while connect() was blocked.
+            drop(conn)
+            return null
         }
+        try {
+            conn.autoCommit = true
+            // Bounds every call on this connection, so a stalled network fails a check instead of hanging it.
+            conn.setNetworkTimeout(abortExecutor, networkTimeoutMillis)
+            // Lets Postgres notice a vanished client within a few intervals and release the lock.
+            conn.execute("SET tcp_keepalives_idle = $queryTimeoutSeconds")
+            conn.execute("SET tcp_keepalives_interval = $queryTimeoutSeconds")
+            conn.execute("SET tcp_keepalives_count = 3")
+        } catch (ex: Exception) {
+            failed("Could not set up the connection for leader election '{}'", ex)
+            drop(conn)
+            return null
+        }
+        connection = conn
+        recovered()
+        return conn
+    }
+
+    private fun Connection.execute(sql: String) {
+        prepareStatement(sql).use { stmt ->
+            stmt.queryTimeout = queryTimeoutSeconds
+            stmt.execute()
+        }
+    }
 
     // Returns the first column of the single row as a boolean (`SELECT 1` reads as true).
     private fun Connection.querySingle(
@@ -167,11 +205,17 @@ class PostgresLeaderElection internal constructor(
         }
     }
 
-    private fun abort(conn: Connection) {
+    // Abort first (it never blocks on a dead socket), then close so a pooled connection is handed back.
+    private fun drop(conn: Connection) {
         try {
             conn.abort(abortExecutor)
         } catch (ex: Exception) {
             log.debug("Aborting the leader election connection for '{}' failed", name, ex)
+        }
+        try {
+            conn.close()
+        } catch (ex: Exception) {
+            log.debug("Closing the leader election connection for '{}' failed", name, ex)
         }
     }
 }

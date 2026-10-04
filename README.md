@@ -944,11 +944,11 @@ Pass `isLeader = election::isLeader` to each outbox and contract:
 - **One election per application** is the simple default: one node polls for every consumer. To spread
   consumers across nodes, give each consumer its own election (its own name); each holds one connection.
 - **Give it its own connection.** The election holds one connection for as long as it runs, so open it
-  directly rather than from your pool (`dataSource::getConnection` also works). Set pgjdbc's `socketTimeout`
-  on it so a stalled network fails a check instead of hanging. It does not work through PgBouncer in
-  transaction mode.
+  directly rather than from your pool. It does not work through PgBouncer in transaction mode.
 - **How fast it reacts.** Every `checkInterval` (5 seconds by default) a follower tries to take the lock and
   the leader checks its connection. A leader whose checks fail or stall for two intervals stops polling.
+  The election also sets TCP keepalives on its session, so if the leader's host vanishes Postgres notices
+  within a few intervals and releases the lock.
 - **Brief overlap.** If Postgres ends the leader's session first (a failover, `pg_terminate_backend`), another
   node can take over before the old leader notices, so two nodes may poll for up to about one
   `checkInterval`. That only causes duplicate dispatches, which deterministic reaction ids absorb.
