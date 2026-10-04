@@ -7,6 +7,7 @@ import io.kotmod.PublicDomainEvent
 import io.kotmod.SerializedEvent
 import io.kotmod.DomainEventPollingBackend
 import io.kotmod.PersistedEvent
+import io.kotmod.SequenceCheck
 import io.kotmod.event.reaction.EventReaction
 import io.kotmod.event.reaction.EventReactionExecutor
 import io.kotmod.event.reaction.EventReactionId
@@ -86,6 +87,7 @@ class PublicEventContractTest {
 
     private fun givenEvents(vararg events: PersistedEvent) {
         every { backend.readEventsAfter(EventLogPosition(1, 9), any()) } returns events.toList()
+        every { backend.checkSequence(any(), any()) } returns SequenceCheck.InOrder
     }
 
     private fun newContract(

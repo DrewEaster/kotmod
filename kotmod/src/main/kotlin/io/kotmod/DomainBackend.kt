@@ -81,4 +81,32 @@ interface DomainEventPollingBackend {
         position: EventLogPosition,
         limit: Int,
     ): List<PersistedEvent>
+
+    /**
+     * Checks whether [event], just read at [position], can be handled without breaking its aggregate's
+     * sequence order. Backends that always read in sequence order keep the default, [SequenceCheck.InOrder].
+     *
+     * - [SequenceCheck.InOrder]: no other event of the aggregate is out of place; handle [event].
+     * - [SequenceCheck.AlreadyHandled]: a later event of the aggregate was already read, and pulled this one
+     *   forward; skip it.
+     * - [SequenceCheck.HandleEarlierFirst]: earlier events of the aggregate sit later in the log; handle them
+     *   (in sequence order) and then [event].
+     * - [SequenceCheck.WaitForEarlier]: an earlier event is committed but not yet readable; stop the batch
+     *   and retry on the next poll.
+     */
+    fun checkSequence(
+        event: PersistedEvent,
+        position: EventLogPosition,
+    ): SequenceCheck = SequenceCheck.InOrder
+}
+
+/** The outcome of [DomainEventPollingBackend.checkSequence]. */
+sealed interface SequenceCheck {
+    data object InOrder : SequenceCheck
+
+    data object AlreadyHandled : SequenceCheck
+
+    data class HandleEarlierFirst(val earlier: List<PersistedEvent>) : SequenceCheck
+
+    data object WaitForEarlier : SequenceCheck
 }

@@ -17,6 +17,7 @@ import io.kotmod.EventId
 import io.kotmod.EventLogPosition
 import io.kotmod.EventMetadata
 import io.kotmod.PersistedEvent
+import io.kotmod.SequenceCheck
 import io.kotmod.SerializedEvent
 import java.sql.Connection
 import java.sql.ResultSet
@@ -221,9 +222,7 @@ class PostgresDomainPollingBackend(
             requirePositionNotAhead(conn, position)
             conn
                 .prepareStatement(
-                    "SELECT global_offset, transaction_id::text::bigint AS transaction_id_value, " +
-                        "aggregate_type, aggregate_id, aggregate_sequence, causation_id, correlation_id, event_id, event_type, " +
-                        "event_version, event_payload, event_timestamp " +
+                    "SELECT $EVENT_COLUMNS " +
                         "FROM ddd_domain_event " +
                         "WHERE (transaction_id, global_offset) > (?::text::xid8, ?) " +
                         "AND transaction_id < pg_snapshot_xmin(pg_current_snapshot()) " +
@@ -237,6 +236,53 @@ class PostgresDomainPollingBackend(
                         val result = mutableListOf<PersistedEvent>()
                         while (rs.next()) result += rs.toPublishedEvent()
                         result
+                    }
+                }
+        }
+
+    override fun checkSequence(
+        event: PersistedEvent,
+        position: EventLogPosition,
+    ): SequenceCheck =
+        jdbc.withConnection { conn ->
+            conn
+                .prepareStatement(
+                    "SELECT $EVENT_COLUMNS, " +
+                        "transaction_id < pg_snapshot_xmin(pg_current_snapshot()) AS readable " +
+                        "FROM ddd_domain_event " +
+                        "WHERE aggregate_type = ? AND aggregate_id = ? AND (" +
+                        "(aggregate_sequence < ? AND (transaction_id, global_offset) > (?::text::xid8, ?)) OR " +
+                        "(aggregate_sequence > ? AND (transaction_id, global_offset) <= (?::text::xid8, ?))) " +
+                        "ORDER BY aggregate_sequence",
+                ).use { ps ->
+                    val m = event.metadata
+                    ps.setString(1, m.aggregateType.value)
+                    ps.setString(2, m.aggregateId.value)
+                    ps.setLong(3, m.sequence)
+                    ps.setLong(4, position.transactionId)
+                    ps.setLong(5, position.globalOffset)
+                    ps.setLong(6, m.sequence)
+                    ps.setLong(7, position.transactionId)
+                    ps.setLong(8, position.globalOffset)
+                    ps.executeQuery().use { rs ->
+                        val earlier = mutableListOf<PersistedEvent>()
+                        var allReadable = true
+                        var laterPassed = false
+                        while (rs.next()) {
+                            val found = rs.toPublishedEvent()
+                            if (found.metadata.sequence > m.sequence) {
+                                laterPassed = true
+                            } else {
+                                earlier += found
+                                if (!rs.getBoolean("readable")) allReadable = false
+                            }
+                        }
+                        when {
+                            laterPassed -> SequenceCheck.AlreadyHandled
+                            earlier.isEmpty() -> SequenceCheck.InOrder
+                            !allReadable -> SequenceCheck.WaitForEarlier
+                            else -> SequenceCheck.HandleEarlierFirst(earlier)
+                        }
                     }
                 }
         }
@@ -262,6 +308,13 @@ class PostgresDomainPollingBackend(
                 "($nextTransactionId). This happens after restoring the database onto a new server (pg_dump or " +
                 "logical replication); see the README's guidance on moving the database before resuming."
         }
+    }
+
+    private companion object {
+        const val EVENT_COLUMNS =
+            "global_offset, transaction_id::text::bigint AS transaction_id_value, aggregate_type, aggregate_id, " +
+                "aggregate_sequence, causation_id, correlation_id, event_id, event_type, event_version, " +
+                "event_payload, event_timestamp"
     }
 
     private fun ResultSet.toPublishedEvent(): PersistedEvent {
