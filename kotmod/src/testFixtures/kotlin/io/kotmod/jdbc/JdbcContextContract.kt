@@ -260,15 +260,17 @@ abstract class JdbcContextContract : IntegrationTest() {
         runBlocking {
             val orders = manager("Order")
 
-            assertFailsWith<IllegalStateException> {
-                context.transaction {
+            val failure =
+                assertFailsWith<IllegalStateException> {
                     context.transaction {
-                        orders.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book")) }
+                        context.transaction {
+                            orders.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book")) }
+                        }
+                        error("outer fails")
                     }
-                    error("outer fails")
                 }
-            }
 
+            assertEquals("outer fails", failure.message)
             assertEquals(0, count("ddd_domain_event"))
         }
 
