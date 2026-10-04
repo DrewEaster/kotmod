@@ -19,6 +19,7 @@ in**, so those events reliably drive follow-up work in your own service and in o
   - [The outbox and event reactions](#the-outbox-and-event-reactions)
   - [Durable reactions with db-scheduler](#durable-reactions-with-db-scheduler)
   - [Ordered reactions](#ordered-reactions)
+  - [Using another queue (e.g. Google Pub/Sub)](#using-another-queue-eg-google-pubsub)
   - [Publishing events to other contexts](#publishing-events-to-other-contexts)
 - [Running in production](#running-in-production)
 - [Known limitations](#known-limitations)
@@ -36,6 +37,11 @@ kotmod writes an aggregate's new state, its events and the command that caused t
 transaction**. An outbox then reads those events in order and turns them into *event reactions* — durable,
 retried units of work — or publishes them to other bounded contexts.
 
+Reactions run on whatever queue you choose. kotmod ships one built on
+[db-scheduler](https://github.com/kagkarlsson/db-scheduler), which needs nothing but the Postgres database
+you already have, and you can plug in another, such as Google Pub/Sub, by implementing two small
+interfaces (see [Using another queue](#using-another-queue-eg-google-pubsub)).
+
 kotmod is not an event store, not a message broker and not a framework: it is a library you wire into
 your own application, on the Postgres database you already have.
 
@@ -50,7 +56,7 @@ plugins {
 
 dependencies {
     implementation("io.github.dreweaster:kotmod:0.1.0")
-    implementation("io.github.dreweaster:kotmod-db-scheduler:0.1.0") // durable event reactions on db-scheduler
+    implementation("io.github.dreweaster:kotmod-db-scheduler:0.1.0") // optional: the ready-made reaction queue
     // implementation("io.github.dreweaster:kotmod-sqldelight:0.1.0") // only if your app uses SQLDelight
 
     // Used directly by the code in this README:
@@ -65,18 +71,22 @@ Requirements:
 
 - A JVM 25 toolchain (kotmod is currently built and tested on it) and Kotlin.
 - PostgreSQL 13 or later.
-- [db-scheduler](https://github.com/kagkarlsson/db-scheduler) 16.12.0 for durable event reactions. It
-  comes in with `kotmod-db-scheduler`.
 
-kotmod is split into modules: `kotmod` (aggregates, events, the outbox and Postgres support — plain JDBC,
-no other database library), `kotmod-db-scheduler` (durable event reactions) and `kotmod-sqldelight`
-(sharing transactions with SQLDelight).
+kotmod is split into modules:
+
+- `kotmod` — aggregates, events, the outbox and Postgres support, on plain JDBC with no other database
+  library. This is the only module you need.
+- `kotmod-db-scheduler` — optional. A ready-made queue for event reactions on
+  [db-scheduler](https://github.com/kagkarlsson/db-scheduler) 16.12.0, which it brings in. Leave it out if
+  you run reactions on another queue, such as Google Pub/Sub
+  (see [Using another queue](#using-another-queue-eg-google-pubsub)).
+- `kotmod-sqldelight` — optional. Shares kotmod's transactions with SQLDelight.
 
 ## Quickstart
 
 This walks through a tiny orders domain: you place an order, ship it, and send a confirmation email
 whenever an order is placed. It uses kotmod's Postgres backends and runs event reactions on
-db-scheduler.
+db-scheduler, kotmod's ready-made queue; you could swap in another queue without changing the rest.
 
 Snippets leave out imports. The complete, compiled code is in
 [`Quickstart.kt`](examples/src/integrationTest/kotlin/io/kotmod/readme/Quickstart.kt) and
@@ -394,7 +404,7 @@ flowchart LR
     AM -->|one transaction| E[(Events in ddd_domain_event)]
     E --> O[AggregateEventOutbox]
     O --> X[EventReactionExecutor]
-    X <--> D[(db-scheduler)]
+    X <--> D[(Your queue: db-scheduler, Pub/Sub, …)]
     E --> P[PublicEventContract]
     P --> SUB[Subscribers in other contexts]
 ```
@@ -406,6 +416,9 @@ flowchart LR
 - **Domain event** — a fact recorded in the event log in the same transaction as the state change.
 - **Event reaction** — durable, retried follow-up work triggered by a domain event.
 - **Trigger** — the stored input of an event reaction.
+- **Sink and source** — the two interfaces a queue implements so an `EventReactionExecutor` can use it:
+  the sink accepts dispatched reactions and the source delivers them back for execution. kotmod ships
+  an implementation on db-scheduler; any other queue works too.
 - **Public event** — a stable event published to other bounded contexts, mapped from internal domain
   events.
 
@@ -658,10 +671,15 @@ transactions.
 handy in your retry handlers, as the quickstart shows.
 
 The executor works with any queue: it dispatches through an `EventReactionTriggerSink` and receives
-reactions from an `EventReactionTriggerSource`. kotmod ships a durable implementation on db-scheduler;
-you can implement the two interfaces yourself to use something else.
+reactions from an `EventReactionTriggerSource`. kotmod ships a durable implementation on db-scheduler
+(next section); to use something else, implement the two interfaces yourself
+(see [Using another queue](#using-another-queue-eg-google-pubsub)).
 
 ### Durable reactions with db-scheduler
+
+This is kotmod's ready-made queue, in the optional `kotmod-db-scheduler` module. It needs nothing but your
+Postgres database; to use a different queue instead, see
+[Using another queue](#using-another-queue-eg-google-pubsub).
 
 `DbSchedulerEventReactions` stores reactions in db-scheduler's `scheduled_tasks` table and runs them on
 your db-scheduler `Scheduler`. Your application owns the `Scheduler` — its threads, polling and
@@ -740,7 +758,9 @@ log differs because a transaction changed several aggregates. To do this, every 
 each event it reads; for an aggregate that has never been written out of order this check is a single
 primary-key lookup.
 
-Ordering needs support from the queue. With db-scheduler, pass `jdbc` to `DbSchedulerEventReactions`; an
+Ordering needs support from the queue (for Pub/Sub, see
+[Using another queue](#using-another-queue-eg-google-pubsub)). With db-scheduler, pass `jdbc` to
+`DbSchedulerEventReactions`; an
 ordered outbox or subscription whose sink does not support ordering fails with an
 `IllegalArgumentException` as soon as it is created, rather than running unordered:
 
@@ -822,6 +842,115 @@ CREATE INDEX scheduled_tasks_ordered_idx ON scheduled_tasks (task_name, task_ins
   briefly be broken: if the outbox crashes after dispatching several reactions from the same event but
   before saving its position, an earlier one of those that had already completed can run again at the same
   time as a later one.
+
+### Using another queue (e.g. Google Pub/Sub)
+
+db-scheduler is a convenient default, not a requirement. An `EventReactionExecutor` only needs a queue
+that implements two interfaces from the core `kotmod` module:
+
+- **`EventReactionTriggerSink`** — `publish(id, trigger, ordering)` queues a reaction. Publishing an id
+  that is already queued should not queue it twice; if your queue can't guarantee that, rely on your
+  reactions being idempotent (they must be anyway, since delivery is at-least-once).
+- **`EventReactionTriggerSource`** — `subscribe(block)` starts delivering queued reactions. For each
+  delivery, call `block` with the reaction id, a fresh execution id, the trigger and the retry count, and
+  act on what it returns:
+  - `ReactionOutcome.Finished` — the reaction is done (succeeded, cancelled or gave up): remove it from
+    the queue.
+  - `ReactionOutcome.Retry(delay)` — deliver it again after about `delay`.
+  - An exception — deliver it again later.
+
+Everything else — timeouts, retry decisions, `onCompletion`, the outbox and public contracts — works the
+same whichever queue you use. Leave out the `kotmod-db-scheduler` dependency if you don't use it.
+
+Here is a sketch for Google Pub/Sub, using the official Java client (`com.google.cloud:google-cloud-pubsub`).
+It is not part of kotmod and is not compiled or tested here; a ready-made Pub/Sub module is planned.
+
+<!-- not-compiled -->
+```kotlin
+class PubSubReactions<T : EventReactionTrigger>(
+    // For ordered reactions, build the publisher with setEnableMessageOrdering(true)
+    // and enable message ordering on the subscription.
+    private val publisher: Publisher,
+    private val subscription: ProjectSubscriptionName,
+    private val serializer: EventReactionTriggerSerializer<T>,
+) : EventReactionTriggerSink<T>, EventReactionTriggerSource<T> {
+    override val supportsOrdering = true
+
+    override suspend fun publish(
+        id: EventReactionId,
+        trigger: T,
+        ordering: DispatchOrdering?,
+    ) {
+        val message =
+            PubsubMessage.newBuilder()
+                .setData(ByteString.copyFromUtf8(serializer.serialize(trigger)))
+                .putAttributes("reactionId", id.value)
+                .apply { if (ordering != null) setOrderingKey(ordering.key) }
+                .build()
+        // Wait for Pub/Sub to accept it: the outbox only moves on once publish returns.
+        withContext(Dispatchers.IO) { publisher.publish(message).get() }
+    }
+
+    override fun subscribe(
+        block: suspend (EventReactionId, EventReactionExecutionId, T, RetryCount) -> ReactionOutcome,
+    ): Cancellable {
+        val receiver =
+            MessageReceiver { message, reply ->
+                // Pub/Sub calls this on its own threads; run the attempt to completion before replying.
+                val outcome =
+                    runBlocking {
+                        try {
+                            block(
+                                EventReactionId(message.getAttributesOrThrow("reactionId")),
+                                EventReactionExecutionId(UUID.randomUUID().toString()),
+                                serializer.deserialize(message.data.toStringUtf8()),
+                                // Delivery attempts are only counted when the subscription has a dead-letter policy.
+                                (Subscriber.getDeliveryAttempt(message) ?: 1) - 1,
+                            )
+                        } catch (e: Exception) {
+                            ReactionOutcome.Retry(Duration.ZERO)
+                        }
+                    }
+                when (outcome) {
+                    is ReactionOutcome.Finished -> reply.ack()
+                    is ReactionOutcome.Retry -> reply.nack()
+                }
+            }
+        val subscriber = Subscriber.newBuilder(subscription, receiver).build()
+        subscriber.startAsync().awaitRunning()
+        return object : Cancellable {
+            override fun cancel() {
+                subscriber.stopAsync().awaitTerminated()
+            }
+        }
+    }
+}
+```
+
+Create one and pass it as both the sink and the source of an `EventReactionExecutor`, just as
+`DbSchedulerEventReactions` is used in the quickstart.
+
+How Pub/Sub differs from db-scheduler:
+
+- **Retry delays are approximate.** Pub/Sub can't redeliver a message after a chosen delay; a `nack()` is
+  redelivered according to the subscription's retry policy. Set its minimum and maximum backoff to suit
+  your reactions, or use the retry handlers' delays only as a guide.
+- **No deduplication by reaction id.** Pub/Sub may deliver a message more than once, and the outbox may
+  publish a reaction again after a restart. Keep `execute` and `onCompletion` idempotent.
+- **Retry counts need a dead-letter policy.** Pub/Sub only counts delivery attempts when the subscription
+  has one; without it, the retry count passed to your handlers is always 0. A dead-letter topic is also
+  where messages go after too many failed deliveries.
+- **Ordering uses ordering keys.** `DispatchOrdering.key` is the aggregate, so publishing with
+  `setOrderingKey(ordering.key)` makes Pub/Sub deliver each aggregate's reactions in order, one at a time,
+  and a `nack()` holds back that aggregate's later reactions until it is redelivered. If a publish fails,
+  the client pauses that ordering key until you call `publisher.resumePublish(key)`.
+- **`OnGiveUp.BlockAggregate` has no direct equivalent.** In this sketch a reaction that gives up is
+  acknowledged and the aggregate's next reaction runs, as with `ContinueWithNext`. Record failures in
+  `onCompletion` (or route them to a dead-letter topic) to deal with them.
+- **Long reactions are fine.** The client keeps extending a message's acknowledgement deadline while
+  `block` runs, up to its maximum extension period (one hour by default).
+- **No leader election is needed for the queue.** As with db-scheduler, every node can run a subscriber;
+  only the outbox and public contracts need [one active poller](#running-in-production).
 
 ### Publishing events to other contexts
 
