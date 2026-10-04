@@ -20,9 +20,12 @@ import io.kotmod.event.reaction.EventReactionExecutor
 import io.kotmod.event.reaction.EventReactionId
 import io.kotmod.event.reaction.EventReactionTrigger
 import io.kotmod.event.reaction.EventReactionTriggerSerializer
+import io.kotmod.event.reaction.OnGiveUp
+import io.kotmod.event.reaction.ReactionOrdering
 import io.kotmod.event.reaction.dbscheduler.DbSchedulerEventReactions
 import io.kotmod.jdbc.JdbcContext
 import io.kotmod.jdbc.transaction
+import io.kotmod.outbox.AggregateEventOutbox
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.PostgresDomainPollingBackend
 import io.kotmod.postgres.PostgresOffsetManager
@@ -161,6 +164,32 @@ fun cancelPendingConfirmation(
 ) {
     scheduler.cancel(notifications.task.instanceId("confirmation-${eventId.value}"))
 }
+
+// Guide: Ordered reactions
+
+fun orderedNotifications(jdbc: JdbcContext): DbSchedulerEventReactions<OrderNotification> =
+    DbSchedulerEventReactions("order-notifications", OrderNotificationSerializer, jdbc = jdbc)
+
+fun orderedOutbox(
+    jdbc: JdbcContext,
+    serialization: DataSerializationContext<OrderEvent>,
+    offsets: PostgresOffsetManager,
+    executor: EventReactionExecutor<OrderNotification, *>,
+): AggregateEventOutbox<OrderNotification> =
+    AggregateEventOutbox(
+        backend = PostgresDomainPollingBackend(jdbc),
+        executor = executor,
+        eventToReactions = { event ->
+            when (serialization.deserialize(event.serialized)) {
+                is OrderPlaced -> listOf(EventReaction(EventReactionId("confirmation-${event.metadata.eventId.value}"), SendOrderConfirmation(event.metadata.aggregateId.value)))
+                else -> emptyList()
+            }
+        },
+        getPosition = { offsets.getPosition("order-notifications") },
+        savePosition = { offsets.savePosition("order-notifications", it) },
+        isLeader = { true },
+        ordering = ReactionOrdering.PerAggregate(onGiveUp = OnGiveUp.BlockAggregate),
+    )
 
 // Guide: Publishing events to other contexts
 

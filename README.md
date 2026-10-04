@@ -18,6 +18,7 @@ in**, so those events reliably drive follow-up work in your own service and in o
   - [Postgres setup](#postgres-setup)
   - [The outbox and event reactions](#the-outbox-and-event-reactions)
   - [Durable reactions with db-scheduler](#durable-reactions-with-db-scheduler)
+  - [Ordered reactions](#ordered-reactions)
   - [Publishing events to other contexts](#publishing-events-to-other-contexts)
 - [Running in production](#running-in-production)
 - [Status and contributing](#status-and-contributing)
@@ -436,6 +437,10 @@ suspend fun cancelOrder(
     }
 ```
 
+**Event sequence numbers.** Every event carries `event.metadata.sequence`: its number within its
+aggregate, counting 1, 2, 3… with no gaps. Reactions and public contracts can use it to tell which of an
+aggregate's events came first.
+
 **Idempotency.** Pass a `CommandId` you control — a request id, a message id — and a retried command
 returns the aggregate's current state without running again. Without one, kotmod generates a random
 id and the call is not idempotent. Pass a `CorrelationId` to tie together all the events of one wider
@@ -579,7 +584,7 @@ kotmod's Postgres classes use plain JDBC through a `JdbcContext`. For a plain `D
 | Table | Holds |
 |---|---|
 | `ddd_aggregate_root` | Each aggregate's version and timestamps |
-| `ddd_domain_event` | The event log, ordered by `global_offset` |
+| `ddd_domain_event` | The event log, ordered by `(transaction_id, global_offset)`, with each event's `aggregate_sequence` |
 | `ddd_command_history` | Which commands each aggregate has handled |
 | `ddd_consumer_offset` | How far each outbox or contract has read (a transaction id and offset) |
 
@@ -701,6 +706,96 @@ fun cancelPendingConfirmation(
 }
 ```
 
+### Ordered reactions
+
+By default reactions are unordered: two reactions from the same aggregate can run at the same time, or
+finish in a different order from the events. That is fine for sending emails, but not for projections or
+anything else that must apply an aggregate's changes in order. For those, ask for ordering:
+
+- `ReactionOrdering.Unordered` is the default.
+- `ReactionOrdering.PerAggregate(onGiveUp = …)` runs an aggregate's reactions one at a time, in event
+  order.
+
+Set it with `ordering = ReactionOrdering.PerAggregate(…)` on `AggregateEventOutbox`, or on
+`PublicEventContract.subscribe(executor, ordering = …) { … }`. The outbox dispatches each aggregate's
+events in sequence order (see `event.metadata.sequence`), even in the rare case where the order in the
+log differs because a transaction changed several aggregates.
+
+Ordering needs support from the queue. With db-scheduler, pass `jdbc` to `DbSchedulerEventReactions`; an
+ordered outbox or subscription whose sink does not support ordering fails with an
+`IllegalArgumentException` as soon as it is created, rather than running unordered:
+
+```kotlin
+fun orderedNotifications(jdbc: JdbcContext): DbSchedulerEventReactions<OrderNotification> =
+    DbSchedulerEventReactions("order-notifications", OrderNotificationSerializer, jdbc = jdbc)
+
+fun orderedOutbox(
+    jdbc: JdbcContext,
+    serialization: DataSerializationContext<OrderEvent>,
+    offsets: PostgresOffsetManager,
+    executor: EventReactionExecutor<OrderNotification, *>,
+): AggregateEventOutbox<OrderNotification> =
+    AggregateEventOutbox(
+        backend = PostgresDomainPollingBackend(jdbc),
+        executor = executor,
+        eventToReactions = { event ->
+            when (serialization.deserialize(event.serialized)) {
+                is OrderPlaced -> listOf(EventReaction(EventReactionId("confirmation-${event.metadata.eventId.value}"), SendOrderConfirmation(event.metadata.aggregateId.value)))
+                else -> emptyList()
+            }
+        },
+        getPosition = { offsets.getPosition("order-notifications") },
+        savePosition = { offsets.savePosition("order-notifications", it) },
+        isLeader = { true },
+        ordering = ReactionOrdering.PerAggregate(onGiveUp = OnGiveUp.BlockAggregate),
+    )
+```
+
+Register the reactions' tasks with your `Scheduler` as before; `tasks` gives the list to pass (`task` is
+still there for the single-task case).
+
+**When a reaction gives up.** A reaction gives up when your retry handler returns `DoNotRetry`. The
+`OnGiveUp` policy says what happens to the aggregate's later reactions:
+
+| Policy | Behaviour |
+|---|---|
+| `OnGiveUp.ContinueWithNext` (default) | The failed reaction is completed as failed and the next one runs |
+| `OnGiveUp.BlockAggregate` | The aggregate's later reactions wait until an operator retries or skips the failed one |
+
+Use `BlockAggregate` when running later reactions after a missed one would leave wrong data, such as a
+projection that skipped an event. Other aggregates are not affected. To find and clear blocked reactions,
+use the helpers on `DbSchedulerEventReactions`, passing your `Scheduler` (or any `SchedulerClient`):
+
+- `blockedReactions(client)` lists each blocked reaction with its aggregate key, reaction id and
+  sequence number.
+- `retryBlocked(client, id)` runs it again now, with its retry count reset.
+- `skipBlocked(client, id)` drops it without running it, so the aggregate's next reaction can run.
+
+**How waiting works.** An ordered reaction only runs when no earlier reaction of the same aggregate is
+still pending. Otherwise it waits and checks again, starting after `orderedRecheckDelay` (2 seconds by
+default) and doubling each time up to 1 minute. When a reaction finishes, kotmod nudges the aggregate's
+next reaction to run immediately, so a backlog normally runs back to back. The cost of ordering is
+therefore a little extra database work for waiting reactions, and one aggregate's reactions run on at most
+one thread at a time; different aggregates still run in parallel.
+
+**Recommended index.** The pending check looks reactions up by task and instance id, so add this to your
+own `scheduled_tasks` migration (it is optional, but worth having once many reactions can be waiting):
+
+```sql
+CREATE INDEX scheduled_tasks_ordered_idx ON scheduled_tasks (task_name, task_instance COLLATE "C");
+```
+
+**Scope.**
+
+- Ordering applies per executor (per db-scheduler task name) and aggregate. Two executors that handle
+  the same aggregate do not wait on each other.
+- Subscriptions that share one executor share ordering for an aggregate, so their reactions queue behind
+  each other. Give each of them distinct reaction ids.
+- Delivery is still at-least-once, so reactions must still be idempotent. In one rare case, ordering can
+  briefly be broken: if the outbox crashes after dispatching several reactions from the same event but
+  before saving its position, an earlier one of those that had already completed can run again at the same
+  time as a later one.
+
 ### Publishing events to other contexts
 
 Internal domain events change as your model changes, so other services shouldn't depend on them
@@ -786,6 +881,11 @@ counter" rather than silently skipping events. To resume after the move, with no
 row's `ddd_domain_event.transaction_id` to `'0'` and every `ddd_consumer_offset.last_transaction_id` to `0`
 (keep `last_offset`). Each consumer then resumes exactly where it left off, and new events sort after the
 migrated ones.
+
+**Ordered reactions are still at-least-once.** If the outbox crashes after dispatching several reactions
+from the same event but before saving its position, an earlier one that already completed can run again at
+the same time as a later one. Keep ordered reactions idempotent too. See
+[Ordered reactions](#ordered-reactions).
 
 **Use deterministic reaction ids.** Build each reaction id from the event id plus a label, as in
 `"confirmation-${event.metadata.eventId.value}"`. Then a re-dispatched event is recognised as a
