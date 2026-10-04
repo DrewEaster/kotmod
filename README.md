@@ -481,7 +481,16 @@ state independently of the events.
 
 #### Several aggregates in one transaction
 
-kotmod deliberately lets one transaction span commands on several aggregates. Wrap them in
+**This is permitted, but not recommended.** In domain-driven design an aggregate is the boundary of
+consistency: each command changes one aggregate in its own transaction. When a change to one aggregate
+should lead to a change in another, the usual design is to react to the first aggregate's event and run
+the second command asynchronously, with an [event reaction](#the-outbox-and-event-reactions). That keeps
+aggregates independent, keeps transactions short and small, and lets each aggregate be changed without
+locking the others.
+
+kotmod still allows it, for pragmatism. Some teams have good reasons to change several aggregates
+atomically — a migration, a legacy design, or an invariant they have chosen not to model as a single
+aggregate — and kotmod would rather support that clearly than forbid it. If you do, wrap the commands in
 `jdbc.transaction { }` and their state, events and command records commit together — or not at all:
 
 ```kotlin
@@ -508,6 +517,9 @@ suspend fun shipAndInvoice(
   if you do. The block keeps your coroutine context (name, tracing, MDC).
 - Every kotmod class inside the block must use the same `JdbcContext`.
 - Keep the block short: it holds a database transaction open.
+- This is the only way an aggregate's events can reach the event log out of order. kotmod still delivers
+  them in order, but such aggregates pay a slower check when replayed (see
+  [Known limitations](#known-limitations)).
 
 ### Event-only aggregates
 
