@@ -694,7 +694,8 @@ How it behaves:
   pushed back a few seconds (without using up a retry) and a warning is logged.
 - **Unreadable data.** If a reaction's stored data can't be decoded — say a trigger class was renamed —
   db-scheduler retries it with backoff from 10 seconds up to 1 hour until a fix is deployed.
-- **Removing a reaction.** To stop a pending reaction for good, cancel its task instance:
+- **Removing a reaction.** To stop a pending unordered reaction for good, cancel its task instance (for
+  ordered reactions, see [Ordered reactions](#ordered-reactions)):
 
 ```kotlin
 fun cancelPendingConfirmation(
@@ -754,7 +755,8 @@ fun orderedOutbox(
 Register the reactions' tasks with your `Scheduler` as before; `tasks` gives the list to pass (`task` is
 still there for the single-task case).
 
-**When a reaction gives up.** A reaction gives up when your retry handler returns `DoNotRetry`. The
+**When a reaction gives up.** A reaction gives up when your retry handler returns `DoNotRetry` with a failed
+result. The
 `OnGiveUp` policy says what happens to the aggregate's later reactions:
 
 | Policy | Behaviour |
@@ -771,15 +773,19 @@ use the helpers on `DbSchedulerEventReactions`, passing your `Scheduler` (or any
 - `retryBlocked(client, id)` runs it again now, with its retry count reset.
 - `skipBlocked(client, id)` drops it without running it, so the aggregate's next reaction can run.
 
+An ordered reaction's db-scheduler instance id is built from its aggregate, sequence number and reaction
+id, so `task.instanceId(reactionId)` does not find it; use these helpers instead.
+
 **How waiting works.** An ordered reaction only runs when no earlier reaction of the same aggregate is
-still pending. Otherwise it waits and checks again, starting after `orderedRecheckDelay` (2 seconds by
-default) and doubling each time up to 1 minute. When a reaction finishes, kotmod nudges the aggregate's
+still pending. Otherwise it waits and checks again, starting after the `orderedRecheckDelay` constructor
+parameter (2 seconds by default) and doubling each time up to 1 minute. When a reaction finishes, kotmod nudges the aggregate's
 next reaction to run immediately, so a backlog normally runs back to back. The cost of ordering is
 therefore a little extra database work for waiting reactions, and one aggregate's reactions run on at most
 one thread at a time; different aggregates still run in parallel.
 
 **Recommended index.** The pending check looks reactions up by task and instance id, so add this to your
-own `scheduled_tasks` migration (it is optional, but worth having once many reactions can be waiting):
+own `scheduled_tasks` migration (it is optional, but worth having once many reactions can be waiting; use
+your table name if you pass a custom `tableName`):
 
 ```sql
 CREATE INDEX scheduled_tasks_ordered_idx ON scheduled_tasks (task_name, task_instance COLLATE "C");
