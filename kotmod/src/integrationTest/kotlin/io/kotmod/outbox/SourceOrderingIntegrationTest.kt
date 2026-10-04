@@ -123,4 +123,39 @@ class SourceOrderingIntegrationTest : IntegrationTest() {
 
             assertEquals(listOf("A#1", "A#2"), dispatched.filter { it.startsWith("A#") })
         }
+
+    @Test
+    fun `an event pulled forward once is never pulled forward again by a later event`() =
+        runBlocking {
+            // Transaction ids (and so log positions) end up ordered ta < tb < tc ...
+            val ta = open()
+            insert(ta, "X", 1)
+            val tb = open()
+            insert(tb, "Y", 1)
+            val tc = open()
+            insert(tc, "Z", 1)
+            // ... but A's events are written in the opposite order: A#1 in tc, A#2 in ta, A#3 in tb.
+            insert(tc, "A", 1)
+            tc.commit()
+            tc.close()
+            insert(ta, "A", 2)
+            ta.commit()
+            ta.close()
+            insert(tb, "A", 3)
+            tb.commit()
+            tb.close()
+
+            val dispatched = CopyOnWriteArrayList<String>()
+            val outbox = outbox(dispatched)
+            outbox.start()
+            try {
+                eventually { dispatched.size >= 6 }
+                delay(300)
+            } finally {
+                outbox.stop()
+            }
+
+            assertEquals(listOf("A#1", "A#2", "A#3"), dispatched.filter { it.startsWith("A#") })
+            assertEquals(6, dispatched.size)
+        }
 }

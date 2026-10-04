@@ -81,7 +81,9 @@ order. For each event `e` read (in position order), before handling it:
 1. **Already handled early?** If an event of the same aggregate with a **higher** sequence is at or before
    the saved position, `e` was pulled forward earlier: skip it and advance the position.
 2. **Earlier events still ahead?** Find events of the same aggregate with a **lower** sequence whose position
-   is after the saved position (committed, but later in the log). If any is not yet readable (its
+   is after the saved position (committed, but later in the log) **and** whose sequence is above the highest
+   sequence of the aggregate already at or before the saved position (anything at or below it was already
+   handled, and pulling it forward again would re-deliver it after a newer event). If any is not yet readable (its
    transaction id is not below `pg_snapshot_xmin`), stop the batch and retry next poll. Otherwise handle them
    first, in sequence order, then `e`, then save `e`'s position.
 

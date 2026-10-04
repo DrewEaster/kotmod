@@ -252,7 +252,7 @@ class PostgresDomainPollingBackend(
                         "FROM ddd_domain_event " +
                         "WHERE aggregate_type = ? AND aggregate_id = ? AND (" +
                         "(aggregate_sequence < ? AND (transaction_id, global_offset) > (?::text::xid8, ?)) OR " +
-                        "(aggregate_sequence > ? AND (transaction_id, global_offset) <= (?::text::xid8, ?))) " +
+                        "(aggregate_sequence <> ? AND (transaction_id, global_offset) <= (?::text::xid8, ?))) " +
                         "ORDER BY aggregate_sequence",
                 ).use { ps ->
                     val m = event.metadata
@@ -265,20 +265,28 @@ class PostgresDomainPollingBackend(
                     ps.setLong(7, position.transactionId)
                     ps.setLong(8, position.globalOffset)
                     ps.executeQuery().use { rs ->
-                        val earlier = mutableListOf<PersistedEvent>()
-                        var allReadable = true
-                        var laterPassed = false
+                        val ahead = mutableListOf<PersistedEvent>()
+                        val readable = mutableMapOf<Long, Boolean>()
+                        var highestPassed = 0L
                         while (rs.next()) {
                             val found = rs.toPublishedEvent()
-                            if (found.metadata.sequence > m.sequence) {
-                                laterPassed = true
+                            val passed =
+                                found.position.transactionId < position.transactionId ||
+                                    (found.position.transactionId == position.transactionId &&
+                                        found.position.globalOffset <= position.globalOffset)
+                            if (passed) {
+                                highestPassed = maxOf(highestPassed, found.metadata.sequence)
                             } else {
-                                earlier += found
-                                if (!rs.getBoolean("readable")) allReadable = false
+                                ahead += found
+                                readable[found.metadata.sequence] = rs.getBoolean("readable")
                             }
                         }
+                        // Earlier events at or below the highest sequence already passed were handled when
+                        // that event was reached; pulling them forward again would re-deliver them.
+                        val earlier = ahead.filter { it.metadata.sequence > highestPassed }
+                        val allReadable = earlier.all { readable.getValue(it.metadata.sequence) }
                         when {
-                            laterPassed -> SequenceCheck.AlreadyHandled
+                            highestPassed > m.sequence -> SequenceCheck.AlreadyHandled
                             earlier.isEmpty() -> SequenceCheck.InOrder
                             !allReadable -> SequenceCheck.WaitForEarlier
                             else -> SequenceCheck.HandleEarlierFirst(earlier)
