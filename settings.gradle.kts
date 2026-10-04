@@ -1,9 +1,13 @@
 pluginManagement {
-    val kotlinVersion: String by settings
-    plugins {
-        kotlin("jvm") version kotlinVersion
-        kotlin("plugin.serialization") version kotlinVersion
+    includeBuild("build-logic")
+}
+
+dependencyResolutionManagement {
+    repositories {
+        mavenCentral()
     }
 }
 
-rootProject.name = "kotmod"
+rootProject.name = "kotmod-root"
+
+include("kotmod", "kotmod-db-scheduler", "examples")
