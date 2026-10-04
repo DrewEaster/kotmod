@@ -10,7 +10,7 @@ import io.kotmod.DomainPersistenceBackend
 import io.kotmod.DomainEvent
 import io.kotmod.OptimisticConcurrencyException
 import io.kotmod.PendingEvent
-import app.cash.sqldelight.driver.jdbc.JdbcDriver
+import io.kotmod.jdbc.JdbcContext
 import io.kotmod.CorrelationId
 import io.kotmod.DomainEventPollingBackend
 import io.kotmod.EventId
@@ -30,18 +30,20 @@ import kotlin.use
 /**
  * Postgres implementation of [DomainPersistenceBackend], using the tables in [DddSchema] and plain JDBC.
  *
- * Every call borrows a connection from [driver], so calls made inside a SQLDelight transaction on that
- * driver share the transaction. Events are serialized with [serialization] as they are appended.
+ * Every call borrows a connection from [jdbc], so calls made inside one of its transactions share that
+ * transaction. Events are serialized with [serialization] as they are appended.
  */
 class PostgresDomainPersistenceBackend<E : DomainEvent>(
-    private val driver: JdbcDriver,
+    private val jdbc: JdbcContext,
     private val serialization: DataSerializationContext<E>,
 ) : DomainPersistenceBackend<E> {
+    override fun <R> inTransaction(block: () -> R): R = jdbc.inTransaction(block)
+
     override fun loadMeta(
         type: AggregateType,
         id: AggregateId,
     ): AggregateMeta? =
-        useConnection { conn ->
+        jdbc.withConnection { conn ->
             conn
                 .prepareStatement(
                     "SELECT aggregate_version, created_at, updated_at " +
@@ -50,7 +52,7 @@ class PostgresDomainPersistenceBackend<E : DomainEvent>(
                     ps.setString(1, type.value)
                     ps.setString(2, id.value)
                     ps.executeQuery().use { rs ->
-                        if (!rs.next()) return@useConnection null
+                        if (!rs.next()) return@withConnection null
                         AggregateMeta(
                             version = rs.getLong("aggregate_version"),
                             createdAt =
@@ -73,7 +75,7 @@ class PostgresDomainPersistenceBackend<E : DomainEvent>(
         id: AggregateId,
         expectedVersion: Long?,
     ) {
-        useConnection { conn ->
+        jdbc.withConnection { conn ->
             val now = OffsetDateTime.now(ZoneOffset.UTC)
             if (expectedVersion == null) {
                 try {
@@ -116,7 +118,7 @@ class PostgresDomainPersistenceBackend<E : DomainEvent>(
 
     override fun appendEvents(events: List<PendingEvent<E>>) {
         if (events.isEmpty()) return
-        useConnection { conn ->
+        jdbc.withConnection { conn ->
             conn
                 .prepareStatement(
                     "INSERT INTO ddd_domain_event " +
@@ -156,7 +158,7 @@ class PostgresDomainPersistenceBackend<E : DomainEvent>(
         id: AggregateId,
         commandId: CommandId,
     ): Boolean =
-        useConnection { conn ->
+        jdbc.withConnection { conn ->
             conn
                 .prepareStatement(
                     "SELECT 1 FROM ddd_command_history " +
@@ -174,7 +176,7 @@ class PostgresDomainPersistenceBackend<E : DomainEvent>(
         id: AggregateId,
         commandId: CommandId,
     ) {
-        useConnection { conn ->
+        jdbc.withConnection { conn ->
             conn
                 .prepareStatement(
                     "INSERT INTO ddd_command_history (aggregate_type, aggregate_id, command_id) " +
@@ -188,14 +190,6 @@ class PostgresDomainPersistenceBackend<E : DomainEvent>(
         }
     }
 
-    private inline fun <R> useConnection(block: (Connection) -> R): R {
-        val (conn, close) = driver.connectionAndClose()
-        try {
-            return block(conn)
-        } finally {
-            close()
-        }
-    }
 
     private companion object {
         const val UNIQUE_VIOLATION = "23505"
@@ -204,7 +198,7 @@ class PostgresDomainPersistenceBackend<E : DomainEvent>(
 
 /** Postgres implementation of [DomainEventPollingBackend], reading `ddd_domain_event` in `global_offset` order. */
 class PostgresDomainPollingBackend(
-    private val driver: JdbcDriver,
+    private val jdbc: JdbcContext,
     private val eventAttributeColumns: Set<String> = setOf(),
 ): DomainEventPollingBackend {
 
@@ -212,9 +206,8 @@ class PostgresDomainPollingBackend(
         lastOffset: Long,
         limit: Int
     ): List<PersistedEvent> {
-        val (conn, close) = driver.connectionAndClose()
-        try {
-            return conn
+        return jdbc.withConnection { conn ->
+            conn
                 .prepareStatement(
                     "SELECT global_offset, aggregate_type, aggregate_id, " +
                             "causation_id, correlation_id, event_id, event_type, event_version, " +
@@ -232,8 +225,6 @@ class PostgresDomainPollingBackend(
                         result
                     }
                 }
-        } finally {
-            close()
         }
     }
 

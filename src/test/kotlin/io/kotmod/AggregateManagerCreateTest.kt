@@ -6,7 +6,6 @@ import io.kotmod.support.OrderPlaced
 import io.kotmod.support.PendingOrder
 import io.kotmod.support.StubPersistenceBackend
 import io.kotmod.support.StubRepository
-import io.kotmod.support.StubTransacter
 import kotlinx.coroutines.test.runTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -29,7 +28,6 @@ class AggregateManagerCreateTest {
                 aggregateType = AggregateType("Order"),
                 repository = repo,
                 backend = backend,
-                transacter = StubTransacter(),
             )
     }
 
@@ -119,5 +117,14 @@ class AggregateManagerCreateTest {
                 PendingOrder("widgets") to listOf(OrderPlaced("widgets"))
             }
             assertNotNull(repo.store[id])
+        }
+
+    @Test
+    fun `create writes meta, events and the command record inside the backend's transaction`() =
+        runTest {
+            orders.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book")) }
+
+            assertEquals(emptyList(), backend.writesOutsideTransaction)
+            assertEquals(1, backend.transactionsCommitted)
         }
 }

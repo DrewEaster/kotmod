@@ -90,8 +90,8 @@ class PublicEventContractIntegrationTest : IntegrationTest() {
 
     @BeforeEach
     fun createBackends() {
-        backend = PostgresDomainPersistenceBackend(driver, TestSerialization())
-        offsets = PostgresOffsetManager(driver)
+        backend = PostgresDomainPersistenceBackend(jdbc, TestSerialization())
+        offsets = PostgresOffsetManager(jdbc)
     }
 
     private fun seed(
@@ -130,7 +130,7 @@ class PublicEventContractIntegrationTest : IntegrationTest() {
 
             val contract =
                 PublicEventContract(
-                    backend = PostgresDomainPollingBackend(driver),
+                    backend = PostgresDomainPollingBackend(jdbc),
                     serialization = TestSerialization(),
                     internalToPublic = { event: TestInternalEvent ->
                         when (event) {

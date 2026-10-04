@@ -40,8 +40,8 @@ class AggregateEventOutboxIntegrationTest : IntegrationTest() {
 
     @BeforeEach
     fun createBackends() {
-        backend = PostgresDomainPersistenceBackend(driver, orderEventSerialization())
-        offsets = PostgresOffsetManager(driver)
+        backend = PostgresDomainPersistenceBackend(jdbc, orderEventSerialization())
+        offsets = PostgresOffsetManager(jdbc)
     }
 
     private fun seed(
@@ -73,7 +73,7 @@ class AggregateEventOutboxIntegrationTest : IntegrationTest() {
         onDispatch: suspend (EventReactionId, FakeTrigger) -> Unit,
         isLeader: () -> Boolean = { true },
     ) = AggregateEventOutbox(
-        backend = PostgresDomainPollingBackend(driver),
+        backend = PostgresDomainPollingBackend(jdbc),
         executor = recordingExecutor(onDispatch),
         eventToReactions = { event ->
             listOf(

@@ -27,6 +27,26 @@ class StubPersistenceBackend<E : DomainEvent> : DomainPersistenceBackend<E> {
     val events = mutableListOf<PendingEvent<E>>()
     val commands = mutableSetOf<CommandKey>()
 
+    private var transactionDepth = 0
+    var transactionsCommitted = 0
+        private set
+    val writesOutsideTransaction = mutableListOf<String>()
+
+    override fun <R> inTransaction(block: () -> R): R {
+        transactionDepth++
+        try {
+            val result = block()
+            if (transactionDepth == 1) transactionsCommitted++
+            return result
+        } finally {
+            transactionDepth--
+        }
+    }
+
+    private fun recordWrite(name: String) {
+        if (transactionDepth == 0) writesOutsideTransaction += name
+    }
+
     override fun loadMeta(
         type: AggregateType,
         id: AggregateId,
@@ -37,6 +57,7 @@ class StubPersistenceBackend<E : DomainEvent> : DomainPersistenceBackend<E> {
         id: AggregateId,
         expectedVersion: Long?,
     ) {
+        recordWrite("saveMeta")
         val key = Key(type, id)
         val now =
             java.time.Instant
@@ -55,6 +76,7 @@ class StubPersistenceBackend<E : DomainEvent> : DomainPersistenceBackend<E> {
     }
 
     override fun appendEvents(events: List<PendingEvent<E>>) {
+        recordWrite("appendEvents")
         this.events.addAll(events)
     }
 
@@ -69,6 +91,7 @@ class StubPersistenceBackend<E : DomainEvent> : DomainPersistenceBackend<E> {
         id: AggregateId,
         commandId: CommandId,
     ) {
+        recordWrite("recordCommandHandled")
         commands.add(CommandKey(type, id, commandId))
     }
 }

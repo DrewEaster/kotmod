@@ -4,7 +4,6 @@ import io.kotmod.support.OrderCancelled
 import io.kotmod.support.OrderEvent
 import io.kotmod.support.OrderPlaced
 import io.kotmod.support.StubPersistenceBackend
-import io.kotmod.support.StubTransacter
 import kotlinx.coroutines.test.runTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -22,7 +21,6 @@ class EventProducerTest {
             EventProducer(
                 aggregateType = AggregateType("Audit"),
                 backend = backend,
-                transacter = StubTransacter(),
             )
     }
 

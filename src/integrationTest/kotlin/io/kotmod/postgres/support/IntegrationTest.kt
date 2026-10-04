@@ -1,7 +1,7 @@
 package io.kotmod.postgres.support
 
-import app.cash.sqldelight.driver.jdbc.JdbcDriver
-import app.cash.sqldelight.driver.jdbc.asJdbcDriver
+import io.kotmod.jdbc.DataSourceJdbcContext
+import io.kotmod.jdbc.JdbcContext
 import io.kotmod.postgres.DddSchema
 import org.junit.jupiter.api.BeforeEach
 import org.postgresql.ds.PGSimpleDataSource
@@ -16,7 +16,7 @@ import javax.sql.DataSource
  */
 abstract class IntegrationTest {
     protected val dataSource: DataSource get() = SharedPostgres.dataSource
-    protected val driver: JdbcDriver get() = SharedPostgres.driver
+    protected val jdbc: JdbcContext get() = SharedPostgres.jdbc
 
     @BeforeEach
     fun truncateDddTables() {
@@ -41,7 +41,7 @@ private object SharedPostgres {
             password = container.password
         }
 
-    val driver: JdbcDriver = dataSource.asJdbcDriver()
+    val jdbc: JdbcContext = DataSourceJdbcContext(dataSource)
 
     init {
         val dbSchedulerDdl =

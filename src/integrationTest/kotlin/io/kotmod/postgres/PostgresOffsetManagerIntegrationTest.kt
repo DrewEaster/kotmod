@@ -10,7 +10,7 @@ class PostgresOffsetManagerIntegrationTest : IntegrationTest() {
 
     @BeforeEach
     fun createOffsetManager() {
-        offsets = PostgresOffsetManager(driver)
+        offsets = PostgresOffsetManager(jdbc)
     }
 
     @Test

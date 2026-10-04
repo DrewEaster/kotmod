@@ -8,7 +8,6 @@ import io.kotmod.support.PendingOrder
 import io.kotmod.support.ShippedOrder
 import io.kotmod.support.StubPersistenceBackend
 import io.kotmod.support.StubRepository
-import io.kotmod.support.StubTransacter
 import io.kotmod.support.cancel
 import io.kotmod.support.ship
 import kotlinx.coroutines.test.runTest
@@ -32,7 +31,6 @@ class AggregateManagerExecuteTest {
                 aggregateType = AggregateType("Order"),
                 repository = repo,
                 backend = backend,
-                transacter = StubTransacter(),
             )
     }
 

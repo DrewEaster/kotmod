@@ -2,8 +2,6 @@ package io.kotmod.readme
 
 // Keep in sync with README.md (Quickstart, steps 1, 3, 4 and 5).
 
-import app.cash.sqldelight.TransacterImpl
-import app.cash.sqldelight.driver.jdbc.asJdbcDriver
 import com.github.kagkarlsson.scheduler.Scheduler
 import io.kotmod.AggregateId
 import io.kotmod.AggregateManager
@@ -16,6 +14,7 @@ import io.kotmod.event.reaction.EventReactionExecutor
 import io.kotmod.event.reaction.EventReactionId
 import io.kotmod.event.reaction.RetrySignal
 import io.kotmod.event.reaction.dbscheduler.DbSchedulerEventReactions
+import io.kotmod.jdbc.DataSourceJdbcContext
 import io.kotmod.event.reaction.dbscheduler.eventually
 import io.kotmod.outbox.AggregateEventOutbox
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
@@ -52,7 +51,7 @@ class QuickstartTest : IntegrationTest() {
                 sentConfirmations += orderId
             }
 
-            val driver = dataSource.asJdbcDriver()
+            val jdbc = DataSourceJdbcContext(dataSource)
 
             val serialization =
                 jsonDataSerializationContext<OrderEvent> {
@@ -66,13 +65,12 @@ class QuickstartTest : IntegrationTest() {
             val orders =
                 AggregateManager(
                     aggregateType = orderType,
-                    repository = OrderRepository(driver),
-                    backend = PostgresDomainPersistenceBackend(driver, serialization),
-                    transacter = object : TransacterImpl(driver) {},
+                    repository = OrderRepository(jdbc),
+                    backend = PostgresDomainPersistenceBackend(jdbc, serialization),
                 )
 
             // Another aggregate type writing to the same event log, as an app with an audit log would.
-            recordView(auditLog(driver), AggregateId("order-1"), viewer = "support", requestId = "view-1")
+            recordView(auditLog(jdbc), AggregateId("order-1"), viewer = "support", requestId = "view-1")
 
             val orderId = AggregateId("order-1")
 
@@ -122,11 +120,11 @@ class QuickstartTest : IntegrationTest() {
                     },
                 )
 
-            val offsets = PostgresOffsetManager(driver)
+            val offsets = PostgresOffsetManager(jdbc)
 
             val outbox =
                 AggregateEventOutbox<OrderNotification>(
-                    backend = PostgresDomainPollingBackend(driver),
+                    backend = PostgresDomainPollingBackend(jdbc),
                     executor = executor,
                     eventToReactions = { event ->
                         if (event.metadata.aggregateType != orderType) {

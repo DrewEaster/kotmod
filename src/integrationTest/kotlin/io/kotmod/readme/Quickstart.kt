@@ -2,15 +2,14 @@ package io.kotmod.readme
 
 // Keep in sync with README.md (Quickstart, steps 2, 3 and 5).
 
-import app.cash.sqldelight.driver.jdbc.JdbcDriver
 import io.kotmod.AggregateId
 import io.kotmod.DomainEvent
 import io.kotmod.Repository
 import io.kotmod.event.reaction.EventReactionTrigger
+import io.kotmod.jdbc.JdbcContext
 import io.kotmod.event.reaction.EventReactionTriggerSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
-import java.sql.Connection
 import kotlin.time.Duration
 
 sealed interface Order
@@ -48,10 +47,10 @@ data class OrderCancelled(
 ) : OrderEvent
 
 class OrderRepository(
-    private val driver: JdbcDriver,
+    private val jdbc: JdbcContext,
 ) : Repository<Order> {
     override fun get(id: AggregateId): Order? =
-        driver.withConnection { conn ->
+        jdbc.withConnection { conn ->
             conn.prepareStatement("SELECT status, item, reason FROM orders WHERE id = ?").use { ps ->
                 ps.setString(1, id.value)
                 ps.executeQuery().use { rs ->
@@ -79,7 +78,7 @@ class OrderRepository(
                 is ShippedOrder -> Triple("SHIPPED", state.item, null)
                 is CancelledOrder -> Triple("CANCELLED", state.item, state.reason)
             }
-        driver.withConnection { conn ->
+        jdbc.withConnection { conn ->
             conn
                 .prepareStatement(
                     "INSERT INTO orders (id, status, item, reason) VALUES (?, ?, ?, ?) " +
@@ -92,16 +91,6 @@ class OrderRepository(
                     ps.executeUpdate()
                 }
         }
-    }
-}
-
-// Borrows the driver's connection, which is the transaction's connection inside AggregateManager.
-fun <R> JdbcDriver.withConnection(block: (Connection) -> R): R {
-    val (connection, close) = connectionAndClose()
-    try {
-        return block(connection)
-    } finally {
-        close()
     }
 }
 

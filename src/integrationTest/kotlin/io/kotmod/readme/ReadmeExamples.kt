@@ -2,8 +2,6 @@ package io.kotmod.readme
 
 // Keep in sync with README.md (Guides). These must compile; QuickstartTest runs the quickstart.
 
-import app.cash.sqldelight.TransacterImpl
-import app.cash.sqldelight.driver.jdbc.JdbcDriver
 import com.github.kagkarlsson.scheduler.Scheduler
 import io.kotmod.AggregateId
 import io.kotmod.AggregateManager
@@ -23,6 +21,7 @@ import io.kotmod.event.reaction.EventReactionId
 import io.kotmod.event.reaction.EventReactionTrigger
 import io.kotmod.event.reaction.EventReactionTriggerSerializer
 import io.kotmod.event.reaction.dbscheduler.DbSchedulerEventReactions
+import io.kotmod.jdbc.JdbcContext
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.PostgresDomainPollingBackend
 import io.kotmod.postgres.PostgresOffsetManager
@@ -75,15 +74,14 @@ data class OrderViewed(
     val viewer: String,
 ) : AuditEvent
 
-fun auditLog(driver: JdbcDriver): EventProducer<AuditEvent> =
+fun auditLog(jdbc: JdbcContext): EventProducer<AuditEvent> =
     EventProducer(
         aggregateType = AggregateType("OrderAuditLog"),
         backend =
             PostgresDomainPersistenceBackend(
-                driver,
+                jdbc,
                 jsonDataSerializationContext<AuditEvent> { +OrderViewed.serializer().toEventSerializer() },
             ),
-        transacter = object : TransacterImpl(driver) {},
     )
 
 suspend fun recordView(
@@ -158,14 +156,14 @@ data class OrderPlacedV1(
 ) : OrderPublicEvent
 
 fun orderContract(
-    driver: JdbcDriver,
+    jdbc: JdbcContext,
     serialization: DataSerializationContext<OrderEvent>,
     offsets: PostgresOffsetManager,
     billingExecutor: EventReactionExecutor<BillingTrigger, *>,
 ): PublicEventContract<OrderEvent, OrderPublicEvent> {
     val contract =
         PublicEventContract<OrderEvent, OrderPublicEvent>(
-            backend = PostgresDomainPollingBackend(driver),
+            backend = PostgresDomainPollingBackend(jdbc),
             serialization = serialization,
             internalToPublic = { event ->
                 when (event) {

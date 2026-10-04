@@ -1,8 +1,6 @@
 package io.kotmod
 
-import app.cash.sqldelight.Transacter
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import io.kotmod.jdbc.databaseWork
 import kotlin.time.toKotlinInstant
 
 /**
@@ -13,8 +11,9 @@ import kotlin.time.toKotlinInstant
  *    anything else (commands are idempotent). Otherwise load the aggregate's version and state.
  * 2. **Command:** call the app's block, which returns the new state and the events it raised. No
  *    database work happens during this phase.
- * 3. **Write:** in one transaction, advance the aggregate's version (optimistic concurrency), save the
- *    new state, append the events and record the command as handled.
+ * 3. **Write:** in one transaction (the backend's [DomainPersistenceBackend.inTransaction]), advance the
+ *    aggregate's version (optimistic concurrency), save the new state, append the events and record the
+ *    command as handled.
  *
  * Events appended here are later picked up by [io.kotmod.outbox.AggregateEventOutbox] and
  * [io.kotmod.contract.PublicEventContract].
@@ -26,7 +25,6 @@ class AggregateManager<S : Any, E : DomainEvent>(
     @PublishedApi internal val aggregateType: AggregateType,
     private val repository: Repository<S>,
     private val backend: DomainPersistenceBackend<E>,
-    private val transacter: Transacter,
 ) {
     /**
      * Creates aggregate [id] from the state and events returned by [block].
@@ -47,7 +45,7 @@ class AggregateManager<S : Any, E : DomainEvent>(
 
         // Phase 1: Read — dedup check
         val dedupResult: S? =
-            withContext(Dispatchers.IO) {
+            databaseWork {
                 if (backend.wasCommandHandled(aggregateType, id, resolvedCommandId)) {
                     repository.get(id) ?: throw AggregateNotFoundException(
                         aggregateType,
@@ -63,8 +61,8 @@ class AggregateManager<S : Any, E : DomainEvent>(
         val (newState, events) = block()
 
         // Phase 3: Write — tight transaction
-        withContext(Dispatchers.IO) {
-            transacter.transactionWithResult {
+        databaseWork {
+            backend.inTransaction {
                 backend.saveMeta(aggregateType, id, expectedVersion = null)
                 repository.save(id, newState)
                 if (events.isNotEmpty()) {
@@ -135,13 +133,13 @@ class AggregateManager<S : Any, E : DomainEvent>(
 
         // Phase 1: Read — dedup check, load meta, load state
         val readResult =
-            withContext(Dispatchers.IO) {
+            databaseWork {
                 if (backend.wasCommandHandled(aggregateType, id, resolvedCommandId)) {
                     val current = repository.get(id) ?: throw AggregateNotFoundException(
                         aggregateType,
                         id
                     )
-                    return@withContext ReadResult.Dedup(current)
+                    return@databaseWork ReadResult.Dedup(current)
                 }
                 val meta =
                     backend.loadMeta(aggregateType, id)
@@ -162,8 +160,8 @@ class AggregateManager<S : Any, E : DomainEvent>(
                 val (newState, events) = block(currentState)
 
                 // Phase 3: Write — tight transaction
-                withContext(Dispatchers.IO) {
-                    transacter.transactionWithResult {
+                databaseWork {
+                    backend.inTransaction {
                         backend.saveMeta(aggregateType, id, expectedVersion = meta.version)
                         repository.save(id, newState)
                         if (events.isNotEmpty()) {

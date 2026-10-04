@@ -5,7 +5,9 @@ package io.kotmod
  *
  * The library does not prescribe how state is stored; the app implements this against its own
  * tables. [AggregateManager] calls [save] inside the same transaction that records the aggregate's
- * version, events and handled command, so implementations must use the transaction's connection.
+ * version, events and handled command, so implementations must use the same
+ * [io.kotmod.jdbc.JdbcContext] (or SQLDelight driver) as the backend, e.g. via
+ * [io.kotmod.jdbc.JdbcContext.withConnection].
  *
  * @param S the aggregate's state type.
  */

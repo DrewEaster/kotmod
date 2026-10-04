@@ -1,8 +1,6 @@
 package io.kotmod
 
-import app.cash.sqldelight.Transacter
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import io.kotmod.jdbc.databaseWork
 import kotlin.time.toKotlinInstant
 
 private sealed class ReadPhaseResult {
@@ -23,7 +21,6 @@ private sealed class ReadPhaseResult {
 class EventProducer<E : DomainEvent>(
     private val aggregateType: AggregateType,
     private val backend: DomainPersistenceBackend<E>,
-    private val transacter: Transacter,
 ) {
     /**
      * Appends [events] for aggregate [id], creating the aggregate's bookkeeping on first use.
@@ -41,7 +38,7 @@ class EventProducer<E : DomainEvent>(
 
         // Phase 1: Read — dedup check, load existing version
         val readResult =
-            withContext(Dispatchers.IO) {
+            databaseWork {
                 if (backend.wasCommandHandled(aggregateType, id, resolvedCommandId)) {
                     ReadPhaseResult.Dedup
                 } else {
@@ -52,8 +49,8 @@ class EventProducer<E : DomainEvent>(
         val existingVersion = (readResult as ReadPhaseResult.Proceed).existingVersion
 
         // Phase 2: Write — tight transaction
-        withContext(Dispatchers.IO) {
-            transacter.transactionWithResult {
+        databaseWork {
+            backend.inTransaction {
                 backend.saveMeta(aggregateType, id, expectedVersion = existingVersion)
                 if (events.isNotEmpty()) {
                     backend.appendEvents(

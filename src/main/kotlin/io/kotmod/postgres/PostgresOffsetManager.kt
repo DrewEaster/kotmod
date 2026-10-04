@@ -1,7 +1,6 @@
 package io.kotmod.postgres
 
-import app.cash.sqldelight.driver.jdbc.JdbcDriver
-import java.sql.Connection
+import io.kotmod.jdbc.JdbcContext
 
 /**
  * Remembers how far each event consumer has read through the event log, in `ddd_consumer_offset`.
@@ -13,11 +12,11 @@ import java.sql.Connection
  * ```
  */
 class PostgresOffsetManager(
-    private val driver: JdbcDriver,
+    private val jdbc: JdbcContext,
 ) {
     /** Returns the last offset saved for [consumerName], or [INITIAL_OFFSET] if it has never saved one. */
     fun getOffset(consumerName: String): Long =
-        useConnection { conn ->
+        jdbc.withConnection { conn ->
             conn
                 .prepareStatement(
                     "SELECT last_offset FROM ddd_consumer_offset WHERE consumer_name = ?",
@@ -34,7 +33,7 @@ class PostgresOffsetManager(
         consumerName: String,
         offset: Long,
     ) {
-        useConnection { conn ->
+        jdbc.withConnection { conn ->
             conn
                 .prepareStatement(
                     "INSERT INTO ddd_consumer_offset (consumer_name, last_offset, updated_at) " +
@@ -49,14 +48,6 @@ class PostgresOffsetManager(
         }
     }
 
-    private inline fun <R> useConnection(block: (Connection) -> R): R {
-        val (conn, close) = driver.connectionAndClose()
-        try {
-            return block(conn)
-        } finally {
-            close()
-        }
-    }
 
     companion object {
         /** Offset for a consumer that has not processed anything yet; lower than any real `global_offset`. */

@@ -1,5 +1,7 @@
 package io.kotmod.jdbc
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
 
@@ -36,3 +38,9 @@ class KotmodTransaction internal constructor(
         }
     }
 }
+
+/**
+ * Runs kotmod's blocking database work for a command. Outside an outer transaction it switches to
+ * [kotlinx.coroutines.Dispatchers.IO].
+ */
+internal suspend fun <R> databaseWork(block: () -> R): R = withContext(Dispatchers.IO) { block() }

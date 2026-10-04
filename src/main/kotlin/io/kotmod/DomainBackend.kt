@@ -7,6 +7,12 @@ package io.kotmod
  * Postgres implementation.
  */
 interface DomainPersistenceBackend<E : DomainEvent> {
+    /**
+     * Runs [block] in a transaction, joining one already open on this thread. [AggregateManager] and
+     * [EventProducer] make all of a command's writes inside it.
+     */
+    fun <R> inTransaction(block: () -> R): R
+
     /** Returns the bookkeeping for aggregate [type]/[id], or `null` if it does not exist. */
     fun loadMeta(
         type: AggregateType,

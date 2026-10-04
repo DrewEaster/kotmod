@@ -1,6 +1,5 @@
 package io.kotmod.postgres
 
-import app.cash.sqldelight.TransacterImpl
 import io.kotmod.AggregateAlreadyExistsException
 import io.kotmod.AggregateId
 import io.kotmod.AggregateType
@@ -30,8 +29,8 @@ class PostgresDomainBackendIntegrationTest : IntegrationTest() {
 
     @BeforeEach
     fun createBackends() {
-        backend = PostgresDomainPersistenceBackend(driver, orderEventSerialization())
-        pollingBackend = PostgresDomainPollingBackend(driver)
+        backend = PostgresDomainPersistenceBackend(jdbc, orderEventSerialization())
+        pollingBackend = PostgresDomainPollingBackend(jdbc)
     }
 
     private fun metadata(
@@ -227,17 +226,14 @@ class PostgresDomainBackendIntegrationTest : IntegrationTest() {
         }
 
     @Test
-    fun `backend operations inside a driver transaction roll back together`() =
+    fun `backend operations inside a JdbcContext transaction roll back together`() =
         runTest {
             val type = AggregateType("Order")
             val id = AggregateId("o-1")
             val now = kotlin.time.Instant.parse("2026-04-18T10:00:00Z")
 
-            // Same shape as a SQLDelight-generated Database: a Transacter over the backend's driver.
-            val transacter = object : TransacterImpl(driver) {}
-
             try {
-                transacter.transaction {
+                jdbc.inTransaction {
                     backend.saveMeta(type, id, expectedVersion = null)
                     backend.appendEvents(
                         listOf(

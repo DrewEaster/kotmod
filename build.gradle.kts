@@ -2,7 +2,6 @@ plugins {
     `java-library`
     kotlin("jvm")
     kotlin("plugin.serialization")
-    id("app.cash.sqldelight") version "2.4.0"
 }
 
 repositories {
@@ -20,8 +19,6 @@ configurations[integrationTest.runtimeOnlyConfigurationName].extendsFrom(configu
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
-    implementation("app.cash.sqldelight:runtime:2.4.0")
-    implementation("app.cash.sqldelight:jdbc-driver:2.4.0")
     implementation("org.slf4j:slf4j-api:2.0.20")
     implementation("com.aventrix.jnanoid:jnanoid:2.0.0")
     api("com.github.kagkarlsson:db-scheduler:16.12.0")
@@ -34,15 +31,6 @@ dependencies {
     "integrationTestImplementation"("org.testcontainers:testcontainers-postgresql:2.0.5")
 }
 
-sqldelight {
-    databases {
-        create("InfrastructureDatabase") {
-            packageName.set("io.kotmod.db")
-            srcDirs("src/main/sqldelight/global")
-            dialect("app.cash.sqldelight:postgresql-dialect:2.4.0")
-        }
-    }
-}
 
 kotlin {
     jvmToolchain(25)

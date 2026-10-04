@@ -5,7 +5,6 @@ import io.kotmod.DomainEvent
 import io.kotmod.PublicDomainEvent
 import io.kotmod.PublicEventEnvelope
 import io.kotmod.outbox.DomainEventPoller
-import app.cash.sqldelight.driver.jdbc.JdbcDriver
 import io.kotmod.DomainEventPollingBackend
 import io.kotmod.PersistedEvent
 import io.kotmod.event.reaction.EventReaction

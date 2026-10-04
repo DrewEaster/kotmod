@@ -241,8 +241,8 @@ class DbSchedulerEventReactionsIntegrationTest : IntegrationTest() {
     @Test
     fun `outbox delivers reactions end to end through db-scheduler and saves its offset`() =
         runBlocking {
-            val persistence = PostgresDomainPersistenceBackend(driver, orderEventSerialization())
-            val offsets = PostgresOffsetManager(driver)
+            val persistence = PostgresDomainPersistenceBackend(jdbc, orderEventSerialization())
+            val offsets = PostgresOffsetManager(jdbc)
             listOf("e-1", "e-2").forEachIndexed { index, eventId ->
                 persistence.appendEvents(
                     listOf(
@@ -268,7 +268,7 @@ class DbSchedulerEventReactionsIntegrationTest : IntegrationTest() {
             val executor = testExecutor(reactions, scheduler, recorder)
             val outbox =
                 AggregateEventOutbox(
-                    backend = PostgresDomainPollingBackend(driver),
+                    backend = PostgresDomainPollingBackend(jdbc),
                     executor = executor,
                     eventToReactions = { event ->
                         listOf(
