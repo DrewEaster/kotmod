@@ -64,7 +64,7 @@ You also need a `javax.sql.DataSource` for your database, for example from Hikar
 Requirements:
 
 - A JVM 25 toolchain (kotmod is currently built and tested on it) and Kotlin.
-- PostgreSQL.
+- PostgreSQL 13 or later.
 - [db-scheduler](https://github.com/kagkarlsson/db-scheduler) 16.12.0 for durable event reactions. It
   comes in with `kotmod-db-scheduler`.
 
@@ -356,8 +356,8 @@ val outbox =
                 }
             }
         },
-        getOffset = { offsets.getOffset("order-notifications") },
-        saveOffset = { offsets.saveOffset("order-notifications", it) },
+        getPosition = { offsets.getPosition("order-notifications") },
+        savePosition = { offsets.savePosition("order-notifications", it) },
         isLeader = { true },
     )
 ```
@@ -581,7 +581,7 @@ kotmod's Postgres classes use plain JDBC through a `JdbcContext`. For a plain `D
 | `ddd_aggregate_root` | Each aggregate's version and timestamps |
 | `ddd_domain_event` | The event log, ordered by `global_offset` |
 | `ddd_command_history` | Which commands each aggregate has handled |
-| `ddd_consumer_offset` | How far each outbox or contract has read |
+| `ddd_consumer_offset` | How far each outbox or contract has read (a transaction id and offset) |
 
 db-scheduler's `scheduled_tasks` table belongs to your application; create it from db-scheduler's
 [`postgresql_tables.sql`](https://github.com/kagkarlsson/db-scheduler/blob/v16.12.0/db-scheduler/src/test/resources/postgresql_tables.sql).
@@ -611,11 +611,11 @@ Repositories implemented with SQLDelight queries need no changes: they already r
 
 ### The outbox and event reactions
 
-`AggregateEventOutbox` is the outbox: while running it reads events after its saved offset, maps each
+`AggregateEventOutbox` is the outbox: while running it reads events after its saved position, maps each
 one to event reactions with `eventToReactions`, dispatches them to an `EventReactionExecutor`, and saves
-the offset after each event. If dispatching fails, the batch stops and the next poll starts again from
-the last saved offset. (Under concurrent writes there is one case where an event can be missed; see
-[Running in production](#running-in-production).)
+the position after each event. If dispatching fails, the batch stops and the next poll starts again from
+the last saved position, so no event is skipped — including events committed late by slower, concurrent
+transactions.
 
 `EventReactionExecutor` runs each reaction:
 
@@ -732,8 +732,8 @@ fun orderContract(
                     else -> null
                 }
             },
-            getOffset = { offsets.getOffset("order-contract") },
-            saveOffset = { offsets.saveOffset("order-contract", it) },
+            getPosition = { offsets.getPosition("order-contract") },
+            savePosition = { offsets.savePosition("order-contract", it) },
             isLeader = { true },
         )
 
@@ -766,16 +766,14 @@ fun orderContract(
 ## Running in production
 
 **Delivery is at-least-once.** Events are committed with the state change that produced them, and the
-outbox only moves past an event once all of its reactions are dispatched. A reaction can run more than
-once — for example if the process dies after dispatching but before saving the offset, or if a shutdown
-interrupts a running reaction. Make `execute` and `onCompletion` idempotent.
+outbox only moves past an event once all of its reactions are dispatched, so no event is ever skipped. A
+reaction can run more than once — for example if the process dies after dispatching but before saving the
+position, or if a shutdown interrupts a running reaction. Make `execute` and `onCompletion` idempotent.
 
-**Known limitation: concurrent writes can cause missed events.** Event offsets come from a Postgres
-sequence, and two transactions can commit in a different order from the offsets they were given. If the
-outbox (or a public contract) reads the later event before the earlier transaction commits, it saves an
-offset past the earlier event and never reads it, so that event's reactions never run. This can happen
-whenever commands commit concurrently. Until it is fixed, take it into account before relying on kotmod
-for reactions that must never be missed.
+**Long transactions delay delivery.** An outbox only reads past transactions that have finished, so it
+never skips an event that a slower transaction commits late. The flip side: while any transaction on the
+same Postgres server is open — even one in another database — later events wait for it. Keep
+transactions short.
 
 **Use deterministic reaction ids.** Build each reaction id from the event id plus a label, as in
 `"confirmation-${event.metadata.eventId.value}"`. Then a re-dispatched event is recognised as a
@@ -798,7 +796,7 @@ needs no such care: it is safe to run on every node, and each reaction runs on o
 | A reaction times out | Your `timeoutRetryHandler` decides |
 | A reaction's stored data can't be read | Retried with backoff from 10 seconds up to 1 hour |
 | A node crashes mid-reaction | db-scheduler notices the missing heartbeat and runs it again |
-| The database is down while dispatching | The outbox batch stops and resumes from the last saved offset on the next poll |
+| The database is down while dispatching | The outbox batch stops and resumes from the last saved position on the next poll |
 | The outbox can't deserialize an event (e.g. another aggregate type's) | The batch stops and is retried every poll, so later events wait — filter by aggregate type as the quickstart does |
 | A command loses a concurrent update | `OptimisticConcurrencyException` — run the command again |
 
