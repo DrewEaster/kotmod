@@ -24,7 +24,8 @@ import kotlin.time.Duration.Companion.milliseconds
  * @param pollInterval pause between polls.
  * @param batchSize maximum number of events read per poll.
  * @param ordering whether reactions for the same aggregate run in event order; ordered outboxes need an
- *   executor whose sink supports ordering.
+ *   executor whose sink supports ordering, and that executor may not be fed ordered reactions by any other
+ *   outbox or contract.
  */
 class AggregateEventOutbox<T : EventReactionTrigger>(
     private val backend: DomainEventPollingBackend,
@@ -41,6 +42,7 @@ class AggregateEventOutbox<T : EventReactionTrigger>(
         require(ordering == ReactionOrdering.Unordered || executor.supportsOrdering) {
             "An ordered outbox needs an executor whose sink supports ordering"
         }
+        if (ordering != ReactionOrdering.Unordered) executor.claimOrderedSource(this)
     }
 
     private val log = LoggerFactory.getLogger(AggregateEventOutbox::class.java)

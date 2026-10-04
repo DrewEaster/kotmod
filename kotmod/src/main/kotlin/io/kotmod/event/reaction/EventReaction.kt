@@ -7,6 +7,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withTimeout
 import org.slf4j.LoggerFactory
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 
@@ -180,6 +181,21 @@ class EventReactionExecutor<T : EventReactionTrigger, ExecutionContext>(
 
     /** Whether this executor's sink can run reactions in order. */
     val supportsOrdering: Boolean get() = sink.supportsOrdering
+
+    private val orderedSource = AtomicReference<Any?>(null)
+
+    /**
+     * Records [source] (an outbox or contract) as the one that feeds this executor ordered reactions. Ordering
+     * only holds for reactions dispatched by one poller, so a second, different source is rejected; the same
+     * source claiming again (a contract with several ordered subscriptions) is fine.
+     */
+    internal fun claimOrderedSource(source: Any) {
+        val claimed = orderedSource.compareAndExchange(null, source)
+        require(claimed == null || claimed === source) {
+            "This executor already receives ordered reactions from $claimed; an ordered executor can be fed by " +
+                "only one outbox or contract. Give each ordered outbox or contract its own executor."
+        }
+    }
 
     /** Queues reaction [id] with [trigger] for execution, stamped with [ordering] if given. */
     suspend fun dispatch(id: EventReactionId, trigger: T, ordering: DispatchOrdering? = null) {

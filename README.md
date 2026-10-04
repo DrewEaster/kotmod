@@ -795,8 +795,11 @@ CREATE INDEX scheduled_tasks_ordered_idx ON scheduled_tasks (task_name, task_ins
 
 - Ordering applies per executor (per db-scheduler task name) and aggregate. Two executors that handle
   the same aggregate do not wait on each other.
-- Subscriptions that share one executor share ordering for an aggregate, so their reactions queue behind
-  each other. Give each of them distinct reaction ids.
+- Ordered subscriptions of one contract that share an executor share ordering for an aggregate: each
+  event's reactions run one at a time, in subscription order. Give each of them distinct reaction ids.
+- An ordered executor can be fed by only one outbox or contract; a second one fails when it is constructed
+  or subscribes. Executors that share one `DbSchedulerEventReactions` task name would share ordering across
+  sources, which is not supported: give each ordered outbox or contract its own task name.
 - Delivery is still at-least-once, so reactions must still be idempotent. In one rare case, ordering can
   briefly be broken: if the outbox crashes after dispatching several reactions from the same event but
   before saving its position, an earlier one of those that had already completed can run again at the same

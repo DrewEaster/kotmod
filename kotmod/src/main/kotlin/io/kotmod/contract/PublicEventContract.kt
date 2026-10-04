@@ -44,21 +44,24 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
         val ordering: ReactionOrdering,
         val block: (PublicEventEnvelope<E>) -> List<EventReaction<T>>,
     ) {
+        /** Dispatches this subscription's reactions, numbering them from [firstOrdinal]; returns the next ordinal. */
         suspend fun fanOut(
             envelope: PublicEventEnvelope<E>,
             position: EventLogPosition,
+            firstOrdinal: Int,
             log: Logger,
-        ) {
+        ): Int {
             val reactions = block(envelope)
-            reactions.forEachIndexed { ordinal, reaction ->
+            reactions.forEachIndexed { index, reaction ->
                 log.debug(
                     "Dispatching event reaction {} for DDD event {} [position={}]",
                     reaction.id.value,
                     envelope.metadata.eventId.value,
                     position,
                 )
-                executor.dispatch(reaction.id, reaction.trigger, ordering.stampFor(envelope.metadata, ordinal))
+                executor.dispatch(reaction.id, reaction.trigger, ordering.stampFor(envelope.metadata, firstOrdinal + index))
             }
+            return firstOrdinal + reactions.size
         }
     }
 
@@ -69,7 +72,9 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
     /**
      * Registers a subscriber: [block] maps each public event to reactions dispatched to [executor].
      * Reactions are stamped per [ordering]; ordered subscriptions need an executor whose sink supports
-     * ordering. Must be called before [start].
+     * ordering. Ordered subscriptions of this contract may share an executor and then share ordering for an
+     * aggregate, but that executor may not be fed ordered reactions by any other outbox or contract. Must be
+     * called before [start].
      */
     fun <T : EventReactionTrigger> subscribe(
         executor: EventReactionExecutor<T, *>,
@@ -80,6 +85,7 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
         require(ordering == ReactionOrdering.Unordered || executor.supportsOrdering) {
             "An ordered subscription needs an executor whose sink supports ordering"
         }
+        if (ordering != ReactionOrdering.Unordered) executor.claimOrderedSource(this)
         subscriptions += Subscription(executor, ordering, block)
     }
 
@@ -111,8 +117,11 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
         val internal: I = serialization.deserialize(envelope.serialized)
         val public: E = internalToPublic(internal) ?: return
         val publicEnvelope = PublicEventEnvelope(envelope.metadata, public)
+        // One ordinal counter across all subscriptions: ordered subscriptions sharing an executor share ordering
+        // for an aggregate, so anything dispatched later for this event must sort later.
+        var ordinal = 0
         for (subscription in subscriptions) {
-            subscription.fanOut(publicEnvelope, envelope.position, log)
+            ordinal = subscription.fanOut(publicEnvelope, envelope.position, ordinal, log)
         }
     }
 }

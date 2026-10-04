@@ -19,6 +19,7 @@ import io.kotmod.support.RecordingOffsets
 import io.kotmod.support.persistedEvent
 import io.mockk.coEvery
 import io.mockk.coVerify
+import io.mockk.coVerifyOrder
 import io.mockk.coVerifySequence
 import io.mockk.every
 import io.mockk.mockk
@@ -299,5 +300,20 @@ class PublicEventContractTest {
 
         coVerify { executorA.dispatch(EventReactionId("A"), FakeTrigger("A"), DispatchOrdering("Order/o-1", 2, 0, OnGiveUp.ContinueWithNext)) }
         coVerify { executorB.dispatch(EventReactionId("B"), FakeTrigger("B"), null) }
+    }
+
+    @Test
+    fun `ordinals run on across ordered subscriptions so a later dispatch for an event always sorts later`() {
+        every { executorA.supportsOrdering } returns true
+        givenEvents(persistedEvent(globalOffset = 10, aggregateId = "o-1", sequence = 5, eventType = "Opened", eventPayload = "Opened(id=doc-1)"))
+        val contract = newContract()
+        contract.subscribe(executorA, ordering = ReactionOrdering.PerAggregate()) { listOf(EventReaction(EventReactionId("zz"), FakeTrigger("S1"))) }
+        contract.subscribe(executorA, ordering = ReactionOrdering.PerAggregate()) { listOf(EventReaction(EventReactionId("aa"), FakeTrigger("S2"))) }
+        kotlinx.coroutines.runBlocking { contract.tickForTest() }
+
+        coVerifyOrder {
+            executorA.dispatch(EventReactionId("zz"), FakeTrigger("S1"), DispatchOrdering("Order/o-1", 5, 0, OnGiveUp.ContinueWithNext))
+            executorA.dispatch(EventReactionId("aa"), FakeTrigger("S2"), DispatchOrdering("Order/o-1", 5, 1, OnGiveUp.ContinueWithNext))
+        }
     }
 }

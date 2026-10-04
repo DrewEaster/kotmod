@@ -1,19 +1,36 @@
 package io.kotmod.event.reaction.dbscheduler
 
+import io.kotmod.AggregateId
+import io.kotmod.AggregateType
+import io.kotmod.CommandId
+import io.kotmod.EventId
+import io.kotmod.EventLogPosition
+import io.kotmod.EventMetadata
+import io.kotmod.PendingEvent
+import io.kotmod.PublicDomainEvent
+import io.kotmod.contract.PublicEventContract
 import io.kotmod.event.reaction.DispatchOrdering
+import io.kotmod.event.reaction.EventReaction
 import io.kotmod.event.reaction.EventReactionCompletionResult
 import io.kotmod.event.reaction.EventReactionExecutionResult
 import io.kotmod.event.reaction.EventReactionExecutor
 import io.kotmod.event.reaction.EventReactionId
 import io.kotmod.event.reaction.OnGiveUp
+import io.kotmod.event.reaction.ReactionOrdering
 import io.kotmod.event.reaction.RetrySignal
+import io.kotmod.postgres.PostgresDomainPersistenceBackend
+import io.kotmod.postgres.PostgresDomainPollingBackend
 import io.kotmod.postgres.support.IntegrationTest
 import io.kotmod.postgres.support.eventually
+import io.kotmod.postgres.support.orderEventSerialization
+import io.kotmod.support.OrderEvent
+import io.kotmod.support.OrderPlaced
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -243,4 +260,82 @@ class OrderedReactionsIntegrationTest : IntegrationTest() {
 
             assertEquals(listOf("start", "start", "end", "end"), log.events.map { it.substringBefore(':') })
         }
+
+    private data class PublicOrderPlaced(
+        val orderId: String,
+    ) : PublicDomainEvent
+
+    @Test
+    fun `ordered subscriptions of one contract sharing an executor run one at a time even when the later id sorts first`() =
+        runBlocking {
+            val persistence = PostgresDomainPersistenceBackend(jdbc, orderEventSerialization())
+            jdbc.inTransaction {
+                persistence.saveMeta(AggregateType("Order"), AggregateId("o-1"), expectedVersion = null, eventCount = 1)
+                persistence.appendEvents(
+                    listOf(
+                        PendingEvent(
+                            metadata =
+                                EventMetadata(
+                                    eventId = EventId("e-1"),
+                                    aggregateType = AggregateType("Order"),
+                                    aggregateId = AggregateId("o-1"),
+                                    causationId = CommandId("cmd-1"),
+                                    correlationId = null,
+                                    timestamp = kotlin.time.Instant.parse("2026-10-04T10:00:00Z"),
+                                    sequence = 1,
+                                ),
+                            event = OrderPlaced("widgets"),
+                        ),
+                    ),
+                )
+            }
+            val reactions = reactions()
+            val scheduler = testScheduler(dataSource, *reactions.tasks.toTypedArray())
+            val log = Log()
+            val executor = executor(reactions, scheduler, log, execute = { _, _ ->
+                delay(500)
+                EventReactionExecutionResult.EventReactionExecutionCompleted
+            })
+            val position = AtomicReference(EventLogPosition.START)
+            val contract =
+                PublicEventContract<OrderEvent, PublicOrderPlaced>(
+                    backend = PostgresDomainPollingBackend(jdbc),
+                    serialization = orderEventSerialization(),
+                    internalToPublic = { PublicOrderPlaced("o-1") },
+                    getPosition = { position.get() },
+                    savePosition = { position.set(it) },
+                    isLeader = { true },
+                    pollInterval = 50.milliseconds,
+                )
+            // The second subscription's reaction id sorts before the first's, and is only dispatched once the
+            // first is already running.
+            contract.subscribe(executor, ordering = ReactionOrdering.PerAggregate()) {
+                listOf(EventReaction(EventReactionId("zz-${it.metadata.eventId.value}"), TestTrigger("first")))
+            }
+            contract.subscribe(executor, ordering = ReactionOrdering.PerAggregate()) {
+                check(eventuallyBlocking { "start:first" in log.events }) { "first reaction never started" }
+                listOf(EventReaction(EventReactionId("aa-${it.metadata.eventId.value}"), TestTrigger("second")))
+            }
+
+            running(scheduler, executor) {
+                contract.start()
+                try {
+                    eventually(10.seconds) { log.events.count { it.startsWith("end:") } == 2 }
+                } finally {
+                    contract.stop()
+                }
+            }
+
+            assertTrue(neverOverlap(log), log.events.toString())
+            assertEquals(listOf("start:first", "end:first", "start:second", "end:second"), log.events.toList())
+        }
+
+    private fun eventuallyBlocking(condition: () -> Boolean): Boolean {
+        val deadline = System.nanoTime() + 5_000_000_000L
+        while (System.nanoTime() < deadline) {
+            if (condition()) return true
+            Thread.sleep(10)
+        }
+        return false
+    }
 }

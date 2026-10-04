@@ -175,8 +175,13 @@ Ordered reactions remain ordinary db-scheduler task instances of the existing ta
 - **Settings:** `orderedRecheckDelay: Duration = 2.seconds`; optional `tableName: String = "scheduled_tasks"`
   for the check query. `supportsOrdering = true`.
 - **Scope of ordering:** checks filter by `task_name`, so ordering is per (executor, aggregate). Separate
-  executors never wait on each other. Two subscriptions sharing one executor share ordering for an aggregate
-  (and a `BlockAggregate` affects both), and must use distinct reaction ids (as today).
+  executors never wait on each other. Ordered subscriptions of one contract sharing an executor share
+  ordering for an aggregate (and a `BlockAggregate` affects both), and must use distinct reaction ids (as
+  today); the contract numbers ordinals with one counter across its subscriptions, so anything dispatched
+  later for an event sorts later. An ordered executor can be fed by only one source (one outbox or one
+  contract): `EventReactionExecutor` rejects a second source when it is constructed or subscribes. Executors
+  sharing one `DbSchedulerEventReactions` task name would share ordering across sources and are not
+  supported; each ordered source needs its own task name.
 - Existing behaviour retained: unsubscribed safety net, undecodable-data backoff, retry counts in task data,
   fresh execution id per attempt.
 
