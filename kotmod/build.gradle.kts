@@ -1,6 +1,17 @@
 plugins {
-    id("kotmod.library")
+    id("kotmod.published")
     `java-test-fixtures`
+}
+
+description = "Domain-driven design on Postgres: aggregates, domain events and a transactional outbox."
+
+// The test fixtures are for kotmod's own tests; keep them out of the published artifacts.
+val javaComponent = components["java"] as AdhocComponentWithVariants
+javaComponent.withVariantsFromConfiguration(configurations["testFixturesApiElements"]) { skip() }
+javaComponent.withVariantsFromConfiguration(configurations["testFixturesRuntimeElements"]) { skip() }
+// The publishing plugin adds the fixtures' sources variant late in configuration.
+afterEvaluate {
+    javaComponent.withVariantsFromConfiguration(configurations["testFixturesSourcesElements"]) { skip() }
 }
 
 dependencies {

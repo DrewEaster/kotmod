@@ -49,9 +49,9 @@ plugins {
 }
 
 dependencies {
-    implementation("io.kotmod:kotmod:<version>")
-    implementation("io.kotmod:kotmod-db-scheduler:<version>") // durable event reactions on db-scheduler
-    // implementation("io.kotmod:kotmod-sqldelight:<version>") // only if your app uses SQLDelight
+    implementation("io.github.dreweaster:kotmod:0.1.0")
+    implementation("io.github.dreweaster:kotmod-db-scheduler:0.1.0") // durable event reactions on db-scheduler
+    // implementation("io.github.dreweaster:kotmod-sqldelight:0.1.0") // only if your app uses SQLDelight
 
     // Used directly by the code in this README:
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")

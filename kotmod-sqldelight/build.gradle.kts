@@ -1,6 +1,8 @@
 plugins {
-    id("kotmod.library")
+    id("kotmod.published")
 }
+
+description = "Share kotmod transactions with SQLDelight."
 
 dependencies {
     api(project(":kotmod"))

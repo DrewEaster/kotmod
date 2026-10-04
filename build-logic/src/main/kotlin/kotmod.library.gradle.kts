@@ -4,7 +4,7 @@ plugins {
     id("org.jetbrains.kotlin.plugin.serialization")
 }
 
-group = "io.kotmod"
+group = "io.github.dreweaster"
 
 repositories {
     mavenCentral()

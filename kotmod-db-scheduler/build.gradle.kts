@@ -1,6 +1,8 @@
 plugins {
-    id("kotmod.library")
+    id("kotmod.published")
 }
+
+description = "Durable kotmod event reactions on db-scheduler."
 
 dependencies {
     api(project(":kotmod"))
