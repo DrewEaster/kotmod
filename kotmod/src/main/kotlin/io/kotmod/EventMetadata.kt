@@ -11,6 +11,7 @@ import kotlin.time.Instant
  * @property causationId the command that caused it.
  * @property correlationId the wider flow it belongs to, if any.
  * @property timestamp when it was raised.
+ * @property sequence this event's number within its aggregate: 1, 2, 3, … in history order, with no gaps.
  */
 data class EventMetadata(
     val eventId: EventId,
@@ -19,6 +20,7 @@ data class EventMetadata(
     val causationId: CommandId,
     val correlationId: CorrelationId?,
     val timestamp: Instant,
+    val sequence: Long,
 )
 
 /** A public event delivered to [io.kotmod.contract.PublicEventContract] subscribers, with the [metadata] of the domain event it came from. */

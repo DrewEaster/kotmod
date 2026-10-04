@@ -63,7 +63,7 @@ class AggregateManager<S : Any, E : DomainEvent>(
         // Phase 3: Write — tight transaction
         databaseWork(backend::isInTransaction) {
             backend.inTransaction {
-                backend.saveMeta(aggregateType, id, expectedVersion = null)
+                val lastSequence = backend.saveMeta(aggregateType, id, expectedVersion = null, eventCount = events.size)
                 repository.save(id, newState)
                 if (events.isNotEmpty()) {
                     backend.appendEvents(
@@ -72,6 +72,7 @@ class AggregateManager<S : Any, E : DomainEvent>(
                             causationId = resolvedCommandId,
                             correlationId = correlationId,
                             events = events,
+                            firstSequence = lastSequence - events.size + 1,
                         ),
                     )
                 }
@@ -162,7 +163,7 @@ class AggregateManager<S : Any, E : DomainEvent>(
                 // Phase 3: Write — tight transaction
                 databaseWork(backend::isInTransaction) {
                     backend.inTransaction {
-                        backend.saveMeta(aggregateType, id, expectedVersion = meta.version)
+                        val lastSequence = backend.saveMeta(aggregateType, id, expectedVersion = meta.version, eventCount = events.size)
                         repository.save(id, newState)
                         if (events.isNotEmpty()) {
                             backend.appendEvents(
@@ -171,6 +172,7 @@ class AggregateManager<S : Any, E : DomainEvent>(
                                     causationId = resolvedCommandId,
                                     correlationId = correlationId,
                                     events = events,
+                                    firstSequence = lastSequence - events.size + 1,
                                 ),
                             )
                         }
@@ -200,12 +202,13 @@ class AggregateManager<S : Any, E : DomainEvent>(
         causationId: CommandId,
         correlationId: CorrelationId?,
         events: List<E>,
+        firstSequence: Long,
     ): List<PendingEvent<E>> {
         val now =
             java.time.Instant
                 .now()
                 .toKotlinInstant()
-        return events.map { event ->
+        return events.mapIndexed { index, event ->
             PendingEvent(
                 metadata =
                     EventMetadata(
@@ -215,6 +218,7 @@ class AggregateManager<S : Any, E : DomainEvent>(
                         causationId = causationId,
                         correlationId = correlationId,
                         timestamp = now,
+                        sequence = firstSequence + index,
                     ),
                 event = event,
             )

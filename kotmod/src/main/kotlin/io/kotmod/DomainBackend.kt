@@ -26,15 +26,18 @@ interface DomainPersistenceBackend<E : DomainEvent> {
     ): AggregateMeta?
 
     /**
-     * Records a change to aggregate [type]/[id]. With [expectedVersion] `null` the aggregate is created at
-     * version 1, throwing [AggregateAlreadyExistsException] if it exists; otherwise its version is advanced
-     * from [expectedVersion], throwing [OptimisticConcurrencyException] if the stored version differs.
+     * Records a change to aggregate [type]/[id] that raised [eventCount] events, and returns the aggregate's
+     * new last event sequence number (the events are numbered `result - eventCount + 1 … result`). With
+     * [expectedVersion] `null` the aggregate is created (throwing [AggregateAlreadyExistsException] if it
+     * exists); otherwise its version is advanced from [expectedVersion] (throwing
+     * [OptimisticConcurrencyException] if the stored version differs).
      */
     fun saveMeta(
         type: AggregateType,
         id: AggregateId,
         expectedVersion: Long?,
-    )
+        eventCount: Int,
+    ): Long
 
     /** Appends [events] to the event log in order. */
     fun appendEvents(events: List<PendingEvent<E>>)

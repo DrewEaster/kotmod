@@ -54,7 +54,7 @@ class AggregateEventOutboxIntegrationTest : IntegrationTest() {
         correlationId: CorrelationId? = null,
     ) {
         val type = AggregateType("Order")
-        backend.saveMeta(type, AggregateId(aggregateId), expectedVersion = null)
+        backend.saveMeta(type, AggregateId(aggregateId), expectedVersion = null, eventCount = 1)
         backend.appendEvents(
             listOf(
                 PendingEvent(
@@ -66,6 +66,7 @@ class AggregateEventOutboxIntegrationTest : IntegrationTest() {
                             causationId = CommandId("cmd-$eventId"),
                             correlationId = correlationId,
                             timestamp = kotlin.time.Instant.parse("2026-04-18T10:00:00Z"),
+                            sequence = 1,
                         ),
                     event = OrderPlaced("widgets-$aggregateId"),
                 ),
@@ -173,9 +174,9 @@ class AggregateEventOutboxIntegrationTest : IntegrationTest() {
                 eventId: String,
             ) = conn
                 .prepareStatement(
-                    "INSERT INTO ddd_domain_event (aggregate_type, aggregate_id, causation_id, event_id, " +
+                    "INSERT INTO ddd_domain_event (aggregate_type, aggregate_id, aggregate_sequence, causation_id, event_id, " +
                         "event_type, event_version, event_payload, event_timestamp) " +
-                        "VALUES ('Order', ?, 'cmd', ?, 'OrderPlaced', 1, '{}', now())",
+                        "VALUES ('Order', ?, 1, 'cmd', ?, 'OrderPlaced', 1, '{}', now())",
                 ).use { ps ->
                     ps.setString(1, "agg-$eventId")
                     ps.setString(2, eventId)

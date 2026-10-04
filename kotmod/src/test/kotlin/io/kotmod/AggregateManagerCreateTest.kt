@@ -127,4 +127,13 @@ class AggregateManagerCreateTest {
             assertEquals(emptyList(), backend.writesOutsideTransaction)
             assertEquals(1, backend.transactionsCommitted)
         }
+
+    @Test
+    fun `events are numbered 1, 2, 3 within their aggregate across commands`() =
+        runTest {
+            orders.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book"), OrderPlaced("pen")) }
+            orders.execute(AggregateId("o-1")) { (it as PendingOrder).let { order -> order to listOf(OrderPlaced(order.name)) } }
+
+            assertEquals(listOf(1L, 2L, 3L), backend.events.map { it.metadata.sequence })
+        }
 }

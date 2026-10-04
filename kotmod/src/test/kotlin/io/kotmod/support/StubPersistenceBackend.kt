@@ -52,11 +52,14 @@ class StubPersistenceBackend<E : DomainEvent> : DomainPersistenceBackend<E> {
         id: AggregateId,
     ): AggregateMeta? = metas[Key(type, id)]
 
+    private val lastSequences = mutableMapOf<Key, Long>()
+
     override fun saveMeta(
         type: AggregateType,
         id: AggregateId,
         expectedVersion: Long?,
-    ) {
+        eventCount: Int,
+    ): Long {
         recordWrite("saveMeta")
         val key = Key(type, id)
         val now =
@@ -73,6 +76,9 @@ class StubPersistenceBackend<E : DomainEvent> : DomainPersistenceBackend<E> {
             }
             metas[key] = current.copy(version = expectedVersion + 1, updatedAt = now)
         }
+        val last = (lastSequences[key] ?: 0L) + eventCount
+        lastSequences[key] = last
+        return last
     }
 
     override fun appendEvents(events: List<PendingEvent<E>>) {

@@ -17,6 +17,7 @@ class EventMetadataTest {
                 causationId = CommandId("cmd-1"),
                 correlationId = CorrelationId("corr-1"),
                 timestamp = ts,
+                sequence = 1,
             )
 
         assertEquals(EventId("e-1"), metadata.eventId)
@@ -37,6 +38,7 @@ class EventMetadataTest {
                 causationId = CommandId("cmd-1"),
                 correlationId = null,
                 timestamp = Instant.parse("2026-04-20T10:00:00Z"),
+                sequence = 1,
             )
         assertNull(metadata.correlationId)
     }
@@ -51,6 +53,7 @@ class EventMetadataTest {
                 causationId = CommandId("cmd-1"),
                 correlationId = null,
                 timestamp = Instant.parse("2026-04-20T10:00:00Z"),
+                sequence = 1,
             )
         val envelope = PublicEventEnvelope(metadata = metadata, event = "some-payload")
 
@@ -68,6 +71,7 @@ class EventMetadataTest {
                 causationId = CommandId("cmd-1"),
                 correlationId = null,
                 timestamp = Instant.parse("2026-04-20T10:00:00Z"),
+                sequence = 1,
             )
         val specific: PublicEventEnvelope<String> = PublicEventEnvelope(metadata, "payload")
         val widened: PublicEventEnvelope<CharSequence> = specific

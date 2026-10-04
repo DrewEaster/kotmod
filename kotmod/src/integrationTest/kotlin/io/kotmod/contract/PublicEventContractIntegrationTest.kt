@@ -99,7 +99,7 @@ class PublicEventContractIntegrationTest : IntegrationTest() {
         orderId: String,
         event: TestInternalEvent,
     ) {
-        backend.saveMeta(type = AggregateType("Order"), id = AggregateId(orderId), expectedVersion = null)
+        backend.saveMeta(type = AggregateType("Order"), id = AggregateId(orderId), expectedVersion = null, eventCount = 1)
         backend.appendEvents(
             listOf(
                 PendingEvent(
@@ -111,6 +111,7 @@ class PublicEventContractIntegrationTest : IntegrationTest() {
                             causationId = CommandId("cmd-$eventId"),
                             correlationId = null,
                             timestamp = kotlin.time.Instant.parse("2026-04-20T10:00:00Z"),
+                            sequence = 1,
                         ),
                     event = event,
                 ),

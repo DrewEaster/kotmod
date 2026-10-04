@@ -51,7 +51,7 @@ class EventProducer<E : DomainEvent>(
         // Phase 2: Write — tight transaction
         databaseWork(backend::isInTransaction) {
             backend.inTransaction {
-                backend.saveMeta(aggregateType, id, expectedVersion = existingVersion)
+                val lastSequence = backend.saveMeta(aggregateType, id, expectedVersion = existingVersion, eventCount = events.size)
                 if (events.isNotEmpty()) {
                     backend.appendEvents(
                         wrap(
@@ -59,6 +59,7 @@ class EventProducer<E : DomainEvent>(
                             causationId = resolvedCommandId,
                             correlationId = correlationId,
                             events = events,
+                            firstSequence = lastSequence - events.size + 1,
                         ),
                     )
                 }
@@ -72,12 +73,13 @@ class EventProducer<E : DomainEvent>(
         causationId: CommandId,
         correlationId: CorrelationId?,
         events: List<E>,
+        firstSequence: Long,
     ): List<PendingEvent<E>> {
         val now =
             java.time.Instant
                 .now()
                 .toKotlinInstant()
-        return events.map { event ->
+        return events.mapIndexed { index, event ->
             PendingEvent(
                 metadata =
                     EventMetadata(
@@ -87,6 +89,7 @@ class EventProducer<E : DomainEvent>(
                         causationId = causationId,
                         correlationId = correlationId,
                         timestamp = now,
+                        sequence = firstSequence + index,
                     ),
                 event = event,
             )

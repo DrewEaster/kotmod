@@ -38,6 +38,7 @@ class PostgresDomainBackendIntegrationTest : IntegrationTest() {
         eventId: String,
         aggregateId: String = "o-1",
         correlationId: CorrelationId? = null,
+        sequence: Long = 1,
     ) = EventMetadata(
         eventId = EventId(eventId),
         aggregateType = AggregateType("Order"),
@@ -45,6 +46,7 @@ class PostgresDomainBackendIntegrationTest : IntegrationTest() {
         causationId = CommandId("cmd-1"),
         correlationId = correlationId,
         timestamp = kotlin.time.Instant.parse("2026-04-18T10:00:00Z"),
+        sequence = sequence,
     )
 
     @Test
@@ -55,11 +57,29 @@ class PostgresDomainBackendIntegrationTest : IntegrationTest() {
         }
 
     @Test
+    fun `saveMeta numbers events contiguously within each aggregate`() =
+        runTest {
+            val order = AggregateType("Order")
+            assertEquals(2L, backend.saveMeta(order, AggregateId("o-1"), expectedVersion = null, eventCount = 2))
+            assertEquals(3L, backend.saveMeta(order, AggregateId("o-1"), expectedVersion = 1, eventCount = 1))
+            assertEquals(3L, backend.saveMeta(order, AggregateId("o-1"), expectedVersion = 2, eventCount = 0))
+            assertEquals(1L, backend.saveMeta(order, AggregateId("o-2"), expectedVersion = null, eventCount = 1))
+        }
+
+    @Test
+    fun `a duplicate sequence within an aggregate is rejected`() =
+        runTest {
+            fun pending(eventId: String): PendingEvent<OrderEvent> = PendingEvent(metadata(eventId, sequence = 1), OrderPlaced("x"))
+            backend.appendEvents(listOf(pending("e-1")))
+            assertFailsWith<java.sql.SQLException> { backend.appendEvents(listOf(pending("e-2"))) }
+        }
+
+    @Test
     fun `saveMeta with null expectedVersion inserts at version 1`() =
         runTest {
             val type = AggregateType("Order")
             val id = AggregateId("o-1")
-            backend.saveMeta(type, id, expectedVersion = null)
+            backend.saveMeta(type, id, expectedVersion = null, eventCount = 0)
             val meta = backend.loadMeta(type, id)
             assertNotNull(meta)
             assertEquals(1L, meta.version)
@@ -70,9 +90,9 @@ class PostgresDomainBackendIntegrationTest : IntegrationTest() {
         runTest {
             val type = AggregateType("Order")
             val id = AggregateId("o-1")
-            backend.saveMeta(type, id, expectedVersion = null)
+            backend.saveMeta(type, id, expectedVersion = null, eventCount = 0)
             assertFailsWith<AggregateAlreadyExistsException> {
-                backend.saveMeta(type, id, expectedVersion = null)
+                backend.saveMeta(type, id, expectedVersion = null, eventCount = 0)
             }
         }
 
@@ -81,8 +101,8 @@ class PostgresDomainBackendIntegrationTest : IntegrationTest() {
         runTest {
             val type = AggregateType("Order")
             val id = AggregateId("o-1")
-            backend.saveMeta(type, id, expectedVersion = null)
-            backend.saveMeta(type, id, expectedVersion = 1L)
+            backend.saveMeta(type, id, expectedVersion = null, eventCount = 0)
+            backend.saveMeta(type, id, expectedVersion = 1L, eventCount = 0)
             val meta = backend.loadMeta(type, id)
             assertEquals(2L, meta!!.version)
         }
@@ -92,9 +112,9 @@ class PostgresDomainBackendIntegrationTest : IntegrationTest() {
         runTest {
             val type = AggregateType("Order")
             val id = AggregateId("o-1")
-            backend.saveMeta(type, id, expectedVersion = null)
+            backend.saveMeta(type, id, expectedVersion = null, eventCount = 0)
             assertFailsWith<OptimisticConcurrencyException> {
-                backend.saveMeta(type, id, expectedVersion = 99L)
+                backend.saveMeta(type, id, expectedVersion = 99L, eventCount = 0)
             }
         }
 
@@ -115,6 +135,7 @@ class PostgresDomainBackendIntegrationTest : IntegrationTest() {
                 causationId = CommandId("cmd-1"),
                 correlationId = correlation,
                 timestamp = now,
+                sequence = if (eventId == "e-1") 1 else 2,
             )
             backend.appendEvents(
                 listOf(
@@ -164,6 +185,7 @@ class PostgresDomainBackendIntegrationTest : IntegrationTest() {
                                 causationId = CommandId("cmd-1"),
                                 correlationId = null,
                                 timestamp = now,
+                                sequence = 1,
                             ),
                         event = OrderPlaced("widgets"),
                     ),
@@ -235,7 +257,7 @@ class PostgresDomainBackendIntegrationTest : IntegrationTest() {
 
             try {
                 jdbc.inTransaction {
-                    backend.saveMeta(type, id, expectedVersion = null)
+                    backend.saveMeta(type, id, expectedVersion = null, eventCount = 1)
                     backend.appendEvents(
                         listOf(
                             PendingEvent(
@@ -247,6 +269,7 @@ class PostgresDomainBackendIntegrationTest : IntegrationTest() {
                                         causationId = CommandId("cmd-1"),
                                         correlationId = null,
                                         timestamp = now,
+                                        sequence = 1,
                                     ),
                                 event = OrderPlaced("widgets"),
                             ),
@@ -278,7 +301,7 @@ class PostgresDomainBackendIntegrationTest : IntegrationTest() {
             backend.appendEvents(
                 listOf(
                     PendingEvent(metadata("e-1", correlationId = CorrelationId("corr-1")), OrderPlaced("widgets")),
-                    PendingEvent(metadata("e-2"), OrderCancelled("widgets", "sold out")),
+                    PendingEvent(metadata("e-2", sequence = 2), OrderCancelled("widgets", "sold out")),
                     PendingEvent(metadata("e-3", aggregateId = "o-2"), OrderPlaced("gadgets")),
                 ),
             )
@@ -286,6 +309,7 @@ class PostgresDomainBackendIntegrationTest : IntegrationTest() {
             val all = pollingBackend.readEventsAfter(EventLogPosition.START, limit = 10)
             assertEquals(listOf(1L, 2L, 3L), all.map { it.position.globalOffset })
             assertEquals(listOf("e-1", "e-2", "e-3"), all.map { it.metadata.eventId.value })
+            assertEquals(listOf(1L, 2L, 1L), all.map { it.metadata.sequence })
 
             val first = all.first()
             assertEquals(metadata("e-1", correlationId = CorrelationId("corr-1")), first.metadata)

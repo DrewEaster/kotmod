@@ -37,9 +37,9 @@ class PollingVisibilityIntegrationTest : IntegrationTest() {
     ) {
         conn
             .prepareStatement(
-                "INSERT INTO ddd_domain_event (aggregate_type, aggregate_id, causation_id, event_id, " +
+                "INSERT INTO ddd_domain_event (aggregate_type, aggregate_id, aggregate_sequence, causation_id, event_id, " +
                     "event_type, event_version, event_payload, event_timestamp) " +
-                    "VALUES ('Order', ?, 'cmd', ?, 'OrderPlaced', 1, '{}', now())",
+                    "VALUES ('Order', ?, 1, 'cmd', ?, 'OrderPlaced', 1, '{}', now())",
             ).use { ps ->
                 ps.setString(1, "agg-$eventId")
                 ps.setString(2, eventId)

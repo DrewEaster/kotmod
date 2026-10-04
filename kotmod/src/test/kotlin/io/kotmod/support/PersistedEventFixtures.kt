@@ -22,6 +22,7 @@ internal fun persistedEvent(
     eventVersion: Int = 1,
     eventPayload: String = "{}",
     timestamp: Instant = Instant.parse("2026-04-18T10:00:00Z"),
+    sequence: Long = 1,
 ) = PersistedEvent(
     position = EventLogPosition(transactionId = 1, globalOffset = globalOffset),
     metadata =
@@ -32,6 +33,7 @@ internal fun persistedEvent(
             causationId = CommandId(causationId),
             correlationId = correlationId?.let(::CorrelationId),
             timestamp = timestamp,
+            sequence = sequence,
         ),
     serialized = SerializedEvent(eventType, eventVersion, eventPayload),
 )

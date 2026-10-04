@@ -256,6 +256,7 @@ class DbSchedulerEventReactionsIntegrationTest : IntegrationTest() {
                                     causationId = CommandId("cmd-$eventId"),
                                     correlationId = null,
                                     timestamp = kotlin.time.Instant.parse("2026-10-03T10:00:00Z"),
+                                    sequence = 1,
                                 ),
                             event = OrderPlaced("widgets-$index"),
                         ),

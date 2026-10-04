@@ -77,7 +77,8 @@ class PostgresDomainPersistenceBackend<E : DomainEvent>(
         type: AggregateType,
         id: AggregateId,
         expectedVersion: Long?,
-    ) {
+        eventCount: Int,
+    ): Long =
         jdbc.withConnection { conn ->
             val now = OffsetDateTime.now(ZoneOffset.UTC)
             if (expectedVersion == null) {
@@ -85,39 +86,44 @@ class PostgresDomainPersistenceBackend<E : DomainEvent>(
                     conn
                         .prepareStatement(
                             "INSERT INTO ddd_aggregate_root " +
-                                "(aggregate_type, aggregate_id, aggregate_version, created_at, updated_at) " +
-                                "VALUES (?, ?, 1, ?, ?)",
+                                "(aggregate_type, aggregate_id, aggregate_version, last_sequence, created_at, updated_at) " +
+                                "VALUES (?, ?, 1, ?, ?, ?) RETURNING last_sequence",
                         ).use { ps ->
                             ps.setString(1, type.value)
                             ps.setString(2, id.value)
-                            ps.setObject(3, now)
+                            ps.setLong(3, eventCount.toLong())
                             ps.setObject(4, now)
-                            ps.executeUpdate()
+                            ps.setObject(5, now)
+                            ps.executeQuery().use { rs ->
+                                rs.next()
+                                rs.getLong(1)
+                            }
                         }
                 } catch (e: SQLException) {
                     if (e.sqlState == UNIQUE_VIOLATION) throw AggregateAlreadyExistsException(type, id)
                     throw e
                 }
             } else {
-                val newVersion = expectedVersion + 1
-                val rows =
-                    conn
-                        .prepareStatement(
-                            "UPDATE ddd_aggregate_root " +
-                                "SET aggregate_version = ?, updated_at = ? " +
-                                "WHERE aggregate_type = ? AND aggregate_id = ? AND aggregate_version = ?",
-                        ).use { ps ->
-                            ps.setLong(1, newVersion)
-                            ps.setObject(2, now)
-                            ps.setString(3, type.value)
-                            ps.setString(4, id.value)
-                            ps.setLong(5, expectedVersion)
-                            ps.executeUpdate()
+                conn
+                    .prepareStatement(
+                        "UPDATE ddd_aggregate_root " +
+                            "SET aggregate_version = ?, last_sequence = last_sequence + ?, updated_at = ? " +
+                            "WHERE aggregate_type = ? AND aggregate_id = ? AND aggregate_version = ? " +
+                            "RETURNING last_sequence",
+                    ).use { ps ->
+                        ps.setLong(1, expectedVersion + 1)
+                        ps.setLong(2, eventCount.toLong())
+                        ps.setObject(3, now)
+                        ps.setString(4, type.value)
+                        ps.setString(5, id.value)
+                        ps.setLong(6, expectedVersion)
+                        ps.executeQuery().use { rs ->
+                            if (!rs.next()) throw OptimisticConcurrencyException(type, id, expectedVersion)
+                            rs.getLong(1)
                         }
-                if (rows == 0) throw OptimisticConcurrencyException(type, id, expectedVersion)
+                    }
             }
         }
-    }
 
     override fun appendEvents(events: List<PendingEvent<E>>) {
         if (events.isEmpty()) return
@@ -125,28 +131,29 @@ class PostgresDomainPersistenceBackend<E : DomainEvent>(
             conn
                 .prepareStatement(
                     "INSERT INTO ddd_domain_event " +
-                        "(aggregate_type, aggregate_id, causation_id, correlation_id, event_id, " +
+                        "(aggregate_type, aggregate_id, aggregate_sequence, causation_id, correlation_id, event_id, " +
                         " event_type, event_version, event_payload, event_timestamp) " +
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 ).use { ps ->
                     for (pending in events) {
                         val metadata = pending.metadata
                         val serialized = serialization.serialize(pending.event)
                         ps.setString(1, metadata.aggregateType.value)
                         ps.setString(2, metadata.aggregateId.value)
-                        ps.setString(3, metadata.causationId.value)
+                        ps.setLong(3, metadata.sequence)
+                        ps.setString(4, metadata.causationId.value)
                         val correlationId = metadata.correlationId
                         if (correlationId != null) {
-                            ps.setString(4, correlationId.value)
+                            ps.setString(5, correlationId.value)
                         } else {
-                            ps.setNull(4, Types.VARCHAR)
+                            ps.setNull(5, Types.VARCHAR)
                         }
-                        ps.setString(5, metadata.eventId.value)
-                        ps.setString(6, serialized.type)
-                        ps.setInt(7, serialized.version)
-                        ps.setString(8, serialized.payload)
+                        ps.setString(6, metadata.eventId.value)
+                        ps.setString(7, serialized.type)
+                        ps.setInt(8, serialized.version)
+                        ps.setString(9, serialized.payload)
                         ps.setObject(
-                            9,
+                            10,
                             OffsetDateTime.ofInstant(metadata.timestamp.toJavaInstant(), ZoneOffset.UTC),
                         )
                         ps.addBatch()
@@ -215,7 +222,7 @@ class PostgresDomainPollingBackend(
             conn
                 .prepareStatement(
                     "SELECT global_offset, transaction_id::text::bigint AS transaction_id_value, " +
-                        "aggregate_type, aggregate_id, causation_id, correlation_id, event_id, event_type, " +
+                        "aggregate_type, aggregate_id, aggregate_sequence, causation_id, correlation_id, event_id, event_type, " +
                         "event_version, event_payload, event_timestamp " +
                         "FROM ddd_domain_event " +
                         "WHERE (transaction_id, global_offset) > (?::text::xid8, ?) " +
@@ -271,6 +278,7 @@ class PostgresDomainPollingBackend(
                     aggregateId = AggregateId(getString("aggregate_id")),
                     causationId = CommandId(getString("causation_id")),
                     correlationId = correlation?.let(::CorrelationId),
+                    sequence = getLong("aggregate_sequence"),
                     timestamp =
                         getObject("event_timestamp", OffsetDateTime::class.java)
                             .toInstant()

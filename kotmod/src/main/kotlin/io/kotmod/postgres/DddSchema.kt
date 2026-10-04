@@ -13,6 +13,7 @@ object DddSchema {
             aggregate_type    VARCHAR(72)  NOT NULL,
             aggregate_id      VARCHAR(72)  NOT NULL,
             aggregate_version BIGINT       NOT NULL,
+            last_sequence     BIGINT       NOT NULL,
             created_at        TIMESTAMPTZ  NOT NULL,
             updated_at        TIMESTAMPTZ  NOT NULL,
             PRIMARY KEY (aggregate_type, aggregate_id)
@@ -23,6 +24,7 @@ object DddSchema {
             transaction_id    XID8         NOT NULL DEFAULT pg_current_xact_id(),
             aggregate_type    VARCHAR(72)  NOT NULL,
             aggregate_id      VARCHAR(72)  NOT NULL,
+            aggregate_sequence BIGINT      NOT NULL,
             causation_id      VARCHAR(72)  NOT NULL,
             correlation_id    VARCHAR(72),
             event_id          VARCHAR(72)  NOT NULL UNIQUE,
@@ -34,6 +36,8 @@ object DddSchema {
         CREATE INDEX idx_ddd_domain_event_aggregate
             ON ddd_domain_event (aggregate_type, aggregate_id, global_offset);
         CREATE INDEX idx_ddd_domain_event_position ON ddd_domain_event (transaction_id, global_offset);
+        CREATE UNIQUE INDEX idx_ddd_domain_event_sequence
+            ON ddd_domain_event (aggregate_type, aggregate_id, aggregate_sequence);
 
         CREATE TABLE ddd_command_history (
             aggregate_type VARCHAR(72) NOT NULL,
