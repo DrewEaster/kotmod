@@ -28,6 +28,7 @@ import io.kotmod.jdbc.transaction
 import io.kotmod.outbox.AggregateEventOutbox
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.PostgresDomainPollingBackend
+import io.kotmod.postgres.PostgresLeaderElection
 import io.kotmod.postgres.PostgresOffsetManager
 import io.kotmod.serialization.jsonDataSerializationContext
 import io.kotmod.serialization.toEventSerializer
@@ -35,6 +36,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import java.sql.DriverManager
 import javax.sql.DataSource
 import kotlin.time.Duration
 
@@ -235,3 +237,28 @@ fun orderContract(
     }
     return contract
 }
+
+fun leaderElection(
+    url: String,
+    user: String,
+    password: String,
+): PostgresLeaderElection {
+    val election = PostgresLeaderElection({ DriverManager.getConnection(url, user, password) }, "order-service")
+    election.start()
+    return election
+}
+
+fun outboxWithLeaderElection(
+    jdbc: JdbcContext,
+    election: PostgresLeaderElection,
+    offsets: PostgresOffsetManager,
+    executor: EventReactionExecutor<OrderNotification, *>,
+): AggregateEventOutbox<OrderNotification> =
+    AggregateEventOutbox(
+        backend = PostgresDomainPollingBackend(jdbc),
+        executor = executor,
+        eventToReactions = { emptyList() },
+        getPosition = { offsets.getPosition("order-notifications") },
+        savePosition = { offsets.savePosition("order-notifications", it) },
+        isLeader = election::isLeader,
+    )

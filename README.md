@@ -373,7 +373,8 @@ outbox.start()
 
 Within a moment you'll see `Sending confirmation for order order-1`. Only the `OrderPlaced` event
 produced a reaction; `OrderShipped` was read and skipped. To shut down, stop in the reverse order:
-`outbox.stop()`, then `scheduler.stop()`, then `executor.stop()`.
+`outbox.stop()`, then `scheduler.stop()`, then `executor.stop()`. The quickstart passes `isLeader = { true }` because it runs on one node; see
+[Running in production](#running-in-production) for leader election across several.
 
 ## Core concepts
 
@@ -902,14 +903,57 @@ the same time as a later one. Keep ordered reactions idempotent too. See
 `"confirmation-${event.metadata.eventId.value}"`. Then a re-dispatched event is recognised as a
 reaction that is already pending. A random id creates a duplicate.
 
-**Start and stop in order.** Start executors, then the db-scheduler `Scheduler`, then the outbox and any
-public contracts; stop in the reverse order. Getting it wrong doesn't lose anything — reactions that
+**Start and stop in order.** Start executors, then the db-scheduler `Scheduler`, then the leader election,
+then the outbox and any public contracts; stop in the reverse order. Getting it wrong doesn't lose anything — reactions that
 arrive before their executor is running are rescheduled with a warning — but it adds noise and delay.
 
 **Run one active poller per consumer.** The outbox and public contracts only poll while `isLeader()`
 returns `true`. Run your application on as many nodes as you like, but make sure only one of them polls
-for each consumer name — use a Postgres advisory lock or your platform's leader election. db-scheduler
-needs no such care: it is safe to run on every node, and each reaction runs on one node at a time.
+for each consumer. db-scheduler needs no such care: it is safe to run on every node, and each reaction
+runs on one node at a time.
+
+**Leader election.** `PostgresLeaderElection` picks the polling node with a Postgres advisory lock. Each
+node creates one with the same name; whichever takes the lock leads until its connection ends, and another
+node takes over within a few seconds:
+
+```kotlin
+fun leaderElection(
+    url: String,
+    user: String,
+    password: String,
+): PostgresLeaderElection {
+    val election = PostgresLeaderElection({ DriverManager.getConnection(url, user, password) }, "order-service")
+    election.start()
+    return election
+}
+```
+
+Pass `isLeader = election::isLeader` to each outbox and contract:
+
+```kotlin
+    AggregateEventOutbox(
+        backend = PostgresDomainPollingBackend(jdbc),
+        executor = executor,
+        eventToReactions = { emptyList() },
+        getPosition = { offsets.getPosition("order-notifications") },
+        savePosition = { offsets.savePosition("order-notifications", it) },
+        isLeader = election::isLeader,
+    )
+```
+
+- **One election per application** is the simple default: one node polls for every consumer. To spread
+  consumers across nodes, give each consumer its own election (its own name); each holds one connection.
+- **Give it its own connection.** The election holds one connection for as long as it runs, so open it
+  directly rather than from your pool (`dataSource::getConnection` also works). Set pgjdbc's `socketTimeout`
+  on it so a stalled network fails a check instead of hanging. It does not work through PgBouncer in
+  transaction mode.
+- **How fast it reacts.** Every `checkInterval` (5 seconds by default) a follower tries to take the lock and
+  the leader checks its connection. A leader whose checks fail or stall for two intervals stops polling.
+- **Brief overlap.** If Postgres ends the leader's session first (a failover, `pg_terminate_backend`), another
+  node can take over before the old leader notices, so two nodes may poll for up to about one
+  `checkInterval`. That only causes duplicate dispatches, which deterministic reaction ids absorb.
+- **Shutdown.** Stop outboxes and contracts first, then `election.stop()`, which releases the lock so another
+  node takes over straight away.
 
 **Know what happens when things fail:**
 
