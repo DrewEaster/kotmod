@@ -2,12 +2,15 @@ package io.kotmod.event.reaction.dbscheduler
 
 import io.kotmod.jdbc.JdbcContext
 
-/** SQL against db-scheduler's own table for ordered reactions. Comparisons use the "C" collation. */
+/**
+ * SQL against db-scheduler's own table for ordered reactions. A key's rows are selected as the "C"-collated range
+ * [orderedKeyPrefix, orderedKeyUpperBound), which an index on `(task_name, task_instance COLLATE "C")` can serve.
+ */
 internal class OrderedQueries(
     private val jdbc: JdbcContext,
     private val tableName: String,
 ) {
-    /** Whether a reaction of [key] that sorts before [ownInstanceId] is still pending for [taskName]. */
+    /** Whether a reaction of [key] that sorts before [ownInstanceId] (which starts with [key]'s prefix) is still pending for [taskName]. */
     fun earlierPending(
         taskName: String,
         key: String,
@@ -16,8 +19,8 @@ internal class OrderedQueries(
         jdbc.withConnection { conn ->
             conn
                 .prepareStatement(
-                    "SELECT EXISTS (SELECT 1 FROM $tableName WHERE task_name = ? AND starts_with(task_instance, ?) " +
-                        "AND task_instance COLLATE \"C\" < ? COLLATE \"C\")",
+                    "SELECT EXISTS (SELECT 1 FROM $tableName WHERE task_name = ? " +
+                        "AND task_instance COLLATE \"C\" >= ? AND task_instance COLLATE \"C\" < ?)",
                 ).use { ps ->
                     ps.setString(1, taskName)
                     ps.setString(2, orderedKeyPrefix(key))
@@ -37,12 +40,14 @@ internal class OrderedQueries(
         jdbc.withConnection { conn ->
             conn
                 .prepareStatement(
-                    "SELECT task_instance FROM $tableName WHERE task_name = ? AND starts_with(task_instance, ?) " +
+                    "SELECT task_instance FROM $tableName WHERE task_name = ? " +
+                        "AND task_instance COLLATE \"C\" >= ? AND task_instance COLLATE \"C\" < ? " +
                         "AND NOT picked AND execution_time < now() + interval '50 years' " +
                         "ORDER BY task_instance COLLATE \"C\" LIMIT 1",
                 ).use { ps ->
                     ps.setString(1, taskName)
                     ps.setString(2, orderedKeyPrefix(key))
+                    ps.setString(3, orderedKeyUpperBound(key))
                     ps.executeQuery().use { rs -> if (rs.next()) rs.getString(1) else null }
                 }
         }

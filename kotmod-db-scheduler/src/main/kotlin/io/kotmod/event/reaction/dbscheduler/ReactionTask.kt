@@ -23,7 +23,7 @@ private val log = LoggerFactory.getLogger("io.kotmod.event.reaction.dbscheduler.
  * Builds the db-scheduler task that decodes each stored reaction and runs it through the subscribed executor.
  *
  * An ordered reaction runs only once no earlier reaction of its aggregate is pending for this task; until then it
- * is rechecked every [orderedRecheckDelay] without using up a retry. A blocked reaction stays parked.
+ * is rechecked after [orderedRecheckDelay], doubling per wait up to a minute, without using up a retry. A blocked reaction stays parked.
  */
 internal fun <T : EventReactionTrigger> reactionTask(
     taskName: String,
@@ -53,14 +53,14 @@ internal fun <T : EventReactionTrigger> reactionTask(
                     val data = ReactionTaskData.decode(instance.data)
                     val ordering = data.ordering
                     if (data.blocked) {
-                        outcomeWhenWaiting(instance.data, Instant.now(), PARKED_DELAY)
+                        outcomeWhenParked(instance.data, Instant.now(), PARKED_DELAY)
                     } else if (ordering != null &&
                         checkNotNull(orderedQueries) {
                             "Task $taskName has an ordered reaction but no JdbcContext to order it with"
                         }.earlierPending(taskName, ordering.key, instance.id)
                     ) {
                         log.debug("Event reaction {} waits for an earlier reaction of {} [task={}]", instance.id, ordering.key, taskName)
-                        outcomeWhenWaiting(instance.data, Instant.now(), orderedRecheckDelay)
+                        outcomeWhenWaitingForEarlier(data, Instant.now(), orderedRecheckDelay)
                     } else {
                         // The handler sees the original reaction id, not the sortable instance id.
                         val reactionId = EventReactionId(ordering?.reactionId ?: instance.id)

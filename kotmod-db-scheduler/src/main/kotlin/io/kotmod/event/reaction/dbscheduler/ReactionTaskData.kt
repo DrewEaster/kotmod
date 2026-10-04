@@ -15,7 +15,8 @@ internal data class OrderingStamp(
 
 /**
  * The data stored with each db-scheduler task instance, encoded as a JSON string: the serialized trigger, its
- * retry count and, for ordered reactions, the ordering stamp and whether it is parked blocking its aggregate.
+ * retry count and, for ordered reactions, the ordering stamp, whether it is parked blocking its aggregate, and how
+ * many times in a row it has waited for an earlier reaction (which backs off its rechecks).
  */
 @Serializable
 internal data class ReactionTaskData(
@@ -23,6 +24,7 @@ internal data class ReactionTaskData(
     val retryCount: Int,
     val ordering: OrderingStamp? = null,
     val blocked: Boolean = false,
+    val waits: Int = 0,
 ) {
     fun encode(): String = Json.encodeToString(serializer(), this)
 

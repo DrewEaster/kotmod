@@ -43,8 +43,9 @@ import kotlin.time.Duration.Companion.seconds
  *
  * Ordered reactions ([io.kotmod.event.reaction.ReactionOrdering.PerAggregate]) need [jdbc], used to query db-scheduler's
  * [tableName] table. Each is stored under an instance id that sorts by aggregate, sequence and ordinal; when picked it
- * runs only if no earlier reaction of its aggregate is pending for this task, and otherwise is rechecked every
- * [orderedRecheckDelay] without using up a retry. Finishing one nudges the aggregate's next reaction to run now. One
+ * runs only if no earlier reaction of its aggregate is pending for this task, and otherwise is rechecked after
+ * [orderedRecheckDelay], doubling per consecutive wait up to a minute, without using up a retry. Finishing one nudges
+ * the aggregate's next reaction to run now, which is the usual way a waiting reaction gets its turn. One
  * that gives up with [OnGiveUp.BlockAggregate] is parked, holding back its aggregate, until [retryBlocked] or
  * [skipBlocked] is called (see [blockedReactions]).
  */

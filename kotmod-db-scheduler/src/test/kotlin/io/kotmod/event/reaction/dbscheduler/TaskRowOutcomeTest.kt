@@ -7,6 +7,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
 class TaskRowOutcomeTest {
@@ -67,5 +68,34 @@ class TaskRowOutcomeTest {
     fun `an ordered reaction that gives up with ContinueWithNext is removed and nudges the next`() {
         val ordered = data.copy(ordering = OrderingStamp("Order/o-1", 3, 0, "ContinueWithNext", "r-1"))
         assertEquals(TaskRowOutcome.Remove(nudgeKey = "Order/o-1"), outcomeAfterExecution(ReactionOutcome.Finished(true), ordered, now))
+    }
+
+    @Test
+    fun `waiting delay doubles per wait from the recheck delay, capped at a minute`() {
+        assertEquals(2.seconds, orderedWaitDelay(2.seconds, 0))
+        assertEquals(4.seconds, orderedWaitDelay(2.seconds, 1))
+        assertEquals(8.seconds, orderedWaitDelay(2.seconds, 2))
+        assertEquals(32.seconds, orderedWaitDelay(2.seconds, 4))
+        assertEquals(1.minutes, orderedWaitDelay(2.seconds, 5))
+        assertEquals(1.minutes, orderedWaitDelay(2.seconds, 1_000))
+        assertEquals(1.minutes, orderedWaitDelay(2.seconds, Int.MAX_VALUE))
+    }
+
+    @Test
+    fun `waiting for an earlier reaction increments waits and leaves the retry count alone`() {
+        val ordered = data.copy(ordering = OrderingStamp("Order/o-1", 3, 0, "ContinueWithNext", "r-1"), waits = 2)
+        assertEquals(
+            TaskRowOutcome.Reschedule(at = now.plusSeconds(8), taskData = ordered.copy(waits = 3).encode()),
+            outcomeWhenWaitingForEarlier(ordered, now, 2.seconds),
+        )
+    }
+
+    @Test
+    fun `running a reaction resets its wait count`() {
+        val ordered = data.copy(ordering = OrderingStamp("Order/o-1", 3, 0, "BlockAggregate", "r-1"), waits = 4)
+        val retried = outcomeAfterExecution(ReactionOutcome.Retry(30.seconds), ordered, now) as TaskRowOutcome.Reschedule
+        assertEquals(ordered.copy(retryCount = 3, waits = 0), ReactionTaskData.decode(retried.taskData))
+        val parked = outcomeAfterExecution(ReactionOutcome.Finished(gaveUp = true), ordered, now) as TaskRowOutcome.Reschedule
+        assertEquals(0, ReactionTaskData.decode(parked.taskData).waits)
     }
 }
