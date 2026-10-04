@@ -770,10 +770,22 @@ outbox only moves past an event once all of its reactions are dispatched, so no 
 reaction can run more than once — for example if the process dies after dispatching but before saving the
 position, or if a shutdown interrupts a running reaction. Make `execute` and `onCompletion` idempotent.
 
-**Long transactions delay delivery.** An outbox only reads past transactions that have finished, so it
-never skips an event that a slower transaction commits late. The flip side: while any transaction on the
-same Postgres server is open — even one in another database — later events wait for it. Keep
-transactions short.
+**Open transactions hold delivery back.** An outbox only reads past transactions that have finished, so it
+never skips an event that a slower transaction commits late. The flip side: while any transaction that has
+written something is still open on the same Postgres server — even in another database — later events wait
+for it, and if it never finishes, **delivery stops for every outbox and contract** with no error. Common
+culprits are connections left "idle in transaction", orphaned prepared transactions (`pg_prepared_xacts`)
+and long batch jobs. Keep transactions short, set `idle_in_transaction_session_timeout`, and monitor
+`pg_stat_activity` for old transactions with a `backend_xid`.
+
+**Moving the database to a new server.** Event positions include Postgres transaction ids, which only make
+sense on the server that issued them. `pg_upgrade` keeps them, so in-place upgrades are fine. After a
+`pg_dump`/restore or a logical-replication migration, the new server's transaction ids start lower, and
+outboxes stop with an error saying their saved position is "ahead of this Postgres server's transaction
+counter" rather than silently skipping events. To resume after the move, with nothing writing yet, set every
+row's `ddd_domain_event.transaction_id` to `'0'` and every `ddd_consumer_offset.last_transaction_id` to `0`
+(keep `last_offset`). Each consumer then resumes exactly where it left off, and new events sort after the
+migrated ones.
 
 **Use deterministic reaction ids.** Build each reaction id from the event id plus a label, as in
 `"confirmation-${event.metadata.eventId.value}"`. Then a re-dispatched event is recognised as a

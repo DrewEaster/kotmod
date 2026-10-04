@@ -5,6 +5,8 @@ import io.kotmod.postgres.support.IntegrationTest
 import java.sql.Connection
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 
 class PollingVisibilityIntegrationTest : IntegrationTest() {
     /** A consumer that reads the event log the way the poller does and records what it saw. */
@@ -137,5 +139,30 @@ class PollingVisibilityIntegrationTest : IntegrationTest() {
         }
 
         assertEquals((1..5).map { "e-$it" }, seen)
+    }
+
+    @Test
+    fun `a saved position ahead of the server's transaction counter fails loudly`() {
+        // As after restoring the database onto a new server: the saved position's transaction id is from the old one.
+        val currentXid =
+            dataSource.connection.use { conn ->
+                conn.createStatement().use { stmt ->
+                    stmt.executeQuery("SELECT pg_snapshot_xmax(pg_current_snapshot())::text::bigint").use { rs ->
+                        rs.next()
+                        rs.getLong(1)
+                    }
+                }
+            }
+        openTransaction().use { a ->
+            insertEvent(a, "e-new")
+            a.commit()
+        }
+
+        val failure =
+            assertFailsWith<IllegalStateException> {
+                PostgresDomainPollingBackend(jdbc).readEventsAfter(EventLogPosition(currentXid + 1_000_000, 1), 100)
+            }
+
+        assertTrue(failure.message!!.contains("ahead of"), failure.message)
     }
 }

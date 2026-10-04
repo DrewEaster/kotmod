@@ -211,6 +211,7 @@ class PostgresDomainPollingBackend(
         limit: Int,
     ): List<PersistedEvent> =
         jdbc.withConnection { conn ->
+            requirePositionNotAhead(conn, position)
             conn
                 .prepareStatement(
                     "SELECT global_offset, transaction_id::text::bigint AS transaction_id_value, " +
@@ -232,6 +233,29 @@ class PostgresDomainPollingBackend(
                     }
                 }
         }
+
+    /**
+     * A saved position whose transaction id is at or beyond the server's next transaction id can only come from
+     * a different server — e.g. after restoring the database with pg_dump or logical replication. Reading on
+     * would silently skip every new event, so fail loudly instead.
+     */
+    private fun requirePositionNotAhead(
+        conn: Connection,
+        position: EventLogPosition,
+    ) {
+        val nextTransactionId =
+            conn.createStatement().use { stmt ->
+                stmt.executeQuery("SELECT pg_snapshot_xmax(pg_current_snapshot())::text::bigint").use { rs ->
+                    rs.next()
+                    rs.getLong(1)
+                }
+            }
+        check(position.transactionId < nextTransactionId) {
+            "Saved event log position $position is ahead of this Postgres server's transaction counter " +
+                "($nextTransactionId). This happens after restoring the database onto a new server (pg_dump or " +
+                "logical replication); see the README's guidance on moving the database before resuming."
+        }
+    }
 
     private fun ResultSet.toPublishedEvent(): PersistedEvent {
         // PostgreSQL JDBC returns null for SQL NULL values, so we don't need wasNull()
