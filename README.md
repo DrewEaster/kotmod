@@ -59,8 +59,6 @@ dependencies {
 }
 ```
 
-> kotmod is not yet published to Maven Central — publishing is coming soon.
-
 You also need a `javax.sql.DataSource` for your database, for example from HikariCP.
 
 Requirements:
