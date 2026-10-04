@@ -358,3 +358,313 @@ flowchart LR
 - **Trigger** — the stored input of an event reaction.
 - **Public event** — a stable event published to other bounded contexts, mapped from internal domain
   events.
+
+## Guides
+
+Each guide builds on the quickstart's orders domain.
+
+### Aggregates and commands
+
+Use `AggregateManager` for anything whose state you store and change through commands.
+
+Every command runs in three phases:
+
+1. **Read** — if the command's id has already been handled, the stored state is returned and nothing
+   else happens. Otherwise the aggregate's version and state are loaded.
+2. **Command** — your block runs and returns the new state and the events it raised. kotmod does no
+   database work while it runs, so keep side effects out of it; put them in event reactions instead.
+3. **Write** — in one transaction, the aggregate's version is advanced, your repository saves the new
+   state, the events are appended and the command is recorded as handled.
+
+`create` starts a new aggregate and throws `AggregateAlreadyExistsException` if it exists. `execute`
+changes an existing one and throws `AggregateNotFoundException` if it doesn't. The narrowed form,
+`execute<PendingOrder>`, only runs when the current state is that subtype and throws
+`UnexpectedAggregateStateException` otherwise, which makes state machines easy to express:
+
+```kotlin
+suspend fun cancelOrder(
+    orders: AggregateManager<Order, OrderEvent>,
+    orderId: AggregateId,
+    reason: String,
+    requestId: String,
+): Order =
+    try {
+        orders.execute<PendingOrder>(orderId, commandId = CommandId(requestId)) { order ->
+            CancelledOrder(order.item, reason) to listOf(OrderCancelled(order.item, reason))
+        }
+    } catch (e: UnexpectedAggregateStateException) {
+        throw IllegalStateException("Only pending orders can be cancelled", e)
+    }
+```
+
+**Idempotency.** Pass a `CommandId` you control — a request id, a message id — and a retried command
+returns the result of its first run instead of applying twice. Without one, kotmod generates a random
+id and the call is not idempotent. Pass a `CorrelationId` to tie together all the events of one wider
+flow; it is stored with every event.
+
+**Concurrency.** Each aggregate has a version. If someone else changes the aggregate between your read
+and your write, the write fails with `OptimisticConcurrencyException`; run the command again and it will
+see the latest state:
+
+```kotlin
+suspend fun <T> retryOnConflict(
+    attempts: Int = 3,
+    command: suspend () -> T,
+): T {
+    repeat(attempts - 1) {
+        try {
+            return command()
+        } catch (e: OptimisticConcurrencyException) {
+            // Someone else changed the aggregate first: run the command again against the latest state.
+        }
+    }
+    return command()
+}
+```
+
+**Your repository joins the transaction.** `Repository.save` is called inside kotmod's transaction, so it
+must borrow the driver's connection — as `OrderRepository` does with `withConnection` — rather than
+opening its own. A repository with its own connection would commit state independently of the events.
+
+### Event-only aggregates
+
+Use `EventProducer` when something needs an event log and idempotent commands but has no state worth
+storing — an audit trail, for example:
+
+```kotlin
+@Serializable
+sealed interface AuditEvent : DomainEvent
+
+@Serializable
+data class OrderViewed(
+    val viewer: String,
+) : AuditEvent
+
+fun auditLog(driver: JdbcDriver): EventProducer<AuditEvent> =
+    EventProducer(
+        aggregateType = AggregateType("OrderAuditLog"),
+        backend =
+            PostgresDomainPersistenceBackend(
+                driver,
+                jsonDataSerializationContext<AuditEvent> { +OrderViewed.serializer().toEventSerializer() },
+            ),
+        transacter = object : TransacterImpl(driver) {},
+    )
+
+suspend fun recordView(
+    auditLog: EventProducer<AuditEvent>,
+    orderId: AggregateId,
+    viewer: String,
+    requestId: String,
+) {
+    auditLog.emit(orderId, listOf(OrderViewed(viewer)), commandId = CommandId(requestId))
+}
+```
+
+`emit` creates the aggregate's bookkeeping the first time it is called for an id. Command ids and
+optimistic concurrency work exactly as they do for `AggregateManager`, and the events flow through the
+outbox like any others.
+
+### Event serialization and schema migrations
+
+Events live in the event log for a long time, so their classes will change. Each event is stored with
+its class name and a schema version, and `jsonDataSerializationContext` knows how to bring old versions
+up to date:
+
+```kotlin
+val orderEventSerialization =
+    jsonDataSerializationContext<OrderEvent> {
+        +OrderPlaced.serializer().toEventSerializer()
+        // OrderShipped used to be called OrderDispatched, in another package.
+        +OrderShipped.serializer().toEventSerializer(initialClassName = "com.example.orders.OrderDispatched") {
+            migrateClassName(OrderShipped::class.qualifiedName!!)
+        }
+        // OrderCancelled gained a `reason` field; older events get a default.
+        +OrderCancelled.serializer().toEventSerializer {
+            migrateFormat { json -> JsonObject(json + ("reason" to JsonPrimitive("not recorded"))) }
+        }
+    }
+```
+
+- Every event type starts at version 1. Each `migrateFormat` or `migrateClassName` adds a version, in the
+  order the changes were made.
+- `migrateFormat` transforms the previous version's JSON into the new shape.
+- `migrateClassName` records a rename or move. Pass the event's *original* class name as
+  `initialClassName`, and the current one to `migrateClassName`.
+- Old events are migrated when they are read; new events are always written at the latest version.
+
+If you don't want JSON, implement `DataSerializationContext` yourself.
+
+### Postgres setup
+
+kotmod's Postgres classes use plain JDBC through a SQLDelight `JdbcDriver`. Create one from any
+`DataSource` with `dataSource.asJdbcDriver()`.
+
+**Schema.** `DddSchema.ddl` creates four tables; copy it into your Flyway or Liquibase migrations:
+
+| Table | Holds |
+|---|---|
+| `ddd_aggregate_root` | Each aggregate's version and timestamps |
+| `ddd_domain_event` | The event log, ordered by `global_offset` |
+| `ddd_command_history` | Which commands each aggregate has handled |
+| `ddd_consumer_offset` | How far each outbox or contract has read |
+
+db-scheduler's `scheduled_tasks` table belongs to your application; create it from db-scheduler's
+[`postgresql_tables.sql`](https://github.com/kagkarlsson/db-scheduler/blob/v16.12.0/db-scheduler/src/test/resources/postgresql_tables.sql).
+
+**Transactions.** `AggregateManager` and `EventProducer` take a SQLDelight `Transacter`. Use
+`object : TransacterImpl(driver) {}`, or your own SQLDelight-generated database if you have one, as long
+as it uses the same driver as the backend and your repository.
+
+**Reading events.** `PostgresDomainPollingBackend` reads the event log for the outbox and public
+contracts. `PostgresOffsetManager` stores how far each of them has read; give every poller its own
+consumer name.
+
+### The outbox and event reactions
+
+`AggregateEventOutbox` is the outbox: while running it reads events after its saved offset, maps each
+one to event reactions with `eventToReactions`, dispatches them to an `EventReactionExecutor`, and saves
+the offset after each event. If dispatching fails, the batch stops and the next poll starts again from
+the last saved offset, so no event is skipped.
+
+`EventReactionExecutor` runs each reaction:
+
+- `execute` does the work and reports an `EventReactionExecutionResult`.
+- `failureRetryHandler` and `timeoutRetryHandler` decide what happens after a failure or a timeout.
+- `onCompletion` is told how the reaction finally ended.
+- `createExecutionContext` builds per-attempt context for your handlers (use `Unit` if you need none).
+- `defaultTimeout` (60 seconds) applies when a trigger has no `timeout` of its own.
+- `defaultBackoffStrategy` sets the delay when one of your handlers throws.
+
+| `execute` reports | What happens next | `onCompletion` receives |
+|---|---|---|
+| `EventReactionExecutionCompleted` | Done | `EventReactionCompleted` |
+| `EventReactionCancelled` | Done, not retried | `EventReactionCancelled` |
+| `EventReactionFailed` (or throws) | `failureRetryHandler` returns `Retry(delay)` or `DoNotRetry(result)` | `result`, if not retried |
+| `EventReactionTimedOut` | `timeoutRetryHandler` returns `Retry(delay)` or `DoNotRetry(result)` | `result`, if not retried |
+
+`BackoffStrategy` gives exponential delays — 1s, 2s, 4s… up to a cap (10 minutes by default) — and is
+handy in your retry handlers, as the quickstart shows.
+
+The executor works with any queue: it dispatches through an `EventReactionTriggerSink` and receives
+reactions from an `EventReactionTriggerSource`. kotmod ships a durable implementation on db-scheduler;
+you can implement the two interfaces yourself to use something else.
+
+### Durable reactions with db-scheduler
+
+`DbSchedulerEventReactions` stores reactions in db-scheduler's `scheduled_tasks` table and runs them on
+your db-scheduler `Scheduler`. Your application owns the `Scheduler` — its threads, polling and
+lifecycle — and kotmod provides the task, sink and source.
+
+Create one `DbSchedulerEventReactions` per executor; each becomes one db-scheduler task, and each
+reaction is an instance of that task, identified by its reaction id. Several executors can share one
+scheduler:
+
+```kotlin
+@Serializable
+sealed interface BillingTrigger : EventReactionTrigger
+
+@Serializable
+data class ChargeCustomer(
+    val orderId: String,
+    override val timeout: Duration? = null,
+) : BillingTrigger
+
+object BillingTriggerSerializer : EventReactionTriggerSerializer<BillingTrigger> {
+    override suspend fun serialize(trigger: BillingTrigger): String = Json.encodeToString(BillingTrigger.serializer(), trigger)
+
+    override suspend fun deserialize(serializedTrigger: String): BillingTrigger =
+        Json.decodeFromString(BillingTrigger.serializer(), serializedTrigger)
+}
+
+fun sharedScheduler(
+    dataSource: DataSource,
+    billing: DbSchedulerEventReactions<BillingTrigger>,
+    notifications: DbSchedulerEventReactions<OrderNotification>,
+): Scheduler =
+    Scheduler
+        .create(dataSource, billing.task, notifications.task)
+        .threads(10)
+        .enableImmediateExecution()
+        .build()
+```
+
+How it behaves:
+
+- **Duplicates.** Dispatching a reaction id that is already pending does nothing.
+- **Retries.** A `Retry(delay)` from your handlers reschedules the reaction with its retry count
+  incremented, so backoff keeps growing across restarts. Every attempt gets a fresh
+  `EventReactionExecutionId`.
+- **Startup order.** If the scheduler runs a reaction before its executor has started, the reaction is
+  pushed back a few seconds (without using up a retry) and a warning is logged.
+- **Unreadable data.** If a reaction's stored data can't be decoded — say a trigger class was renamed —
+  db-scheduler retries it with backoff from 10 seconds up to 1 hour until a fix is deployed.
+- **Removing a reaction.** To stop a pending reaction for good, cancel its task instance:
+
+```kotlin
+fun cancelPendingConfirmation(
+    scheduler: Scheduler,
+    notifications: DbSchedulerEventReactions<OrderNotification>,
+    eventId: EventId,
+) {
+    scheduler.cancel(notifications.task.instanceId("confirmation-${eventId.value}"))
+}
+```
+
+### Publishing events to other contexts
+
+Internal domain events change as your model changes, so other services shouldn't depend on them
+directly. Instead, publish **public events** — a deliberately stable contract — with a
+`PublicEventContract`:
+
+```kotlin
+@Serializable
+sealed interface OrderPublicEvent : PublicDomainEvent
+
+@Serializable
+data class OrderPlacedV1(
+    val item: String,
+) : OrderPublicEvent
+
+fun orderContract(
+    driver: JdbcDriver,
+    serialization: DataSerializationContext<OrderEvent>,
+    offsets: PostgresOffsetManager,
+    billingExecutor: EventReactionExecutor<BillingTrigger, *>,
+): PublicEventContract<OrderEvent, OrderPublicEvent> {
+    val contract =
+        PublicEventContract<OrderEvent, OrderPublicEvent>(
+            backend = PostgresDomainPollingBackend(driver),
+            serialization = serialization,
+            internalToPublic = { event ->
+                when (event) {
+                    is OrderPlaced -> OrderPlacedV1(event.item)
+                    else -> null
+                }
+            },
+            getOffset = { offsets.getOffset("order-contract") },
+            saveOffset = { offsets.saveOffset("order-contract", it) },
+            isLeader = { true },
+        )
+
+    contract.subscribe(billingExecutor) { envelope ->
+        when (envelope.event) {
+            is OrderPlacedV1 ->
+                listOf(
+                    EventReaction<BillingTrigger>(
+                        id = EventReactionId("charge-${envelope.metadata.eventId.value}"),
+                        trigger = ChargeCustomer(orderId = envelope.metadata.aggregateId.value),
+                    ),
+                )
+        }
+    }
+    return contract
+}
+```
+
+- `internalToPublic` maps each internal event to a public one; returning `null` keeps it private.
+- Subscribers receive a `PublicEventEnvelope`: the public event plus the original event's metadata
+  (event id, aggregate id, correlation id and so on).
+- A contract can have several subscribers, each with its own executor. Subscribe before calling
+  `start()`.
+- A contract reads the event log independently of the outbox, so give it its own consumer name.
