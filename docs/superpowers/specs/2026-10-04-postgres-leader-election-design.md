@@ -82,8 +82,10 @@ AggregateEventOutbox(..., isLeader = election::isLeader)
 - **Dropping a connection:** uses `Connection.abort(executor)`, not `close()`, which can block on a dead socket.
   Postgres releases the lock once it notices the session has gone.
 - **Lease:** if a check hangs (for example, the network stalls without the socket failing), the age limit still
-  makes `isLeader()` false after `2 × checkInterval`. The README recommends pgjdbc's `socketTimeout` so hung
-  checks also end.
+  makes `isLeader()` false after `2 × checkInterval`. The lock connection also gets a JDBC network timeout of
+  `2 × checkInterval` (so hung checks end) and session TCP keepalives of `checkInterval` (so Postgres notices a
+  vanished leader within a few intervals). `stop()` waits for the loop at most `2 × checkInterval`, then aborts
+  the connection.
 - **Errors:** no exception escapes the loop.
 - **Logging:**
   - INFO on becoming leader and on stepping down in `stop()`;
@@ -125,7 +127,7 @@ Integration tests against Postgres (Testcontainers `IntegrationTest`), with `che
 - **README, "Running in production":** the "use a Postgres advisory lock or your platform's leader election" line
   becomes a **Leader election** section with a snippet compiled in `ReadmeExamples.kt`. It covers:
   - one election per app by default, or one per consumer to spread the load;
-  - opening its connection outside the pool, with `socketTimeout`;
+  - opening its connection outside the pool;
   - no support for PgBouncer in transaction mode;
   - shutdown order (stop outboxes and contracts first, then the election);
   - the overlap window.

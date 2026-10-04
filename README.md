@@ -21,6 +21,7 @@ in**, so those events reliably drive follow-up work in your own service and in o
   - [Ordered reactions](#ordered-reactions)
   - [Publishing events to other contexts](#publishing-events-to-other-contexts)
 - [Running in production](#running-in-production)
+- [Known limitations](#known-limitations)
 - [Status and contributing](#status-and-contributing)
 
 ## Why kotmod
@@ -950,8 +951,9 @@ Pass `isLeader = election::isLeader` to each outbox and contract:
   The election also sets TCP keepalives on its session, so if the leader's host vanishes Postgres notices
   within a few intervals and releases the lock.
 - **Brief overlap.** If Postgres ends the leader's session first (a failover, `pg_terminate_backend`), another
-  node can take over before the old leader notices, so two nodes may poll for up to about one
-  `checkInterval`. That only causes duplicate dispatches, which deterministic reaction ids absorb.
+  node can take over before the old leader notices. Pollers check `isLeader()` only at the start of each
+  poll, so two nodes may poll for up to about two `checkInterval`s plus one poll batch. That only causes
+  duplicate dispatches, which deterministic reaction ids absorb.
 - **Shutdown.** Stop outboxes and contracts first, then `election.stop()`, which releases the lock so another
   node takes over straight away.
 
@@ -969,6 +971,53 @@ Pass `isLeader = election::isLeader` to each outbox and contract:
 
 **Tune throughput.** The outbox and contracts poll every 500ms (`pollInterval`) and read up to 100
 events per poll (`batchSize`). `Scheduler.threads(n)` caps how many reactions run at once.
+
+## Known limitations
+
+These are known gaps in the current release. None of them loses events; most need an unusual setup or a
+failure in a specific spot to show up.
+
+**Leader election**
+
+- **`stop()` must not be cancelled.** If the coroutine calling `election.stop()` is cancelled part-way, the
+  lock may stay held, with its connection open, until the process exits, and no other node can lead.
+  Call it from a shutdown path that isn't cancelled, or use the blocking `election.close()`.
+- **Don't call `start()` and `stop()` at the same time from different threads.** Doing so can leave two
+  background loops sharing one connection. Starting again after `stop()` has returned is fine.
+- **A JVM `Error` stops the election silently.** An `Error` such as `OutOfMemoryError` thrown inside the
+  election's background loop ends the loop without a log line. If it happened while leading, the node keeps
+  the lock (and reports itself as leader until the lease runs out) until the process exits. Restart the
+  process.
+- **Some transitions aren't logged.** When a hung check lets the lease run out, nothing is logged until the
+  check finally fails. If a check takes the lock while `stop()` is running, the "Stepped down" line is
+  skipped.
+
+**Ordered reactions**
+
+- **An executor stays tied to its first ordered source.** Once an ordered outbox or contract has been built
+  on an executor, building another one on the same executor instance fails, even if the first has been
+  stopped. If you rebuild outboxes in-process (for example on an application context refresh), create new
+  executors as well.
+- **Subscriptions sharing an executor must be deterministic.** Within one contract, reactions from all
+  ordered subscriptions on an executor are numbered together. A re-dispatch after a crash is only
+  recognised as a duplicate if every one of those subscriptions returns the same reactions, in the same
+  order, for the same event.
+- **At most 9,999 reactions per event on one ordered executor.** Beyond that, reactions sort in the wrong
+  order. This is not checked.
+- **Aggregate types containing `/` can share ordering keys.** The ordering key is
+  `"<aggregate type>/<aggregate id>"`, so type `a/b` with id `c` and type `a` with id `b/c` share one key.
+  Their reactions then wait on each other unnecessarily; nothing runs out of order.
+- **Unreadable reaction data affects the blocked-reaction helpers.** If any pending reaction of the task has
+  stored data that can't be decoded, `blockedReactions`, `retryBlocked` and `skipBlocked` fail. A reaction
+  whose trigger can't be decoded holds back its aggregate's later reactions without being listed by
+  `blockedReactions`.
+- **Prompt hand-over needs immediate execution.** When a reaction finishes, the aggregate's next reaction is
+  rescheduled to run now. It only starts straight away if the `Scheduler` uses
+  `enableImmediateExecution()`; otherwise it starts on db-scheduler's next poll.
+- **Replaying an aggregate that was once written out of order is slow.** For such an aggregate, every event
+  pays a full check whose cost grows with the aggregate's history. This only applies to aggregates written by
+  an outer transaction that changed several aggregates in a racing order, and only matters for very long
+  histories.
 
 ## Status and contributing
 
