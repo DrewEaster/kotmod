@@ -7,6 +7,21 @@ in**, so those events reliably drive follow-up work in your own service and in o
 
 ## Contents
 
+- [Why kotmod](#why-kotmod)
+- [Installation](#installation)
+- [Quickstart](#quickstart)
+- [Core concepts](#core-concepts)
+- [Guides](#guides)
+  - [Aggregates and commands](#aggregates-and-commands)
+  - [Event-only aggregates](#event-only-aggregates)
+  - [Event serialization and schema migrations](#event-serialization-and-schema-migrations)
+  - [Postgres setup](#postgres-setup)
+  - [The outbox and event reactions](#the-outbox-and-event-reactions)
+  - [Durable reactions with db-scheduler](#durable-reactions-with-db-scheduler)
+  - [Publishing events to other contexts](#publishing-events-to-other-contexts)
+- [Running in production](#running-in-production)
+- [Status and contributing](#status-and-contributing)
+
 ## Why kotmod
 
 Most services want two things from their domain model: state they can query like any other table,
@@ -668,3 +683,47 @@ fun orderContract(
 - A contract can have several subscribers, each with its own executor. Subscribe before calling
   `start()`.
 - A contract reads the event log independently of the outbox, so give it its own consumer name.
+
+## Running in production
+
+**Delivery is at-least-once.** Events are never lost: they are committed with the state change, and the
+outbox only moves past an event once all of its reactions are dispatched. But a reaction can run more
+than once — for example if the process dies after dispatching but before saving the offset, or if a
+shutdown interrupts a running reaction. Make `execute` and `onCompletion` idempotent.
+
+**Use deterministic reaction ids.** Build each reaction id from the event id plus a label, as in
+`"confirmation-${event.metadata.eventId.value}"`. Then a re-dispatched event is recognised as a
+reaction that is already pending. A random id creates a duplicate.
+
+**Start and stop in order.** Start executors, then the db-scheduler `Scheduler`, then the outbox and any
+public contracts; stop in the reverse order. Getting it wrong doesn't lose anything — reactions that
+arrive before their executor is running are rescheduled with a warning — but it adds noise and delay.
+
+**Run one active poller per consumer.** The outbox and public contracts only poll while `isLeader()`
+returns `true`. Run your application on as many nodes as you like, but make sure only one of them polls
+for each consumer name — use a Postgres advisory lock or your platform's leader election. db-scheduler
+needs no such care: it is safe to run on every node, and each reaction runs on one node at a time.
+
+**Know what happens when things fail:**
+
+| Situation | Behaviour |
+|---|---|
+| A reaction fails or throws | Your `failureRetryHandler` decides: retry after a delay, or complete it as failed |
+| A reaction times out | Your `timeoutRetryHandler` decides |
+| A reaction's stored data can't be read | Retried with backoff from 10 seconds up to 1 hour |
+| A node crashes mid-reaction | db-scheduler notices the missing heartbeat and runs it again |
+| The database is down while dispatching | The outbox batch stops and resumes from the last saved offset on the next poll |
+| A command loses a concurrent update | `OptimisticConcurrencyException` — run the command again |
+
+**Tune throughput.** The outbox and contracts poll every 500ms (`pollInterval`) and read up to 100
+events per poll (`batchSize`). `Scheduler.threads(n)` caps how many reactions run at once.
+
+## Status and contributing
+
+kotmod is pre-1.0: the API may still change between releases. Issues and pull requests are welcome.
+
+- `./gradlew test` runs the unit tests.
+- `./gradlew integrationTest` runs the integration tests against Postgres in Docker (via Testcontainers),
+  including the quickstart above.
+
+kotmod is licensed under the [Apache License 2.0](LICENSE).
