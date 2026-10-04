@@ -48,11 +48,11 @@ plugins {
 
 dependencies {
     implementation("io.kotmod:kotmod:<version>")
+    implementation("io.kotmod:kotmod-db-scheduler:<version>") // durable event reactions on db-scheduler
+    // implementation("io.kotmod:kotmod-sqldelight:<version>") // only if your app uses SQLDelight
 
     // Used directly by the code in this README:
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
-    implementation("app.cash.sqldelight:jdbc-driver:2.4.0")
     implementation("org.postgresql:postgresql:42.7.13")
 }
 ```
@@ -66,7 +66,11 @@ Requirements:
 - A JVM 25 toolchain (kotmod is currently built and tested on it) and Kotlin.
 - PostgreSQL.
 - [db-scheduler](https://github.com/kagkarlsson/db-scheduler) 16.12.0 for durable event reactions. It
-  comes in as an API dependency of kotmod.
+  comes in with `kotmod-db-scheduler`.
+
+kotmod is split into modules: `kotmod` (aggregates, events, the outbox and Postgres support — plain JDBC,
+no other database library), `kotmod-db-scheduler` (durable event reactions) and `kotmod-sqldelight`
+(sharing transactions with SQLDelight).
 
 ## Quickstart
 
@@ -75,8 +79,8 @@ whenever an order is placed. It uses kotmod's Postgres backends and runs event r
 db-scheduler.
 
 Snippets leave out imports. The complete, compiled code is in
-[`Quickstart.kt`](src/integrationTest/kotlin/io/kotmod/readme/Quickstart.kt) and
-[`QuickstartTest.kt`](src/integrationTest/kotlin/io/kotmod/readme/QuickstartTest.kt). Two names to
+[`Quickstart.kt`](examples/src/integrationTest/kotlin/io/kotmod/readme/Quickstart.kt) and
+[`QuickstartTest.kt`](examples/src/integrationTest/kotlin/io/kotmod/readme/QuickstartTest.kt). Two names to
 watch: `Duration` is `kotlin.time.Duration`, and `EventReactionFailed` and `EventReactionCancelled` exist
 in both `EventReactionExecutionResult` and `EventReactionCompletionResult`, so use the qualified forms
 shown.
@@ -147,11 +151,12 @@ data class OrderCancelled(
 
 ### 3. Wire up persistence
 
-Given a `javax.sql.DataSource` for your database (for example from HikariCP), create a JDBC driver, tell
-kotmod how to serialize your events, and create an `AggregateManager` for orders:
+Given a `javax.sql.DataSource` for your database (for example from HikariCP), create a `JdbcContext` — how
+kotmod reaches the database and runs transactions — tell kotmod how to serialize your events, and create an
+`AggregateManager` for orders:
 
 ```kotlin
-val driver = dataSource.asJdbcDriver()
+val jdbc = DataSourceJdbcContext(dataSource)
 
 val serialization =
     jsonDataSerializationContext<OrderEvent> {
@@ -165,21 +170,20 @@ val orderType = AggregateType("Order")
 val orders =
     AggregateManager(
         aggregateType = orderType,
-        repository = OrderRepository(driver),
-        backend = PostgresDomainPersistenceBackend(driver, serialization),
-        transacter = object : TransacterImpl(driver) {},
+        repository = OrderRepository(jdbc),
+        backend = PostgresDomainPersistenceBackend(jdbc, serialization),
     )
 ```
 
-The `Repository` is yours: it loads and saves order state in the `orders` table. It borrows the driver's
-connection through a small `withConnection` helper, so its writes join the same transaction as kotmod's:
+The `Repository` is yours: it loads and saves order state in the `orders` table. It borrows its connection
+through `jdbc.withConnection`, so its writes join the same transaction as kotmod's:
 
 ```kotlin
 class OrderRepository(
-    private val driver: JdbcDriver,
+    private val jdbc: JdbcContext,
 ) : Repository<Order> {
     override fun get(id: AggregateId): Order? =
-        driver.withConnection { conn ->
+        jdbc.withConnection { conn ->
             conn.prepareStatement("SELECT status, item, reason FROM orders WHERE id = ?").use { ps ->
                 ps.setString(1, id.value)
                 ps.executeQuery().use { rs ->
@@ -207,7 +211,7 @@ class OrderRepository(
                 is ShippedOrder -> Triple("SHIPPED", state.item, null)
                 is CancelledOrder -> Triple("CANCELLED", state.item, state.reason)
             }
-        driver.withConnection { conn ->
+        jdbc.withConnection { conn ->
             conn
                 .prepareStatement(
                     "INSERT INTO orders (id, status, item, reason) VALUES (?, ?, ?, ?) " +
@@ -220,16 +224,6 @@ class OrderRepository(
                     ps.executeUpdate()
                 }
         }
-    }
-}
-
-// Borrows the driver's connection, which is the transaction's connection inside AggregateManager.
-fun <R> JdbcDriver.withConnection(block: (Connection) -> R): R {
-    val (connection, close) = connectionAndClose()
-    try {
-        return block(connection)
-    } finally {
-        close()
     }
 }
 ```
@@ -339,11 +333,11 @@ still pending, it is recognised as the same reaction. `PostgresOffsetManager` re
 outbox has read:
 
 ```kotlin
-val offsets = PostgresOffsetManager(driver)
+val offsets = PostgresOffsetManager(jdbc)
 
 val outbox =
     AggregateEventOutbox<OrderNotification>(
-        backend = PostgresDomainPollingBackend(driver),
+        backend = PostgresDomainPollingBackend(jdbc),
         executor = executor,
         eventToReactions = { event ->
             if (event.metadata.aggregateType != orderType) {
@@ -468,8 +462,40 @@ suspend fun <T> retryOnConflict(
 ```
 
 **Your repository joins the transaction.** `Repository.save` is called inside kotmod's transaction, so it
-must borrow the driver's connection — as `OrderRepository` does with `withConnection` — rather than
-opening its own. A repository with its own connection would commit state independently of the events.
+must borrow its connection from the same `JdbcContext` as the backend — as `OrderRepository` does with
+`jdbc.withConnection` — rather than opening its own. A repository with its own connection would commit
+state independently of the events.
+
+#### Several aggregates in one transaction
+
+kotmod deliberately lets one transaction span commands on several aggregates. Wrap them in
+`jdbc.transaction { }` and their state, events and command records commit together — or not at all:
+
+```kotlin
+suspend fun shipAndInvoice(
+    jdbc: JdbcContext,
+    orders: AggregateManager<Order, OrderEvent>,
+    invoices: AggregateManager<Order, OrderEvent>,
+    orderId: AggregateId,
+) {
+    jdbc.transaction {
+        orders.execute<PendingOrder>(orderId) { order ->
+            ShippedOrder(order.item) to listOf(OrderShipped(order.item))
+        }
+        invoices.create(AggregateId("invoice-${orderId.value}")) {
+            PendingOrder("invoice") to listOf(OrderPlaced("invoice"))
+        }
+    }
+}
+```
+
+- If any command fails — including an `OptimisticConcurrencyException` on one aggregate — everything rolls
+  back, including the other aggregates' events.
+- Commands inside the block see each other's uncommitted writes.
+- Run commands one after another, never in parallel, and don't switch threads inside the block (for
+  example with `withContext`); kotmod throws `IllegalStateException` if you do.
+- Every kotmod class inside the block must use the same `JdbcContext`.
+- Keep the block short: it holds a database transaction open.
 
 ### Event-only aggregates
 
@@ -485,15 +511,14 @@ data class OrderViewed(
     val viewer: String,
 ) : AuditEvent
 
-fun auditLog(driver: JdbcDriver): EventProducer<AuditEvent> =
+fun auditLog(jdbc: JdbcContext): EventProducer<AuditEvent> =
     EventProducer(
         aggregateType = AggregateType("OrderAuditLog"),
         backend =
             PostgresDomainPersistenceBackend(
-                driver,
+                jdbc,
                 jsonDataSerializationContext<AuditEvent> { +OrderViewed.serializer().toEventSerializer() },
             ),
-        transacter = object : TransacterImpl(driver) {},
     )
 
 suspend fun recordView(
@@ -543,8 +568,8 @@ If you don't want JSON, implement `DataSerializationContext` yourself.
 
 ### Postgres setup
 
-kotmod's Postgres classes use plain JDBC through a SQLDelight `JdbcDriver`. Create one from any
-`DataSource` with `dataSource.asJdbcDriver()`.
+kotmod's Postgres classes use plain JDBC through a `JdbcContext`. For a plain `DataSource`, use
+`DataSourceJdbcContext(dataSource)`; SQLDelight users have an adapter (below).
 
 **Schema.** `DddSchema.ddl` creates four tables; copy it into your Flyway or Liquibase migrations:
 
@@ -558,13 +583,25 @@ kotmod's Postgres classes use plain JDBC through a SQLDelight `JdbcDriver`. Crea
 db-scheduler's `scheduled_tasks` table belongs to your application; create it from db-scheduler's
 [`postgresql_tables.sql`](https://github.com/kagkarlsson/db-scheduler/blob/v16.12.0/db-scheduler/src/test/resources/postgresql_tables.sql).
 
-**Transactions.** `AggregateManager` and `EventProducer` take a SQLDelight `Transacter`. Use
-`object : TransacterImpl(driver) {}`, or your own SQLDelight-generated database if you have one, as long
-as it uses the same driver as the backend and your repository.
+**Transactions.** Pass the same `JdbcContext` to every kotmod class and to your repositories. Each command
+runs in a transaction opened by its backend's `JdbcContext`; `jdbc.inTransaction { }` and
+`jdbc.withConnection { }` let your own code join it, and `jdbc.transaction { }` spans several commands.
 
 **Reading events.** `PostgresDomainPollingBackend` reads the event log for the outbox and public
 contracts. `PostgresOffsetManager` stores how far each of them has read; give every poller its own
 consumer name.
+
+#### Using SQLDelight
+
+Add `io.kotmod:kotmod-sqldelight` and build a `SqlDelightJdbcContext` from the same `JdbcDriver` as your
+generated database. kotmod then runs its transactions through SQLDelight's, so your SQLDelight queries and
+kotmod's writes share one transaction whichever side opens it:
+
+- Inside `jdbc.transaction { }`, call your SQLDelight queries as usual — they join kotmod's transaction.
+- Inside your own `database.transaction { }`, wrap kotmod calls in `runBlocking { jdbc.transaction { … } }`
+  (SQLDelight's block can't suspend); they join your transaction.
+
+Repositories implemented with SQLDelight queries need no changes: they already run inside the transaction.
 
 ### The outbox and event reactions
 
@@ -674,14 +711,14 @@ data class OrderPlacedV1(
 ) : OrderPublicEvent
 
 fun orderContract(
-    driver: JdbcDriver,
+    jdbc: JdbcContext,
     serialization: DataSerializationContext<OrderEvent>,
     offsets: PostgresOffsetManager,
     billingExecutor: EventReactionExecutor<BillingTrigger, *>,
 ): PublicEventContract<OrderEvent, OrderPublicEvent> {
     val contract =
         PublicEventContract<OrderEvent, OrderPublicEvent>(
-            backend = PostgresDomainPollingBackend(driver),
+            backend = PostgresDomainPollingBackend(jdbc),
             serialization = serialization,
             internalToPublic = { event ->
                 when (event) {
@@ -765,6 +802,9 @@ events per poll (`batchSize`). `Scheduler.threads(n)` caps how many reactions ru
 ## Status and contributing
 
 kotmod is pre-1.0: the API may still change between releases. Issues and pull requests are welcome.
+
+The repository is a multi-module Gradle build: `kotmod`, `kotmod-db-scheduler`, `kotmod-sqldelight` and
+`examples` (the compiled code behind this README).
 
 - `./gradlew test` runs the unit tests.
 - `./gradlew integrationTest` runs the integration tests against Postgres in Docker (via Testcontainers),

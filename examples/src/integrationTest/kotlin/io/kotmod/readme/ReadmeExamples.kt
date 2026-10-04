@@ -22,6 +22,7 @@ import io.kotmod.event.reaction.EventReactionTrigger
 import io.kotmod.event.reaction.EventReactionTriggerSerializer
 import io.kotmod.event.reaction.dbscheduler.DbSchedulerEventReactions
 import io.kotmod.jdbc.JdbcContext
+import io.kotmod.jdbc.transaction
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.PostgresDomainPollingBackend
 import io.kotmod.postgres.PostgresOffsetManager
@@ -62,6 +63,22 @@ suspend fun <T> retryOnConflict(
         }
     }
     return command()
+}
+
+suspend fun shipAndInvoice(
+    jdbc: JdbcContext,
+    orders: AggregateManager<Order, OrderEvent>,
+    invoices: AggregateManager<Order, OrderEvent>,
+    orderId: AggregateId,
+) {
+    jdbc.transaction {
+        orders.execute<PendingOrder>(orderId) { order ->
+            ShippedOrder(order.item) to listOf(OrderShipped(order.item))
+        }
+        invoices.create(AggregateId("invoice-${orderId.value}")) {
+            PendingOrder("invoice") to listOf(OrderPlaced("invoice"))
+        }
+    }
 }
 
 // Guide: Event-only aggregates
