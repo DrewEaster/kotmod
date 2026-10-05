@@ -784,6 +784,11 @@ transactions.
 `BackoffStrategy` gives exponential delays — 1s, 2s, 4s… up to a cap (10 minutes by default) — and is
 handy in your retry handlers, as the quickstart shows.
 
+The executor works with any queue: it dispatches through an `EventReactionTriggerSink` and receives
+reactions from an `EventReactionTriggerSource`. kotmod ships a durable implementation on db-scheduler
+(next section); to use something else, implement the two interfaces yourself
+(see [Using another queue](#using-another-queue-eg-google-pubsub)).
+
 #### Delayed reactions
 
 Give a reaction a `notBefore` and it doesn't run before that time. For example, ask for a review a week
@@ -824,11 +829,6 @@ fun reviewReminderOutbox(
 - Delayed reactions can't be ordered: a delayed reaction would hold back every later reaction of its
   aggregate. An ordered outbox or subscription that returns one fails with an `IllegalArgumentException`
   naming it.
-
-The executor works with any queue: it dispatches through an `EventReactionTriggerSink` and receives
-reactions from an `EventReactionTriggerSource`. kotmod ships a durable implementation on db-scheduler
-(next section); to use something else, implement the two interfaces yourself
-(see [Using another queue](#using-another-queue-eg-google-pubsub)).
 
 ### Durable reactions with db-scheduler
 
@@ -1066,8 +1066,6 @@ class PubSubReactions<T : EventReactionTrigger>(
                                 EventReactionExecutionId(UUID.randomUUID().toString()),
                                 serializer.deserialize(message.data.toStringUtf8()),
                                 // Delivery attempts are only counted when the subscription has a dead-letter policy.
-                                // It also counts redeliveries after Wait, which this sketch can't tell apart,
-                                // so allow for waits in the dead-letter policy's maximum delivery attempts.
                                 (Subscriber.getDeliveryAttempt(message) ?: 1) - 1,
                                 message.attributesMap["notBefore"]?.let { Instant.parse(it) },
                             )
@@ -1077,8 +1075,12 @@ class PubSubReactions<T : EventReactionTrigger>(
                     }
                 when (outcome) {
                     is ReactionOutcome.Finished -> reply.ack()
-                    // Wait is a nack too, but without counting a retry of our own (there is no counter here).
-                    is ReactionOutcome.Retry, is ReactionOutcome.Wait -> reply.nack()
+                    is ReactionOutcome.Retry -> reply.nack()
+                    // A nack ignores the delay, so this only suits waits of a few minutes. For longer ones, hand
+                    // the reaction back to Cloud Tasks for `outcome.delay` and ack this message instead (see
+                    // "Delays on Google Cloud"). Pub/Sub counts a nack as a delivery attempt, which a
+                    // dead-letter policy would treat as a failure.
+                    is ReactionOutcome.Wait -> reply.nack()
                 }
             }
         val subscriber = Subscriber.newBuilder(subscription, receiver).build()
@@ -1112,6 +1114,11 @@ How Pub/Sub differs from db-scheduler:
 - **`OnGiveUp.BlockAggregate` has no direct equivalent.** In this sketch a reaction that gives up is
   acknowledged and the aggregate's next reaction runs, as with `ContinueWithNext`. Record failures in
   `onCompletion` (or route them to a dead-letter topic) to deal with them.
+- **`ReactionOutcome.Wait` only suits short waits.** A `nack()` ignores the delay: the message comes back
+  according to the subscription's retry policy (at most 10 minutes later), and each redelivery counts
+  towards the dead-letter limit (at most 100 attempts). A reaction that must wait longer than a few
+  minutes would be redelivered many times, or dead-lettered before it is due. For longer waits, hand the
+  reaction to a scheduler such as Cloud Tasks and ack the original (see below).
 - **Long reactions are fine.** The client keeps extending a message's acknowledgement deadline while
   `block` runs, up to its maximum extension period (one hour by default).
 - **No leader election is needed for the queue.** As with db-scheduler, every node can run a subscriber;
@@ -1119,8 +1126,10 @@ How Pub/Sub differs from db-scheduler:
 
 **Delays on Google Cloud.** Pub/Sub can't hold a message back until a time. A sink can instead hand a
 delayed reaction to **Cloud Tasks** with a schedule time, and have the task publish it to Pub/Sub when it's
-due. Cloud Tasks limits how far ahead a task can be scheduled (about 30 days); for longer delays, the
-executor's check covers you, because a reaction that arrives early is simply scheduled again.
+due. Cloud Tasks can only schedule about 30 days ahead, so for a longer delay the reaction is scheduled for
+the furthest time allowed and arrives before its `notBefore`. The executor then returns `Wait` without
+running it, and the source should hand the reaction to Cloud Tasks again for the remaining time and ack the
+original message.
 
 ### Publishing events to other contexts
 
@@ -1356,7 +1365,8 @@ failure in a specific spot to show up.
    Then add an `InitialState` object for commands on an aggregate that doesn't exist yet, as in
    [the quickstart](#2-define-state-events-commands-and-rejections).
 3. Declare an `AggregateKind` for the aggregate, as `Orders` in [the quickstart](#3-wire-up-persistence), and
-   build `AggregateManager` from it and the `InitialState` object, and replace `create { }` and `execute<T> { }` calls with `handle(id, command)`.
+   build `AggregateManager` from it and the `InitialState` object. Then replace `create { }` and
+   `execute<T> { }` calls with `handle(id, command)`.
    `AggregateManager`'s type arguments are now `<S, C, E, R>` (state, command, event, rejection), e.g.
    `AggregateManager<Order, OrderCommand, OrderEvent, OrderRejection>` where 0.1.0 had
    `AggregateManager<Order, OrderEvent>`.
