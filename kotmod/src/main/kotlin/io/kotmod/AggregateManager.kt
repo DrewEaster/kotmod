@@ -3,7 +3,6 @@ package io.kotmod
 import io.kotmod.jdbc.KotmodTransaction
 import io.kotmod.jdbc.databaseWork
 import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.Json
 import kotlin.time.toKotlinInstant
 
@@ -30,16 +29,17 @@ import kotlin.time.toKotlinInstant
  * @param E the aggregate's domain event type.
  * @param R the aggregate's rejection type.
  * @param initial decides commands for an aggregate that doesn't exist yet.
- * @param rejectionSerializer serializes rejections, which are recorded so a repeated command id gets the same answer.
+ * @param kind names the aggregate type and how its commands and rejections are serialized.
  */
 class AggregateManager<S : AggregateState<S, C, E, R>, C : Any, E : DomainEvent, R : Any>(
-    private val aggregateType: AggregateType,
+    private val kind: AggregateKind<C, R>,
     private val repository: Repository<S>,
     private val backend: DomainPersistenceBackend<E>,
     private val initial: InitialState<S, C, E, R>,
-    private val rejectionSerializer: KSerializer<R>,
     private val maxConflictRetries: Int = 5,
 ) {
+    private val aggregateType: AggregateType get() = kind.type
+
     init {
         require(maxConflictRetries >= 0) { "maxConflictRetries must not be negative" }
     }
@@ -154,7 +154,7 @@ class AggregateManager<S : AggregateState<S, C, E, R>, C : Any, E : DomainEvent,
                             commandId,
                             // rejection_type is VARCHAR(255) and only informational: truncate rather than fail the insert.
                             rejectionType = outcome.rejection::class.java.name.take(MAX_REJECTION_TYPE_LENGTH),
-                            payload = Json.encodeToString(rejectionSerializer, outcome.rejection),
+                            payload = Json.encodeToString(kind.rejectionSerializer, outcome.rejection),
                         )
                 }
             }
@@ -177,7 +177,7 @@ class AggregateManager<S : AggregateState<S, C, E, R>, C : Any, E : DomainEvent,
         handled: HandledCommand.Rejected,
     ): R =
         try {
-            Json.decodeFromString(rejectionSerializer, handled.payload)
+            Json.decodeFromString(kind.rejectionSerializer, handled.payload)
         } catch (e: IllegalArgumentException) {
             // kotlinx.serialization's SerializationException is an IllegalArgumentException.
             throw RejectionDeserializationException(aggregateType, id, commandId, handled.type, e)

@@ -5,7 +5,6 @@ import app.cash.sqldelight.driver.jdbc.JdbcDriver
 import app.cash.sqldelight.driver.jdbc.asJdbcDriver
 import io.kotmod.AggregateId
 import io.kotmod.AggregateManager
-import io.kotmod.AggregateType
 import io.kotmod.jdbc.JdbcContext
 import io.kotmod.jdbc.JdbcContextContract
 import io.kotmod.jdbc.transaction
@@ -33,7 +32,7 @@ class SqlDelightJdbcContextIntegrationTest : JdbcContextContract() {
 
     private fun statelessOrders(jdbc: JdbcContext) =
         AggregateManager(
-            aggregateType = AggregateType("Order"),
+            kind = io.kotmod.support.testOrderKind(),
             repository =
                 object : io.kotmod.Repository<io.kotmod.support.Order> {
                     override fun get(id: AggregateId) = null
@@ -45,7 +44,6 @@ class SqlDelightJdbcContextIntegrationTest : JdbcContextContract() {
                 },
             backend = PostgresDomainPersistenceBackend(jdbc, orderEventSerialization()),
             initial = io.kotmod.support.NoOrder,
-            rejectionSerializer = io.kotmod.support.OrderRejection.serializer(),
         )
 
     @Test

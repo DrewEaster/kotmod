@@ -2,7 +2,6 @@ package io.kotmod.postgres
 
 import io.kotmod.AggregateId
 import io.kotmod.AggregateManager
-import io.kotmod.AggregateType
 import io.kotmod.CommandId
 import io.kotmod.CommandResult
 import io.kotmod.Repository
@@ -21,6 +20,7 @@ import io.kotmod.support.ShipOrder
 import io.kotmod.support.ShippedOrder
 import io.kotmod.support.placeOrder
 import io.kotmod.support.ship
+import io.kotmod.support.testOrderKind
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -83,11 +83,10 @@ class AggregateManagerIntegrationTest : IntegrationTest() {
         }
         orders =
             AggregateManager(
-                AggregateType("Order"),
+                testOrderKind(),
                 OrderTable(jdbc),
                 PostgresDomainPersistenceBackend(jdbc, orderEventSerialization()),
                 NoOrder,
-                io.kotmod.support.OrderRejection.serializer(),
             )
     }
 

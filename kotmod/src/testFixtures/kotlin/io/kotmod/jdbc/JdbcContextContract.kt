@@ -2,7 +2,6 @@ package io.kotmod.jdbc
 
 import io.kotmod.AggregateId
 import io.kotmod.AggregateManager
-import io.kotmod.AggregateType
 import io.kotmod.CommandResult
 import io.kotmod.OptimisticConcurrencyException
 import io.kotmod.Repository
@@ -11,12 +10,12 @@ import io.kotmod.postgres.support.orderEventSerialization
 import io.kotmod.support.DecideWith
 import io.kotmod.support.NoOrder
 import io.kotmod.support.Order
-import io.kotmod.support.OrderRejection
 import io.kotmod.support.PendingOrder
 import io.kotmod.support.PlaceOrder
 import io.kotmod.support.ShipOrder
 import io.kotmod.support.ShippedOrder
 import io.kotmod.support.ship
+import io.kotmod.support.testOrderKind
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.Dispatchers
@@ -162,11 +161,10 @@ abstract class JdbcContextContract : IntegrationTest() {
         type: String,
         jdbc: JdbcContext = context,
     ) = AggregateManager(
-        aggregateType = AggregateType(type),
+        kind = testOrderKind(type),
         repository = ProbeOrderRepository(jdbc),
         backend = PostgresDomainPersistenceBackend(jdbc, orderEventSerialization()),
         initial = NoOrder,
-        rejectionSerializer = OrderRejection.serializer(),
     )
 
     private fun count(table: String): Int =

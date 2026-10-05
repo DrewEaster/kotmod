@@ -3,7 +3,9 @@ package io.kotmod.readme
 // Keep in sync with README.md (Quickstart, steps 2, 3 and 5).
 
 import io.kotmod.AggregateId
+import io.kotmod.AggregateKind
 import io.kotmod.AggregateState
+import io.kotmod.AggregateType
 import io.kotmod.DomainEvent
 import io.kotmod.InitialState
 import io.kotmod.Outcome
@@ -69,6 +71,12 @@ data object OrderAlreadyCancelled : OrderRejection
 
 @Serializable
 data object CancellationReasonMissing : OrderRejection
+
+object Orders : AggregateKind<OrderCommand, OrderRejection>(
+    type = AggregateType("Order"),
+    commandSerializer = OrderCommand.serializer(),
+    rejectionSerializer = OrderRejection.serializer(),
+)
 
 typealias OrderOutcome = Outcome<Order, OrderEvent, OrderRejection>
 

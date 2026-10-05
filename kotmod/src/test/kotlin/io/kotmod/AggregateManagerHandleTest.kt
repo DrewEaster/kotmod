@@ -20,6 +20,7 @@ import io.kotmod.support.ShippedOrder
 import io.kotmod.support.StubPersistenceBackend
 import io.kotmod.support.StubRepository
 import io.kotmod.support.ship
+import io.kotmod.support.testOrderKind
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import kotlin.test.BeforeTest
@@ -44,9 +45,20 @@ class AggregateManagerHandleTest {
     }
 
     private fun manager(maxConflictRetries: Int = 5) =
-        AggregateManager(type, repo, backend, NoOrder, OrderRejection.serializer(), maxConflictRetries = maxConflictRetries)
+        AggregateManager(testOrderKind(), repo, backend, NoOrder, maxConflictRetries = maxConflictRetries)
 
     private fun version() = backend.metas[StubPersistenceBackend.Key(type, id)]?.version
+
+    @Test
+    fun `the kind's type names the aggregate in the event log and the command history`() =
+        runTest {
+            val invoices = AggregateManager(testOrderKind("Invoice"), repo, backend, NoOrder)
+
+            invoices.handle(id, PlaceOrder("book"), commandId = CommandId("c-1"))
+
+            assertEquals(AggregateType("Invoice"), backend.events.single().metadata.aggregateType)
+            assertEquals(HandledCommand.Accepted, backend.commands[StubPersistenceBackend.CommandKey(AggregateType("Invoice"), id, CommandId("c-1"))])
+        }
 
     @Test
     fun `accepting from the initial state creates the aggregate with state, meta at version 1, events and the command`() =

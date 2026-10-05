@@ -1,12 +1,20 @@
 package io.kotmod.support
 
+import io.kotmod.AggregateKind
 import io.kotmod.AggregateState
+import io.kotmod.AggregateType
 import io.kotmod.DomainEvent
 import io.kotmod.InitialState
 import io.kotmod.Outcome
 import io.kotmod.accept
 import io.kotmod.reject
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.descriptors.PrimitiveKind
+import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
 
 sealed interface Order : AggregateState<Order, OrderCommand, OrderEvent, OrderRejection>
 
@@ -111,3 +119,18 @@ data class OrderCancelled(
     val name: String,
     val reason: String,
 ) : OrderEvent
+
+/** Test commands are never serialized (DecideWith holds a lambda), so the test kind's command serializer refuses. */
+object TestOrderCommandSerializer : KSerializer<OrderCommand> {
+    override val descriptor: SerialDescriptor = PrimitiveSerialDescriptor("io.kotmod.support.TestOrderCommand", PrimitiveKind.STRING)
+
+    override fun serialize(
+        encoder: Encoder,
+        value: OrderCommand,
+    ): Unit = error("test commands are not serialized")
+
+    override fun deserialize(decoder: Decoder): OrderCommand = error("test commands are not serialized")
+}
+
+fun testOrderKind(type: String = "Order"): AggregateKind<OrderCommand, OrderRejection> =
+    AggregateKind(AggregateType(type), TestOrderCommandSerializer, OrderRejection.serializer())

@@ -5,7 +5,6 @@ package io.kotmod.readme
 import com.github.kagkarlsson.scheduler.Scheduler
 import io.kotmod.AggregateId
 import io.kotmod.AggregateManager
-import io.kotmod.AggregateType
 import io.kotmod.CommandResult
 import io.kotmod.event.reaction.BackoffStrategy
 import io.kotmod.event.reaction.EventReaction
@@ -61,15 +60,12 @@ class QuickstartTest : IntegrationTest() {
                     +OrderCancelled.serializer().toEventSerializer()
                 }
 
-            val orderType = AggregateType("Order")
-
             val orders =
                 AggregateManager(
-                    aggregateType = orderType,
+                    kind = Orders,
                     repository = OrderRepository(jdbc),
                     backend = PostgresDomainPersistenceBackend(jdbc, serialization),
                     initial = NoOrder,
-                    rejectionSerializer = OrderRejection.serializer(),
                 )
 
             // Another aggregate type writing to the same event log, as an app with an audit log would.
@@ -125,7 +121,7 @@ class QuickstartTest : IntegrationTest() {
                     backend = PostgresDomainPollingBackend(jdbc),
                     executor = executor,
                     eventToReactions = { event ->
-                        if (event.metadata.aggregateType != orderType) {
+                        if (event.metadata.aggregateType != Orders.type) {
                             // The event log holds every aggregate type's events; only order events can be read here.
                             emptyList()
                         } else {

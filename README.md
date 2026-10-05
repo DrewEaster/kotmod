@@ -243,8 +243,17 @@ data class CancelledOrder(
 ### 3. Wire up persistence
 
 Given a `javax.sql.DataSource` for your database (for example from HikariCP), create a `JdbcContext` — how
-kotmod reaches the database and runs transactions — tell kotmod how to serialize your events, and create an
-`AggregateManager` for orders:
+kotmod reaches the database and runs transactions — tell kotmod how to serialize your events, name the aggregate with a **kind**, and create an `AggregateManager` for orders:
+
+An `AggregateKind` names the aggregate type and says how its commands and rejections are serialized:
+
+```kotlin
+object Orders : AggregateKind<OrderCommand, OrderRejection>(
+    type = AggregateType("Order"),
+    commandSerializer = OrderCommand.serializer(),
+    rejectionSerializer = OrderRejection.serializer(),
+)
+```
 
 ```kotlin
 val jdbc = DataSourceJdbcContext(dataSource)
@@ -256,15 +265,12 @@ val serialization =
         +OrderCancelled.serializer().toEventSerializer()
     }
 
-val orderType = AggregateType("Order")
-
 val orders =
     AggregateManager(
-        aggregateType = orderType,
+        kind = Orders,
         repository = OrderRepository(jdbc),
         backend = PostgresDomainPersistenceBackend(jdbc, serialization),
         initial = NoOrder,
-        rejectionSerializer = OrderRejection.serializer(),
     )
 ```
 
@@ -428,7 +434,7 @@ val outbox =
         backend = PostgresDomainPollingBackend(jdbc),
         executor = executor,
         eventToReactions = { event ->
-            if (event.metadata.aggregateType != orderType) {
+            if (event.metadata.aggregateType != Orders.type) {
                 // The event log holds every aggregate type's events; only order events can be read here.
                 emptyList()
             } else {
