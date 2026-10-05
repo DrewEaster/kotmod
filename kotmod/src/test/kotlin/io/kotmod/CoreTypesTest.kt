@@ -71,19 +71,6 @@ class CoreTypesTest {
     }
 
     @Test
-    fun `UnexpectedAggregateStateException names the types`() {
-        val ex =
-            UnexpectedAggregateStateException(
-                aggregateType = AggregateType("Order"),
-                aggregateId = AggregateId("o-1"),
-                expected = "PendingOrder",
-                actual = "ShippedOrder",
-            )
-        assertTrue(ex.message!!.contains("PendingOrder"))
-        assertTrue(ex.message!!.contains("ShippedOrder"))
-    }
-
-    @Test
     fun `value classes reject blank values`() {
         assertFailsWith<IllegalArgumentException> { AggregateId("") }
         assertFailsWith<IllegalArgumentException> { AggregateId("   ") }

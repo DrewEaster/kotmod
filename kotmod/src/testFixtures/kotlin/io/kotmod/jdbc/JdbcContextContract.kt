@@ -1,18 +1,21 @@
 package io.kotmod.jdbc
 
-import io.kotmod.AggregateAlreadyExistsException
 import io.kotmod.AggregateId
 import io.kotmod.AggregateManager
 import io.kotmod.AggregateType
+import io.kotmod.CommandResult
 import io.kotmod.OptimisticConcurrencyException
 import io.kotmod.Repository
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.support.orderEventSerialization
+import io.kotmod.support.DecideWith
 import io.kotmod.support.Order
-import io.kotmod.support.OrderPlaced
-import io.kotmod.support.OrderShipped
+import io.kotmod.support.OrderCommands
 import io.kotmod.support.PendingOrder
+import io.kotmod.support.PlaceOrder
+import io.kotmod.support.ShipOrder
 import io.kotmod.support.ShippedOrder
+import io.kotmod.support.ship
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.Dispatchers
@@ -161,6 +164,7 @@ abstract class JdbcContextContract : IntegrationTest() {
         aggregateType = AggregateType(type),
         repository = ProbeOrderRepository(jdbc),
         backend = PostgresDomainPersistenceBackend(jdbc, orderEventSerialization()),
+        commands = OrderCommands,
     )
 
     private fun count(table: String): Int =
@@ -185,8 +189,8 @@ abstract class JdbcContextContract : IntegrationTest() {
             val invoices = manager("Invoice")
 
             context.transaction {
-                orders.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book")) }
-                invoices.create(AggregateId("i-1")) { PendingOrder("invoice") to listOf(OrderPlaced("invoice")) }
+                orders.handle(AggregateId("o-1"), PlaceOrder("book"))
+                invoices.handle(AggregateId("i-1"), PlaceOrder("invoice"))
             }
 
             assertEquals(2, count("ddd_aggregate_root"))
@@ -196,16 +200,17 @@ abstract class JdbcContextContract : IntegrationTest() {
         }
 
     @Test
-    fun `a failing second command rolls back the first command's state, events and command record`() =
+    fun `throwing on a rejection rolls back the first command's state, events and command record, and the rejection`() =
         runBlocking {
             val orders = manager("Order")
             val invoices = manager("Invoice")
-            invoices.create(AggregateId("i-1")) { PendingOrder("invoice") to listOf(OrderPlaced("invoice")) }
+            invoices.handle(AggregateId("i-1"), PlaceOrder("invoice"))
 
-            assertFailsWith<AggregateAlreadyExistsException> {
+            assertFailsWith<IllegalStateException> {
                 context.transaction {
-                    orders.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book")) }
-                    invoices.create(AggregateId("i-1")) { PendingOrder("again") to listOf(OrderPlaced("again")) }
+                    orders.handle(AggregateId("o-1"), PlaceOrder("book"))
+                    val again = invoices.handle(AggregateId("i-1"), PlaceOrder("again"))
+                    if (again is CommandResult.Rejected) error("rejected: ${again.rejection}")
                 }
             }
 
@@ -220,27 +225,34 @@ abstract class JdbcContextContract : IntegrationTest() {
         runBlocking {
             val orders = manager("Order")
             val invoices = manager("Invoice")
-            orders.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book")) }
-            invoices.create(AggregateId("i-1")) { PendingOrder("invoice") to listOf(OrderPlaced("invoice")) }
+            orders.handle(AggregateId("o-1"), PlaceOrder("book"))
+            invoices.handle(AggregateId("i-1"), PlaceOrder("invoice"))
 
             assertFailsWith<OptimisticConcurrencyException> {
                 context.transaction {
-                    orders.execute<PendingOrder>(AggregateId("o-1")) { ShippedOrder(it.name) to listOf(OrderShipped(it.name)) }
-                    invoices.execute<PendingOrder>(AggregateId("i-1")) { order ->
-                        // Someone else changes the invoice between our read and our write.
-                        dataSource.connection.use { conn ->
-                            conn.createStatement().use {
-                                it.execute("UPDATE ddd_aggregate_root SET aggregate_version = aggregate_version + 1 WHERE aggregate_id = 'i-1'")
-                            }
-                        }
-                        ShippedOrder(order.name) to listOf(OrderShipped(order.name))
-                    }
+                    orders.handle(AggregateId("o-1"), ShipOrder)
+                    invoices.handle(
+                        AggregateId("i-1"),
+                        DecideWith { order ->
+                            // Someone else changes the invoice between our read and our write.
+                            bumpVersionElsewhere("i-1")
+                            (order as PendingOrder).ship()
+                        },
+                    )
                 }
             }
 
             assertEquals(2, count("ddd_domain_event"))
             assertEquals(PendingOrder("book"), ProbeOrderRepository(context).get(AggregateId("o-1")))
         }
+
+    private fun bumpVersionElsewhere(aggregateId: String) {
+        dataSource.connection.use { conn ->
+            conn.createStatement().use {
+                it.execute("UPDATE ddd_aggregate_root SET aggregate_version = aggregate_version + 1 WHERE aggregate_id = '$aggregateId'")
+            }
+        }
+    }
 
     @Test
     fun `commands inside a transaction see earlier uncommitted writes`() =
@@ -249,11 +261,11 @@ abstract class JdbcContextContract : IntegrationTest() {
 
             val shipped =
                 context.transaction {
-                    orders.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book")) }
-                    orders.execute<PendingOrder>(AggregateId("o-1")) { ShippedOrder(it.name) to listOf(OrderShipped(it.name)) }
+                    orders.handle(AggregateId("o-1"), PlaceOrder("book"))
+                    orders.handle(AggregateId("o-1"), ShipOrder)
                 }
 
-            assertEquals(ShippedOrder("book"), shipped)
+            assertEquals(CommandResult.Accepted(ShippedOrder("book")), shipped)
             assertEquals(2, count("ddd_domain_event"))
         }
 
@@ -266,7 +278,7 @@ abstract class JdbcContextContract : IntegrationTest() {
                 assertFailsWith<IllegalStateException> {
                     context.transaction {
                         context.transaction {
-                            orders.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book")) }
+                            orders.handle(AggregateId("o-1"), PlaceOrder("book"))
                         }
                         error("outer fails")
                     }
@@ -285,7 +297,7 @@ abstract class JdbcContextContract : IntegrationTest() {
                 assertFailsWith<IllegalStateException> {
                     context.transaction {
                         withContext(Dispatchers.Default) {
-                            orders.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book")) }
+                            orders.handle(AggregateId("o-1"), PlaceOrder("book"))
                         }
                     }
                 }
@@ -302,7 +314,7 @@ abstract class JdbcContextContract : IntegrationTest() {
             val failure =
                 assertFailsWith<IllegalStateException> {
                     context.transaction {
-                        other.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book")) }
+                        other.handle(AggregateId("o-1"), PlaceOrder("book"))
                     }
                 }
 
@@ -319,7 +331,7 @@ abstract class JdbcContextContract : IntegrationTest() {
             val running =
                 async(Dispatchers.Default) {
                     context.transaction {
-                        orders.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book")) }
+                        orders.handle(AggregateId("o-1"), PlaceOrder("book"))
                         written.complete(Unit)
                         awaitCancellation()
                     }
@@ -379,14 +391,20 @@ abstract class JdbcContextContract : IntegrationTest() {
         runBlocking {
             val orders = manager("Order")
             val invoices = manager("Invoice")
-            invoices.create(AggregateId("i-1")) { PendingOrder("invoice") to listOf(OrderPlaced("invoice")) }
+            invoices.handle(AggregateId("i-1"), PlaceOrder("invoice"))
 
             assertFailsWith<TransactionRolledBackException> {
                 context.transaction {
-                    orders.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book")) }
+                    orders.handle(AggregateId("o-1"), PlaceOrder("book"))
                     try {
-                        invoices.create(AggregateId("i-1")) { PendingOrder("again") to listOf(OrderPlaced("again")) }
-                    } catch (_: AggregateAlreadyExistsException) {
+                        invoices.handle(
+                            AggregateId("i-1"),
+                            DecideWith { order ->
+                                bumpVersionElsewhere("i-1")
+                                (order as PendingOrder).ship()
+                            },
+                        )
+                    } catch (_: OptimisticConcurrencyException) {
                         // carry on regardless
                     }
                 }
@@ -405,7 +423,7 @@ abstract class JdbcContextContract : IntegrationTest() {
                 context.inTransaction {
                     insertProbe("app")
                     runBlocking {
-                        orders.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book")) }
+                        orders.handle(AggregateId("o-1"), PlaceOrder("book"))
                     }
                     error("app fails after kotmod ran")
                 }

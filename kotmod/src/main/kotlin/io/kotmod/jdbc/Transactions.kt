@@ -49,8 +49,8 @@ class KotmodTransaction internal constructor(
  * back together:
  * ```
  * jdbc.transaction {
- *     orders.execute<PendingOrder>(orderId) { … }
- *     invoices.create(invoiceId) { … }
+ *     orders.handle(orderId, ShipOrder)
+ *     invoices.handle(invoiceId, CreateInvoice(orderId))
  * }
  * ```
  * Outside a transaction, it switches to an IO thread, opens a transaction there and runs [block] confined

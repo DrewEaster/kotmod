@@ -34,6 +34,9 @@ class StubPersistenceBackend<E : DomainEvent> : DomainPersistenceBackend<E> {
         private set
     val writesOutsideTransaction = mutableListOf<String>()
 
+    /** The next this-many `saveMeta` calls throw [OptimisticConcurrencyException], to simulate a concurrent writer. */
+    var conflictsToInject = 0
+
     override fun <R> inTransaction(block: () -> R): R {
         transactionDepth++
         try {
@@ -65,6 +68,10 @@ class StubPersistenceBackend<E : DomainEvent> : DomainPersistenceBackend<E> {
         eventCount: Int,
     ): Long {
         recordWrite("saveMeta")
+        if (conflictsToInject > 0) {
+            conflictsToInject--
+            throw OptimisticConcurrencyException(type, id, expectedVersion ?: 0)
+        }
         val key = Key(type, id)
         val now =
             java.time.Instant

@@ -3,10 +3,14 @@ package io.kotmod.readme
 // Keep in sync with README.md (Quickstart, steps 2, 3 and 5).
 
 import io.kotmod.AggregateId
+import io.kotmod.CommandHandlers
 import io.kotmod.DomainEvent
+import io.kotmod.Outcome
 import io.kotmod.Repository
+import io.kotmod.accept
 import io.kotmod.event.reaction.EventReactionTrigger
 import io.kotmod.jdbc.JdbcContext
+import io.kotmod.reject
 import io.kotmod.event.reaction.EventReactionTriggerSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -46,14 +50,70 @@ data class OrderCancelled(
     val reason: String,
 ) : OrderEvent
 
-fun placeOrder(item: String): Pair<PendingOrder, List<OrderEvent>> =
-    PendingOrder(item) to listOf(OrderPlaced(item))
+@Serializable
+sealed interface OrderCommand
 
-fun PendingOrder.ship(): Pair<ShippedOrder, List<OrderEvent>> =
-    ShippedOrder(item) to listOf(OrderShipped(item))
+@Serializable
+data class PlaceOrder(
+    val item: String,
+) : OrderCommand
 
-fun PendingOrder.cancel(reason: String): Pair<CancelledOrder, List<OrderEvent>> =
-    CancelledOrder(item, reason) to listOf(OrderCancelled(item, reason))
+@Serializable
+data object ShipOrder : OrderCommand
+
+@Serializable
+data class CancelOrder(
+    val reason: String,
+) : OrderCommand
+
+@Serializable
+sealed interface OrderRejection
+
+@Serializable
+data object OrderAlreadyPlaced : OrderRejection
+
+@Serializable
+data object OrderNotFound : OrderRejection
+
+@Serializable
+data object OrderAlreadyShipped : OrderRejection
+
+@Serializable
+data object OrderAlreadyCancelled : OrderRejection
+
+@Serializable
+data object CancellationReasonMissing : OrderRejection
+
+typealias OrderOutcome = Outcome<Order, OrderEvent, OrderRejection>
+
+fun placeOrder(item: String): OrderOutcome = accept(PendingOrder(item), OrderPlaced(item))
+
+fun PendingOrder.ship(): OrderOutcome = accept(ShippedOrder(item), OrderShipped(item))
+
+fun PendingOrder.cancel(reason: String): OrderOutcome =
+    if (reason.isBlank()) {
+        reject(CancellationReasonMissing)
+    } else {
+        accept(CancelledOrder(item, reason), OrderCancelled(item, reason))
+    }
+
+object OrderCommands : CommandHandlers<Order, OrderCommand, OrderEvent, OrderRejection>(
+    rejectionSerializer = OrderRejection.serializer(),
+) {
+    override fun OrderCommand.handler() =
+        when (this) {
+            is PlaceOrder -> creates(otherwise = { OrderAlreadyPlaced }) { placeOrder(item) }
+            ShipOrder -> on<PendingOrder>(otherwise = ::notPending) { it.ship() }
+            is CancelOrder -> on<PendingOrder>(otherwise = ::notPending) { it.cancel(reason) }
+        }
+
+    private fun notPending(order: Order?): OrderRejection =
+        when (order) {
+            is ShippedOrder -> OrderAlreadyShipped
+            is CancelledOrder -> OrderAlreadyCancelled
+            else -> OrderNotFound
+        }
+}
 
 class OrderRepository(
     private val jdbc: JdbcContext,

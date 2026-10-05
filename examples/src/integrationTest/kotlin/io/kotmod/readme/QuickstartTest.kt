@@ -6,6 +6,7 @@ import com.github.kagkarlsson.scheduler.Scheduler
 import io.kotmod.AggregateId
 import io.kotmod.AggregateManager
 import io.kotmod.AggregateType
+import io.kotmod.CommandResult
 import io.kotmod.event.reaction.BackoffStrategy
 import io.kotmod.event.reaction.EventReaction
 import io.kotmod.event.reaction.EventReactionCompletionResult
@@ -67,6 +68,7 @@ class QuickstartTest : IntegrationTest() {
                     aggregateType = orderType,
                     repository = OrderRepository(jdbc),
                     backend = PostgresDomainPersistenceBackend(jdbc, serialization),
+                    commands = OrderCommands,
                 )
 
             // Another aggregate type writing to the same event log, as an app with an audit log would.
@@ -74,9 +76,9 @@ class QuickstartTest : IntegrationTest() {
 
             val orderId = AggregateId("order-1")
 
-            orders.create(orderId) { placeOrder("book") }
+            orders.handle(orderId, PlaceOrder("book"))
 
-            val shipped = orders.execute<PendingOrder>(orderId) { it.ship() }
+            val shipped = orders.handle(orderId, ShipOrder)
 
             val notifications = DbSchedulerEventReactions("order-notifications", OrderNotificationSerializer)
 
@@ -156,7 +158,7 @@ class QuickstartTest : IntegrationTest() {
                 executor.stop()
             }
 
-            assertEquals(ShippedOrder("book"), shipped)
+            assertEquals(CommandResult.Accepted(ShippedOrder("book")), shipped)
             assertEquals(listOf("order-1"), sentConfirmations.toList())
         }
 

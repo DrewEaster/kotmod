@@ -6,7 +6,10 @@ sealed class DddException(
     cause: Throwable? = null,
 ) : RuntimeException(message, cause)
 
-/** Thrown when a command targets an aggregate that does not exist. */
+/**
+ * Thrown when an aggregate's bookkeeping exists, or one of its commands was accepted, but its [Repository] has no
+ * state for it: the state was deleted or saved somewhere else.
+ */
 class AggregateNotFoundException(
     val aggregateType: AggregateType,
     val aggregateId: AggregateId,
@@ -19,8 +22,9 @@ class AggregateAlreadyExistsException(
 ) : DddException("Aggregate already exists: ${aggregateType.value}/${aggregateId.value}")
 
 /**
- * Thrown when an aggregate was changed by someone else between being read and being written:
- * its stored version no longer matches [expectedVersion]. Retrying the command re-reads the latest state.
+ * Thrown when an aggregate was changed by someone else between being read and being written: its stored version
+ * no longer matches [expectedVersion]. [AggregateManager.handle] retries automatically; you only see this when its
+ * retries run out, or inside an outer transaction.
  */
 class OptimisticConcurrencyException(
     val aggregateType: AggregateType,
@@ -54,14 +58,3 @@ class RejectionDeserializationException(
             "can't be read; keep renamed rejection classes readable with @SerialName",
         cause,
     )
-
-/**
- * Thrown by the narrowed [AggregateManager.execute] when the aggregate's current state is not the
- * subtype the command expects, e.g. shipping an order that has already been cancelled.
- */
-class UnexpectedAggregateStateException(
-    val aggregateType: AggregateType,
-    val aggregateId: AggregateId,
-    val expected: String,
-    val actual: String,
-) : DddException("Aggregate ${aggregateType.value}/${aggregateId.value} is in state $actual but $expected was expected")

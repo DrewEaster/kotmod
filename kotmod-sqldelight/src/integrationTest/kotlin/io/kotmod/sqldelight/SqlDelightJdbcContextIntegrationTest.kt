@@ -11,8 +11,7 @@ import io.kotmod.jdbc.JdbcContextContract
 import io.kotmod.jdbc.transaction
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.support.orderEventSerialization
-import io.kotmod.support.OrderPlaced
-import io.kotmod.support.PendingOrder
+import io.kotmod.support.PlaceOrder
 import kotlinx.coroutines.runBlocking
 import javax.sql.DataSource
 import kotlin.test.Test
@@ -45,6 +44,7 @@ class SqlDelightJdbcContextIntegrationTest : JdbcContextContract() {
                     ) = Unit
                 },
             backend = PostgresDomainPersistenceBackend(jdbc, orderEventSerialization()),
+            commands = io.kotmod.support.OrderCommands,
         )
 
     @Test
@@ -58,7 +58,7 @@ class SqlDelightJdbcContextIntegrationTest : JdbcContextContract() {
                     driver.execute(null, "INSERT INTO jdbc_probe (id) VALUES ('app')", 0)
                     runBlocking {
                         context.transaction {
-                            orders.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book")) }
+                            orders.handle(AggregateId("o-1"), PlaceOrder("book"))
                         }
                     }
                     error("app fails after kotmod ran")
@@ -77,7 +77,7 @@ class SqlDelightJdbcContextIntegrationTest : JdbcContextContract() {
 
             context.transaction {
                 driver.execute(null, "INSERT INTO jdbc_probe (id) VALUES ('app')", 0)
-                orders.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book")) }
+                orders.handle(AggregateId("o-1"), PlaceOrder("book"))
             }
 
             assertEquals(listOf("app"), committedProbes())
@@ -93,7 +93,7 @@ class SqlDelightJdbcContextIntegrationTest : JdbcContextContract() {
             val failure =
                 assertFailsWith<IllegalStateException> {
                     context.transaction {
-                        orders.create(AggregateId("o-1")) { PendingOrder("book") to listOf(OrderPlaced("book")) }
+                        orders.handle(AggregateId("o-1"), PlaceOrder("book"))
                         error("roll back both")
                     }
                 }

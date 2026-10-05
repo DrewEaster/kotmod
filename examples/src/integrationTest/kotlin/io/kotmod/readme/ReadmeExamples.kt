@@ -7,13 +7,12 @@ import io.kotmod.AggregateId
 import io.kotmod.AggregateManager
 import io.kotmod.AggregateType
 import io.kotmod.CommandId
+import io.kotmod.CommandResult
 import io.kotmod.DataSerializationContext
 import io.kotmod.DomainEvent
 import io.kotmod.EventId
 import io.kotmod.EventProducer
-import io.kotmod.OptimisticConcurrencyException
 import io.kotmod.PublicDomainEvent
-import io.kotmod.UnexpectedAggregateStateException
 import io.kotmod.contract.PublicEventContract
 import io.kotmod.event.reaction.EventReaction
 import io.kotmod.event.reaction.EventReactionExecutor
@@ -43,40 +42,33 @@ import kotlin.time.Duration
 // Guide: Aggregates and commands
 
 suspend fun cancelOrder(
-    orders: AggregateManager<Order, OrderEvent>,
+    orders: AggregateManager<Order, OrderEvent, OrderCommand, OrderRejection>,
     orderId: AggregateId,
     reason: String,
     requestId: String,
-): Order =
-    try {
-        orders.execute<PendingOrder>(orderId, commandId = CommandId(requestId)) { it.cancel(reason) }
-    } catch (e: UnexpectedAggregateStateException) {
-        throw IllegalStateException("Only pending orders can be cancelled", e)
+): String =
+    when (val result = orders.handle(orderId, CancelOrder(reason), commandId = CommandId(requestId))) {
+        is CommandResult.Accepted -> "Cancelled"
+        is CommandResult.Rejected ->
+            when (result.rejection) {
+                OrderAlreadyShipped -> "Too late: the order has shipped"
+                CancellationReasonMissing -> "Please give a reason"
+                else -> "Can't cancel: ${result.rejection}"
+            }
     }
-
-suspend fun <T> retryOnConflict(
-    attempts: Int = 3,
-    command: suspend () -> T,
-): T {
-    repeat(attempts - 1) {
-        try {
-            return command()
-        } catch (e: OptimisticConcurrencyException) {
-            // Someone else changed the aggregate first: run the command again against the latest state.
-        }
-    }
-    return command()
-}
 
 suspend fun shipAndInvoice(
     jdbc: JdbcContext,
-    orders: AggregateManager<Order, OrderEvent>,
-    invoices: AggregateManager<Order, OrderEvent>,
+    orders: AggregateManager<Order, OrderEvent, OrderCommand, OrderRejection>,
+    invoices: AggregateManager<Order, OrderEvent, OrderCommand, OrderRejection>,
     orderId: AggregateId,
 ) {
     jdbc.transaction {
-        orders.execute<PendingOrder>(orderId) { it.ship() }
-        invoices.create(AggregateId("invoice-${orderId.value}")) { placeOrder("invoice") }
+        // A rejection is a value: throw to roll the whole transaction back.
+        val shipped = orders.handle(orderId, ShipOrder)
+        if (shipped is CommandResult.Rejected) throw IllegalStateException("Can't ship: ${shipped.rejection}")
+        val invoiced = invoices.handle(AggregateId("invoice-${orderId.value}"), PlaceOrder("invoice"))
+        if (invoiced is CommandResult.Rejected) throw IllegalStateException("Can't invoice: ${invoiced.rejection}")
     }
 }
 

@@ -1,203 +1,170 @@
 package io.kotmod
 
+import io.kotmod.jdbc.KotmodTransaction
 import io.kotmod.jdbc.databaseWork
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.serialization.json.Json
 import kotlin.time.toKotlinInstant
 
 /**
  * Runs commands against aggregates of one [AggregateType] whose state is stored by a [Repository].
  *
- * Each command runs in three phases:
- * 1. **Read:** if the command id has already been handled, return the current state without doing
- *    anything else (commands are idempotent). Otherwise load the aggregate's version and state.
- * 2. **Command:** call the app's block, which returns the new state and the events it raised. No
- *    database work happens during this phase.
- * 3. **Write:** in one transaction (the backend's [DomainPersistenceBackend.inTransaction]), advance the
- *    aggregate's version (optimistic concurrency), save the new state, append the events and record the
- *    command as handled.
+ * [handle] is the only way to change an aggregate. Each command runs in three phases:
+ * 1. **Read:** if the command id has already been handled, return the recorded answer (the current state if
+ *    it was accepted, the same rejection if it was rejected). Otherwise load the aggregate's version and state.
+ * 2. **Decide:** [commands] routes the command to a pure function, which accepts it (new state and events) or
+ *    rejects it with one of the aggregate's rejection types. No database work happens in this phase.
+ * 3. **Write:** in one transaction, either advance the aggregate's version (optimistic concurrency), save the
+ *    new state, append the events and record the command as accepted; or record the rejection.
+ *
+ * If the write loses a race with another writer, [handle] starts again from the read, up to
+ * [maxConflictRetries] times, except inside an outer transaction, where the conflict propagates.
  *
  * Events appended here are later picked up by [io.kotmod.outbox.AggregateEventOutbox] and
  * [io.kotmod.contract.PublicEventContract].
  *
  * @param S the aggregate's state type.
  * @param E the aggregate's domain event type.
+ * @param C the aggregate's command type.
+ * @param R the aggregate's rejection type.
  */
-class AggregateManager<S : Any, E : DomainEvent>(
-    @PublishedApi internal val aggregateType: AggregateType,
+class AggregateManager<S : Any, E : DomainEvent, C : Any, R : Any>(
+    private val aggregateType: AggregateType,
     private val repository: Repository<S>,
     private val backend: DomainPersistenceBackend<E>,
+    private val commands: CommandHandlers<S, C, E, R>,
+    private val maxConflictRetries: Int = 5,
 ) {
+    init {
+        require(maxConflictRetries >= 0) { "maxConflictRetries must not be negative" }
+    }
+
     /**
-     * Creates aggregate [id] from the state and events returned by [block].
+     * Handles [command] for aggregate [id] and returns whether it was accepted (with the new state) or rejected
+     * (with the rejection).
      *
-     * If [commandId] has already been handled for [id], the stored state is returned and [block] is not
-     * called. Throws [AggregateAlreadyExistsException] if the aggregate already exists. A random command id
-     * is used when none is given, which makes the call non-idempotent.
-     *
-     * @return the new state.
+     * If [commandId] has already been handled for [id], the recorded answer is returned without deciding again:
+     * the current state if it was accepted, or the same rejection if it was rejected. A random command id is
+     * used when none is given, which makes the call non-idempotent. [correlationId] is stored with every event.
      */
-    suspend fun create(
+    suspend fun handle(
         id: AggregateId,
+        command: C,
         commandId: CommandId? = null,
         correlationId: CorrelationId? = null,
-        block: suspend () -> Pair<S, List<E>>,
-    ): S {
+    ): CommandResult<S, R> {
         val resolvedCommandId = commandId ?: CommandId(randomId())
+        val retries = if (inOuterTransaction()) 0 else maxConflictRetries
+        var attempt = 0
+        while (true) {
+            try {
+                return handleOnce(id, command, resolvedCommandId, correlationId)
+            } catch (e: DddException) {
+                if (!e.isConflict() || attempt >= retries) throw e
+                attempt++
+            }
+        }
+    }
 
-        // Phase 1: Read — dedup check
-        val dedupResult: S? =
+    private suspend fun inOuterTransaction(): Boolean =
+        currentCoroutineContext()[KotmodTransaction] != null || backend.isInTransaction()
+
+    private fun DddException.isConflict(): Boolean =
+        this is OptimisticConcurrencyException ||
+            this is AggregateAlreadyExistsException ||
+            this is CommandAlreadyRecordedException
+
+    private suspend fun handleOnce(
+        id: AggregateId,
+        command: C,
+        commandId: CommandId,
+        correlationId: CorrelationId?,
+    ): CommandResult<S, R> {
+        // Phase 1: Read — the recorded answer, or the current version and state
+        val read =
             databaseWork(backend::isInTransaction) {
-                if (backend.findHandledCommand(aggregateType, id, resolvedCommandId) != null) {
-                    repository.get(id) ?: throw AggregateNotFoundException(
-                        aggregateType,
-                        id
-                    )
-                } else {
-                    null
+                when (val handled = backend.findHandledCommand(aggregateType, id, commandId)) {
+                    HandledCommand.Accepted -> Read.Answered<S, R>(CommandResult.Accepted(requireState(id)))
+                    is HandledCommand.Rejected -> Read.Answered<S, R>(CommandResult.Rejected(decodeRejection(id, commandId, handled)))
+                    null -> {
+                        val meta = backend.loadMeta(aggregateType, id)
+                        Read.Undecided<S, R>(meta, if (meta == null) null else requireState(id))
+                    }
                 }
             }
-        if (dedupResult != null) return dedupResult
+        val undecided =
+            when (read) {
+                is Read.Answered -> return read.result
+                is Read.Undecided -> read
+            }
 
-        // Phase 2: Command — invoke user lambda
-        val (newState, events) = block()
+        // Phase 2: Decide — pure, no database work
+        val outcome = commands.handlerFor(command).decide(undecided.state)
 
         // Phase 3: Write — tight transaction
         databaseWork(backend::isInTransaction) {
             backend.inTransaction {
-                val lastSequence = backend.saveMeta(aggregateType, id, expectedVersion = null, eventCount = events.size)
-                repository.save(id, newState)
-                if (events.isNotEmpty()) {
-                    backend.appendEvents(
-                        wrapPending(
-                            id = id,
-                            causationId = resolvedCommandId,
-                            correlationId = correlationId,
-                            events = events,
-                            firstSequence = lastSequence - events.size + 1,
-                        ),
-                    )
-                }
-                backend.recordCommandHandled(aggregateType, id, resolvedCommandId)
-            }
-        }
-        return newState
-    }
-
-    /**
-     * Applies a command to existing aggregate [id]: [block] receives the current state and returns the new
-     * state and the events it raised.
-     *
-     * If [commandId] has already been handled for [id], the stored state is returned and [block] is not
-     * called. Throws [AggregateNotFoundException] if the aggregate does not exist and
-     * [OptimisticConcurrencyException] if it changed concurrently.
-     *
-     * @return the new state.
-     */
-    suspend fun execute(
-        id: AggregateId,
-        commandId: CommandId? = null,
-        correlationId: CorrelationId? = null,
-        block: suspend (S) -> Pair<S, List<E>>,
-    ): S = executeCore(id, commandId, correlationId) { current -> block(current) }
-
-    /**
-     * Like [execute], but only applies the command when the current state is of subtype [T], throwing
-     * [UnexpectedAggregateStateException] otherwise. Useful for state machines, e.g. a command that only
-     * applies to a pending order.
-     */
-    @JvmName("executeNarrowed")
-    suspend inline fun <reified T : S> execute(
-        id: AggregateId,
-        commandId: CommandId? = null,
-        correlationId: CorrelationId? = null,
-        crossinline block: suspend (T) -> Pair<S, List<E>>,
-    ): S =
-        executeCore(id, commandId, correlationId) { current ->
-            val narrowed =
-                current as? T
-                    ?: throw UnexpectedAggregateStateException(
-                        aggregateType = aggregateType,
-                        aggregateId = id,
-                        expected = T::class.simpleName ?: "?",
-                        actual = current::class.simpleName ?: "?",
-                    )
-            block(narrowed)
-        }
-
-    @PublishedApi
-    internal suspend fun executeCore(
-        id: AggregateId,
-        commandId: CommandId?,
-        correlationId: CorrelationId?,
-        block: suspend (S) -> Pair<S, List<E>>,
-    ): S {
-        val resolvedCommandId = commandId ?: CommandId(randomId())
-
-        // Phase 1: Read — dedup check, load meta, load state
-        val readResult =
-            databaseWork(backend::isInTransaction) {
-                if (backend.findHandledCommand(aggregateType, id, resolvedCommandId) != null) {
-                    val current = repository.get(id) ?: throw AggregateNotFoundException(
-                        aggregateType,
-                        id
-                    )
-                    return@databaseWork ReadResult.Dedup(current)
-                }
-                val meta =
-                    backend.loadMeta(aggregateType, id)
-                        ?: throw AggregateNotFoundException(aggregateType, id)
-                val current =
-                    repository.get(id)
-                        ?: throw AggregateNotFoundException(aggregateType, id)
-                ReadResult.Proceed(meta, current)
-            }
-
-        when (readResult) {
-            is ReadResult.Dedup<S> -> return readResult.state
-            is ReadResult.Proceed<S> -> {
-                val meta = readResult.meta
-                val currentState = readResult.state
-
-                // Phase 2: Command — invoke user lambda
-                val (newState, events) = block(currentState)
-
-                // Phase 3: Write — tight transaction
-                databaseWork(backend::isInTransaction) {
-                    backend.inTransaction {
-                        val lastSequence = backend.saveMeta(aggregateType, id, expectedVersion = meta.version, eventCount = events.size)
-                        repository.save(id, newState)
-                        if (events.isNotEmpty()) {
+                when (outcome) {
+                    is Outcome.Accept -> {
+                        val lastSequence =
+                            backend.saveMeta(aggregateType, id, expectedVersion = undecided.meta?.version, eventCount = outcome.events.size)
+                        repository.save(id, outcome.state)
+                        if (outcome.events.isNotEmpty()) {
                             backend.appendEvents(
                                 wrapPending(
                                     id = id,
-                                    causationId = resolvedCommandId,
+                                    causationId = commandId,
                                     correlationId = correlationId,
-                                    events = events,
-                                    firstSequence = lastSequence - events.size + 1,
+                                    events = outcome.events,
+                                    firstSequence = lastSequence - outcome.events.size + 1,
                                 ),
                             )
                         }
-                        backend.recordCommandHandled(aggregateType, id, resolvedCommandId)
+                        backend.recordCommandHandled(aggregateType, id, commandId)
                     }
+                    is Outcome.Reject ->
+                        backend.recordCommandRejected(
+                            aggregateType,
+                            id,
+                            commandId,
+                            rejectionType = outcome.rejection::class.java.name,
+                            payload = Json.encodeToString(commands.rejectionSerializer, outcome.rejection),
+                        )
                 }
-                return newState
             }
+        }
+        return when (outcome) {
+            is Outcome.Accept -> CommandResult.Accepted(outcome.state)
+            is Outcome.Reject -> CommandResult.Rejected(outcome.rejection)
         }
     }
 
-    @PublishedApi
-    internal sealed class ReadResult<S> {
-        class Dedup<S>(
-            val state: S,
-        ) : ReadResult<S>()
+    private fun requireState(id: AggregateId): S = repository.get(id) ?: throw AggregateNotFoundException(aggregateType, id)
 
-        class Proceed<S>(
-            val meta: AggregateMeta,
-            val state: S,
-        ) : ReadResult<S>()
+    private fun decodeRejection(
+        id: AggregateId,
+        commandId: CommandId,
+        handled: HandledCommand.Rejected,
+    ): R =
+        try {
+            Json.decodeFromString(commands.rejectionSerializer, handled.payload)
+        } catch (e: IllegalArgumentException) {
+            // kotlinx.serialization's SerializationException is an IllegalArgumentException.
+            throw RejectionDeserializationException(aggregateType, id, commandId, handled.type, e)
+        }
+
+    private sealed interface Read<S, R> {
+        class Answered<S, R>(
+            val result: CommandResult<S, R>,
+        ) : Read<S, R>
+
+        class Undecided<S, R>(
+            val meta: AggregateMeta?,
+            val state: S?,
+        ) : Read<S, R>
     }
 
-    @PublishedApi
-    internal fun wrapPending(
+    private fun wrapPending(
         id: AggregateId,
         causationId: CommandId,
         correlationId: CorrelationId?,
