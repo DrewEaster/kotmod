@@ -36,6 +36,9 @@ class PostgresOffsetManager(
      * Returns the position last saved for [consumerName]. If it has never saved one, the position chosen by
      * [startFrom] is saved straight away and returned, so every node and every restart agrees on it. A saved
      * position always wins over [startFrom].
+     *
+     * The first call fixes the starting position, so calling this just to observe a consumer from outside can set
+     * where that consumer starts. To observe without that risk, pass the same [startFrom] the consumer uses.
      */
     fun getPosition(
         consumerName: String,

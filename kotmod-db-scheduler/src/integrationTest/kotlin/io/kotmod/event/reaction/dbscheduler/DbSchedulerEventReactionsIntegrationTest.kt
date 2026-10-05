@@ -306,7 +306,7 @@ class DbSchedulerEventReactionsIntegrationTest : IntegrationTest() {
                 setOf(TestTrigger("charge-o-0"), TestTrigger("charge-o-1")),
                 recorder.attempts.map { it.trigger }.toSet(),
             )
-            assertEquals(2L, offsets.getPosition("order-outbox").globalOffset)
+            assertEquals(2L, offsets.getPosition("order-outbox", StartFrom.Beginning).globalOffset)
             assertTrue(scheduler.getScheduledExecutionsForTask("order-reactions", String::class.java).isEmpty())
         }
 

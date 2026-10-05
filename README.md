@@ -747,11 +747,12 @@ runs in a transaction opened by its backend's `JdbcContext`; `jdbc.inTransaction
 contracts. `PostgresOffsetManager` stores how far each of them has read; give every poller its own
 consumer name.
 
-**Starting positions.** A consumer with no saved position starts at the head of the event log, so deploying
-a new outbox, contract or process manager never replays history. Events in a transaction still open at that
-moment are not skipped. Pass `startFrom = StartFrom.Beginning` to `getPosition` for a consumer that must see
-history, such as a new projection. An existing consumer keeps its saved position; to reset one deliberately,
-save a position yourself with `savePosition`.
+**Starting positions.** A consumer with no saved position starts from the head of the event log as of its first
+read of its position (its first poll as leader), not when it is constructed, so deploying a new outbox,
+contract or process manager does not replay history. It may also see a few events committed just before, while
+an older transaction was still open, but never history from before that. Pass `startFrom = StartFrom.Beginning`
+to `getPosition` for a consumer that must see history, such as a new projection. An existing consumer keeps its
+saved position; to reset one deliberately, save a position yourself with `savePosition`.
 
 #### Using SQLDelight
 
@@ -1223,9 +1224,10 @@ manager, not saga.)
 
 The example below is a dispatch deadline: when an order is placed, wait two days; if it still hasn't shipped,
 cancel it and record that the deadline was missed. If the customer cancels first, the deadline is abandoned.
-A new process manager starts at the head of the event log and sees only future events; to cover orders
-already in flight, pass `startFrom = StartFrom.Beginning` when it asks `PostgresOffsetManager` for its
-position.
+A new process manager starts from the head of the event log as of its first poll as leader, so it sees events
+written from then on (plus any committed just before by a transaction that was still open), not earlier ones;
+to cover orders already in flight, pass `startFrom = StartFrom.Beginning` when it asks `PostgresOffsetManager`
+for its position.
 
 #### Inputs: the anti-corruption layer
 

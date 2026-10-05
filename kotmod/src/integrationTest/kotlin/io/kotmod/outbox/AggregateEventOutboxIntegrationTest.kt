@@ -109,7 +109,7 @@ class AggregateEventOutboxIntegrationTest : IntegrationTest() {
             outbox.start()
             try {
                 withTimeout(5.seconds) {
-                    while (offsets.getPosition(CONSUMER).globalOffset < 2) delay(50)
+                    while (offsets.getPosition(CONSUMER, StartFrom.Beginning).globalOffset < 2) delay(50)
                 }
             } finally {
                 outbox.stop()
@@ -122,7 +122,7 @@ class AggregateEventOutboxIntegrationTest : IntegrationTest() {
                 ),
                 captured.toList(),
             )
-            assertEquals(2L, offsets.getPosition(CONSUMER).globalOffset)
+            assertEquals(2L, offsets.getPosition(CONSUMER, StartFrom.Beginning).globalOffset)
         }
 
     @Test
@@ -138,7 +138,7 @@ class AggregateEventOutboxIntegrationTest : IntegrationTest() {
             outbox.start()
             try {
                 withTimeout(5.seconds) {
-                    while (offsets.getPosition(CONSUMER).globalOffset < 2) delay(50)
+                    while (offsets.getPosition(CONSUMER, StartFrom.Beginning).globalOffset < 2) delay(50)
                 }
             } finally {
                 outbox.stop()
