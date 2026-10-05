@@ -1360,6 +1360,74 @@ data object Missed : DispatchDeadline {
 cancel one: a state that has moved on simply ignores it, as `Dispatched` does with `DeadlinePassed` above. A
 timeout delivered early waits until it is due.
 
+#### When timeouts go stale
+
+A timeout is never cancelled, so when one arrives the state decides whether it still means anything.
+
+Usually the state has moved on. A state that no longer waits for the timeout ignores it, as `Dispatched` and
+`Abandoned` ignore `DeadlinePassed` above. There is nothing to do beyond writing each state's `when`.
+
+The harder case is a state that armed another timeout. Say an invoice's due date can be moved: the process
+schedules `PaymentOverdue` for the new date, but the one for the old date is still queued. Both arrive while the
+process is in `AwaitingPayment`, and the state can't tell them apart unless they say what they are about. So a
+timeout carries what it is about, and the state remembers which one it is waiting for. A timeout that doesn't
+match is stale and is ignored. This is cancellation without cancelling.
+
+```kotlin
+@Serializable
+sealed interface PaymentReminderInput
+
+@Serializable
+data class InvoiceIssued(
+    val invoiceId: String,
+    val dueAt: Instant,
+) : PaymentReminderInput
+
+@Serializable
+data class DueDateMoved(
+    val until: Instant,
+) : PaymentReminderInput
+
+@Serializable
+data object InvoicePaid : PaymentReminderInput
+
+@Serializable
+data class PaymentOverdue(
+    val dueAt: Instant,
+) : PaymentReminderInput
+```
+
+```kotlin
+data class AwaitingPayment(
+    val invoiceId: String,
+    val dueAt: Instant,
+) : PaymentReminder {
+    override suspend fun handle(input: PaymentReminderInput): PaymentReminderOutcome =
+        when (input) {
+            is DueDateMoved ->
+                transition(
+                    copy(dueAt = input.until),
+                    schedule = listOf(schedule(PaymentOverdue(input.until), at = input.until)),
+                )
+            is PaymentOverdue ->
+                if (input.dueAt != dueAt) {
+                    ignore()
+                } else {
+                    transition(Overdue, events = listOf(InvoiceWentOverdue(invoiceId)))
+                }
+            InvoicePaid -> transition(Paid)
+            is InvoiceIssued -> ignore()
+        }
+}
+```
+
+If the due date moves from the 10th to the 20th, the timeout for the 10th arrives with `dueAt` of the 10th, which
+is not the state's `dueAt`, and is ignored. The one for the 20th matches and moves the invoice to `Overdue`.
+
+kotmod doesn't generate timeout ids for you. A decision can run again on a conflict retry, and a generated id
+would be different each time, so the retry would schedule a different timeout. Take the value that identifies a
+timeout from the domain instead: a due time, or a sequence number you keep in state.
+
 #### Commands to other aggregates
 
 `Orders.command(id, command)` only accepts commands of that aggregate kind, so a wrong command doesn't compile.

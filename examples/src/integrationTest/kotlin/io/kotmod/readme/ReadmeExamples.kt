@@ -457,3 +457,82 @@ fun startDispatchDeadlines(
     scheduler.start()
     return scheduler
 }
+
+// Guide: When timeouts go stale
+
+@Serializable
+sealed interface PaymentReminderInput
+
+@Serializable
+data class InvoiceIssued(
+    val invoiceId: String,
+    val dueAt: Instant,
+) : PaymentReminderInput
+
+@Serializable
+data class DueDateMoved(
+    val until: Instant,
+) : PaymentReminderInput
+
+@Serializable
+data object InvoicePaid : PaymentReminderInput
+
+@Serializable
+data class PaymentOverdue(
+    val dueAt: Instant,
+) : PaymentReminderInput
+
+@Serializable
+sealed interface PaymentReminderEvent : DomainEvent
+
+@Serializable
+data class InvoiceWentOverdue(
+    val invoiceId: String,
+) : PaymentReminderEvent
+
+typealias PaymentReminderOutcome = ProcessOutcome<PaymentReminder, PaymentReminderEvent, PaymentReminderInput>
+
+sealed interface PaymentReminder : ProcessState<PaymentReminder, PaymentReminderInput, PaymentReminderEvent>
+
+object NoPaymentReminder : ProcessInitialState<PaymentReminder, PaymentReminderInput, PaymentReminderEvent> {
+    override suspend fun handle(input: PaymentReminderInput): PaymentReminderOutcome =
+        when (input) {
+            is InvoiceIssued ->
+                transition(
+                    AwaitingPayment(input.invoiceId, input.dueAt),
+                    schedule = listOf(schedule(PaymentOverdue(input.dueAt), at = input.dueAt)),
+                )
+            is DueDateMoved, InvoicePaid, is PaymentOverdue -> ignore()
+        }
+}
+
+data class AwaitingPayment(
+    val invoiceId: String,
+    val dueAt: Instant,
+) : PaymentReminder {
+    override suspend fun handle(input: PaymentReminderInput): PaymentReminderOutcome =
+        when (input) {
+            is DueDateMoved ->
+                transition(
+                    copy(dueAt = input.until),
+                    schedule = listOf(schedule(PaymentOverdue(input.until), at = input.until)),
+                )
+            is PaymentOverdue ->
+                if (input.dueAt != dueAt) {
+                    ignore()
+                } else {
+                    transition(Overdue, events = listOf(InvoiceWentOverdue(invoiceId)))
+                }
+            InvoicePaid -> transition(Paid)
+            is InvoiceIssued -> ignore()
+        }
+}
+
+data object Paid : PaymentReminder {
+    // Nothing left to wait for: any timeout that still arrives is stale.
+    override suspend fun handle(input: PaymentReminderInput): PaymentReminderOutcome = ignore()
+}
+
+data object Overdue : PaymentReminder {
+    override suspend fun handle(input: PaymentReminderInput): PaymentReminderOutcome = ignore()
+}
