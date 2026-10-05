@@ -186,6 +186,12 @@ data class SendOrderConfirmation(
     override val timeout: Duration? = null,
 ) : OrderNotification
 
+@Serializable
+data class SendReviewReminder(
+    val orderId: String,
+    override val timeout: Duration? = null,
+) : OrderNotification
+
 object OrderNotificationSerializer : EventReactionTriggerSerializer<OrderNotification> {
     override suspend fun serialize(trigger: OrderNotification): String = Json.encodeToString(OrderNotification.serializer(), trigger)
 

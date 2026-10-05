@@ -41,6 +41,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import java.sql.DriverManager
 import javax.sql.DataSource
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.days
 
 // Guide: Aggregates and commands
 
@@ -197,6 +198,35 @@ fun orderedOutbox(
         savePosition = { offsets.savePosition("order-notifications", it) },
         isLeader = { true },
         ordering = ReactionOrdering.PerAggregate(onGiveUp = OnGiveUp.BlockAggregate),
+    )
+
+// Guide: Delayed reactions
+
+fun reviewReminderOutbox(
+    jdbc: JdbcContext,
+    serialization: DataSerializationContext<OrderEvent>,
+    offsets: PostgresOffsetManager,
+    executor: EventReactionExecutor<OrderNotification, *>,
+): AggregateEventOutbox<OrderNotification> =
+    AggregateEventOutbox(
+        backend = PostgresDomainPollingBackend(jdbc),
+        executor = executor,
+        eventToReactions = { event ->
+            when (serialization.deserialize(event.serialized)) {
+                is OrderShipped ->
+                    listOf(
+                        EventReaction(
+                            id = EventReactionId("review-reminder-${event.metadata.eventId.value}"),
+                            trigger = SendReviewReminder(orderId = event.metadata.aggregateId.value),
+                            notBefore = event.metadata.timestamp + 7.days,
+                        ),
+                    )
+                else -> emptyList()
+            }
+        },
+        getPosition = { offsets.getPosition("review-reminders") },
+        savePosition = { offsets.savePosition("review-reminders", it) },
+        isLeader = { true },
     )
 
 // Guide: Publishing events to other contexts

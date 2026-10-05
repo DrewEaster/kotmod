@@ -361,6 +361,12 @@ data class SendOrderConfirmation(
     override val timeout: Duration? = null,
 ) : OrderNotification
 
+@Serializable
+data class SendReviewReminder(
+    val orderId: String,
+    override val timeout: Duration? = null,
+) : OrderNotification
+
 object OrderNotificationSerializer : EventReactionTriggerSerializer<OrderNotification> {
     override suspend fun serialize(trigger: OrderNotification): String = Json.encodeToString(OrderNotification.serializer(), trigger)
 
@@ -400,6 +406,7 @@ val executor =
         execute = { _, _, trigger, _, _ ->
             when (trigger) {
                 is SendOrderConfirmation -> sendConfirmation(trigger.orderId)
+                is SendReviewReminder -> println("Asking for a review of order ${trigger.orderId}")
             }
             EventReactionExecutionResult.EventReactionExecutionCompleted
         },
@@ -777,6 +784,47 @@ transactions.
 `BackoffStrategy` gives exponential delays — 1s, 2s, 4s… up to a cap (10 minutes by default) — and is
 handy in your retry handlers, as the quickstart shows.
 
+#### Delayed reactions
+
+Give a reaction a `notBefore` and it doesn't run before that time. For example, ask for a review a week
+after an order ships:
+
+```kotlin
+fun reviewReminderOutbox(
+    jdbc: JdbcContext,
+    serialization: DataSerializationContext<OrderEvent>,
+    offsets: PostgresOffsetManager,
+    executor: EventReactionExecutor<OrderNotification, *>,
+): AggregateEventOutbox<OrderNotification> =
+    AggregateEventOutbox(
+        backend = PostgresDomainPollingBackend(jdbc),
+        executor = executor,
+        eventToReactions = { event ->
+            when (serialization.deserialize(event.serialized)) {
+                is OrderShipped ->
+                    listOf(
+                        EventReaction(
+                            id = EventReactionId("review-reminder-${event.metadata.eventId.value}"),
+                            trigger = SendReviewReminder(orderId = event.metadata.aggregateId.value),
+                            notBefore = event.metadata.timestamp + 7.days,
+                        ),
+                    )
+                else -> emptyList()
+            }
+        },
+        getPosition = { offsets.getPosition("review-reminders") },
+        savePosition = { offsets.savePosition("review-reminders", it) },
+        isLeader = { true },
+    )
+```
+
+- With db-scheduler, a delayed reaction waits in `scheduled_tasks` until it is due, at no extra cost.
+- If a queue delivers a reaction early, the executor puts it back until it is due. It doesn't run, and it
+  doesn't count as a retry.
+- Delayed reactions can't be ordered: a delayed reaction would hold back every later reaction of its
+  aggregate. An ordered outbox or subscription that returns one fails with an `IllegalArgumentException`
+  naming it.
+
 The executor works with any queue: it dispatches through an `EventReactionTriggerSink` and receives
 reactions from an `EventReactionTriggerSource`. kotmod ships a durable implementation on db-scheduler
 (next section); to use something else, implement the two interfaces yourself
@@ -955,15 +1003,18 @@ CREATE INDEX scheduled_tasks_ordered_idx ON scheduled_tasks (task_name, task_ins
 db-scheduler is a convenient default, not a requirement. An `EventReactionExecutor` only needs a queue
 that implements two interfaces from the core `kotmod` module:
 
-- **`EventReactionTriggerSink`** — `publish(id, trigger, ordering)` queues a reaction. Publishing an id
-  that is already queued should not queue it twice; if your queue can't guarantee that, rely on your
-  reactions being idempotent (they must be anyway, since delivery is at-least-once).
+- **`EventReactionTriggerSink`** — `publish(id, trigger, ordering, notBefore)` queues a reaction. Publishing
+  an id that is already queued should not queue it twice; if your queue can't guarantee that, rely on your
+  reactions being idempotent (they must be anyway, since delivery is at-least-once). Carry `notBefore` with
+  the message, and if your queue can delay delivery, don't deliver before it.
 - **`EventReactionTriggerSource`** — `subscribe(block)` starts delivering queued reactions. For each
-  delivery, call `block` with the reaction id, a fresh execution id, the trigger and the retry count, and
-  act on what it returns:
+  delivery, call `block` with the reaction id, a fresh execution id, the trigger, the retry count and the
+  reaction's `notBefore`, and act on what it returns:
   - `ReactionOutcome.Finished` — the reaction is done (succeeded, cancelled or gave up): remove it from
     the queue.
-  - `ReactionOutcome.Retry(delay)` — deliver it again after about `delay`.
+  - `ReactionOutcome.Retry(delay)` — deliver it again after about `delay`, counting a retry.
+  - `ReactionOutcome.Wait(delay)` — it isn't due yet: deliver it again after about `delay` without
+    counting a retry.
   - An exception — deliver it again later.
 
 Everything else — timeouts, retry decisions, `onCompletion`, the outbox and public contracts — works the
@@ -987,19 +1038,22 @@ class PubSubReactions<T : EventReactionTrigger>(
         id: EventReactionId,
         trigger: T,
         ordering: DispatchOrdering?,
+        notBefore: Instant?,
     ) {
         val message =
             PubsubMessage.newBuilder()
                 .setData(ByteString.copyFromUtf8(serializer.serialize(trigger)))
                 .putAttributes("reactionId", id.value)
                 .apply { if (ordering != null) setOrderingKey(ordering.key) }
+                // Carry notBefore with the message; Pub/Sub can't hold it back (see "Delays on Google Cloud").
+                .apply { if (notBefore != null) putAttributes("notBefore", notBefore.toString()) }
                 .build()
         // Wait for Pub/Sub to accept it: the outbox only moves on once publish returns.
         withContext(Dispatchers.IO) { publisher.publish(message).get() }
     }
 
     override fun subscribe(
-        block: suspend (EventReactionId, EventReactionExecutionId, T, RetryCount) -> ReactionOutcome,
+        block: suspend (EventReactionId, EventReactionExecutionId, T, RetryCount, Instant?) -> ReactionOutcome,
     ): Cancellable {
         val receiver =
             MessageReceiver { message, reply ->
@@ -1012,7 +1066,10 @@ class PubSubReactions<T : EventReactionTrigger>(
                                 EventReactionExecutionId(UUID.randomUUID().toString()),
                                 serializer.deserialize(message.data.toStringUtf8()),
                                 // Delivery attempts are only counted when the subscription has a dead-letter policy.
+                                // It also counts redeliveries after Wait, which this sketch can't tell apart,
+                                // so allow for waits in the dead-letter policy's maximum delivery attempts.
                                 (Subscriber.getDeliveryAttempt(message) ?: 1) - 1,
+                                message.attributesMap["notBefore"]?.let { Instant.parse(it) },
                             )
                         } catch (e: Exception) {
                             ReactionOutcome.Retry(Duration.ZERO)
@@ -1020,7 +1077,8 @@ class PubSubReactions<T : EventReactionTrigger>(
                     }
                 when (outcome) {
                     is ReactionOutcome.Finished -> reply.ack()
-                    is ReactionOutcome.Retry -> reply.nack()
+                    // Wait is a nack too, but without counting a retry of our own (there is no counter here).
+                    is ReactionOutcome.Retry, is ReactionOutcome.Wait -> reply.nack()
                 }
             }
         val subscriber = Subscriber.newBuilder(subscription, receiver).build()
@@ -1058,6 +1116,11 @@ How Pub/Sub differs from db-scheduler:
   `block` runs, up to its maximum extension period (one hour by default).
 - **No leader election is needed for the queue.** As with db-scheduler, every node can run a subscriber;
   only the outbox and public contracts need [one active poller](#running-in-production).
+
+**Delays on Google Cloud.** Pub/Sub can't hold a message back until a time. A sink can instead hand a
+delayed reaction to **Cloud Tasks** with a schedule time, and have the task publish it to Pub/Sub when it's
+due. Cloud Tasks limits how far ahead a task can be scheduled (about 30 days); for longer delays, the
+executor's check covers you, because a reaction that arrives early is simply scheduled again.
 
 ### Publishing events to other contexts
 
@@ -1292,8 +1355,8 @@ failure in a specific spot to show up.
    implement `AggregateState` and decide each command in `handle`, returning `accept(...)` or `reject(...)`.
    Then add an `InitialState` object for commands on an aggregate that doesn't exist yet, as in
    [the quickstart](#2-define-state-events-commands-and-rejections).
-3. Pass the `InitialState` object as `initial`, and your rejection type's serializer as `rejectionSerializer`, to
-   `AggregateManager`, and replace `create { }` and `execute<T> { }` calls with `handle(id, command)`.
+3. Declare an `AggregateKind` for the aggregate, as `Orders` in [the quickstart](#3-wire-up-persistence), and
+   build `AggregateManager` from it and the `InitialState` object, and replace `create { }` and `execute<T> { }` calls with `handle(id, command)`.
    `AggregateManager`'s type arguments are now `<S, C, E, R>` (state, command, event, rejection), e.g.
    `AggregateManager<Order, OrderCommand, OrderEvent, OrderRejection>` where 0.1.0 had
    `AggregateManager<Order, OrderEvent>`.
@@ -1302,6 +1365,9 @@ failure in a specific spot to show up.
 5. If you implemented `DomainPersistenceBackend` yourself, replace `wasCommandHandled` with
    `findHandledCommand`, add `recordCommandRejected`, and throw `CommandAlreadyRecordedException` when a
    command id is recorded twice.
+6. If you implemented your own queue, add the `notBefore` parameter to your sink's `publish` and carry it
+   to delivery, pass it to `block` as the fifth argument, and handle `ReactionOutcome.Wait` by delivering
+   again after the delay without counting a retry.
 
 ## Status and contributing
 

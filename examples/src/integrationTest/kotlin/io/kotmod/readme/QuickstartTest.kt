@@ -94,6 +94,7 @@ class QuickstartTest : IntegrationTest() {
                     execute = { _, _, trigger, _, _ ->
                         when (trigger) {
                             is SendOrderConfirmation -> sendConfirmation(trigger.orderId)
+                            is SendReviewReminder -> println("Asking for a review of order ${trigger.orderId}")
                         }
                         EventReactionExecutionResult.EventReactionExecutionCompleted
                     },
