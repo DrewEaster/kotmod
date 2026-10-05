@@ -242,10 +242,8 @@ data class CancelledOrder(
 
 ### 3. Wire up persistence
 
-Given a `javax.sql.DataSource` for your database (for example from HikariCP), create a `JdbcContext` — how
-kotmod reaches the database and runs transactions — tell kotmod how to serialize your events, name the aggregate with a **kind**, and create an `AggregateManager` for orders:
-
-An `AggregateKind` names the aggregate type and says how its commands and rejections are serialized:
+First name the aggregate. An `AggregateKind` names the aggregate type and says how its commands and
+rejections are serialized:
 
 ```kotlin
 object Orders : AggregateKind<OrderCommand, OrderRejection>(
@@ -254,6 +252,10 @@ object Orders : AggregateKind<OrderCommand, OrderRejection>(
     rejectionSerializer = OrderRejection.serializer(),
 )
 ```
+
+Then, given a `javax.sql.DataSource` for your database (for example from HikariCP), create a `JdbcContext` —
+how kotmod reaches the database and runs transactions — tell kotmod how to serialize your events, and create an
+`AggregateManager` for orders from the kind:
 
 ```kotlin
 val jdbc = DataSourceJdbcContext(dataSource)
