@@ -28,8 +28,16 @@ class ReactionTaskDataTest {
     }
 
     @Test
-    fun `notBefore round-trips`() {
-        val data = ReactionTaskData(trigger = "t", retryCount = 0, notBeforeEpochMillis = 1_760_000_000_000)
+    fun `notBefore round-trips with sub-millisecond precision`() {
+        val notBefore = kotlin.time.Instant.fromEpochSeconds(1_760_000_000, 123_456_789)
+        val data = ReactionTaskData(trigger = "t", retryCount = 0, notBefore = notBefore.toString())
+        val decoded = ReactionTaskData.decode(data.encode())
+        assertEquals(notBefore, kotlin.time.Instant.parse(decoded.notBefore!!))
+    }
+
+    @Test
+    fun `notBefore string round-trips`() {
+        val data = ReactionTaskData(trigger = "t", retryCount = 0, notBefore = "2026-10-10T09:00:00.123456789Z")
         assertEquals(data, ReactionTaskData.decode(data.encode()))
     }
 }

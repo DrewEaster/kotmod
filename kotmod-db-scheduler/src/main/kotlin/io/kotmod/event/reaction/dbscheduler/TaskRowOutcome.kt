@@ -32,8 +32,9 @@ internal sealed interface TaskRowOutcome {
 
 /**
  * Removes the row if the reaction finished, reschedules it after the requested delay with the retry count
- * incremented for a retry, or unchanged for a wait. An ordered reaction that gave up with [OnGiveUp.BlockAggregate] is instead parked and flagged blocked.
- * Either way the reaction ran, so its wait count is reset.
+ * incremented for a retry, or unchanged for a wait. An ordered reaction that gave up with
+ * [OnGiveUp.BlockAggregate] is instead parked and flagged blocked. After a retry or a finish the reaction ran,
+ * so its wait count is reset; after a wait it is left unchanged.
  */
 internal fun outcomeAfterExecution(
     result: ReactionOutcome,

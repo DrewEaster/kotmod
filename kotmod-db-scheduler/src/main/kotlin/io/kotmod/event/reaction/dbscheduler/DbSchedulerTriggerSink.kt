@@ -38,7 +38,13 @@ internal class DbSchedulerTriggerSink<T : EventReactionTrigger>(
         }
         val stamp = ordering?.let { OrderingStamp(it.key, it.sequence, it.ordinal, it.onGiveUp.name, id.value) }
         val instanceId = stamp?.let { orderedInstanceId(it.key, it.sequence, it.ordinal, id.value) } ?: id.value
-        val taskData = ReactionTaskData(trigger = triggerSerializer.serialize(trigger), retryCount = 0, ordering = stamp, notBeforeEpochMillis = notBefore?.toEpochMilliseconds()).encode()
+        val taskData =
+            ReactionTaskData(
+                trigger = triggerSerializer.serialize(trigger),
+                retryCount = 0,
+                ordering = stamp,
+                notBefore = notBefore?.toString(),
+            ).encode()
         val scheduled =
             withContext(Dispatchers.IO) {
                 client.scheduleIfNotExists(TaskInstance(taskName, instanceId, taskData), notBefore?.toJavaInstant() ?: clock())

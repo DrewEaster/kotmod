@@ -212,16 +212,20 @@ fun reviewReminderOutbox(
         backend = PostgresDomainPollingBackend(jdbc),
         executor = executor,
         eventToReactions = { event ->
-            when (serialization.deserialize(event.serialized)) {
-                is OrderShipped ->
-                    listOf(
-                        EventReaction(
-                            id = EventReactionId("review-reminder-${event.metadata.eventId.value}"),
-                            trigger = SendReviewReminder(orderId = event.metadata.aggregateId.value),
-                            notBefore = event.metadata.timestamp + 7.days,
-                        ),
-                    )
-                else -> emptyList()
+            if (event.metadata.aggregateType != Orders.type) {
+                emptyList()
+            } else {
+                when (serialization.deserialize(event.serialized)) {
+                    is OrderShipped ->
+                        listOf(
+                            EventReaction(
+                                id = EventReactionId("review-reminder-${event.metadata.eventId.value}"),
+                                trigger = SendReviewReminder(orderId = event.metadata.aggregateId.value),
+                                notBefore = event.metadata.timestamp + 7.days,
+                            ),
+                        )
+                    else -> emptyList()
+                }
             }
         },
         getPosition = { offsets.getPosition("review-reminders") },

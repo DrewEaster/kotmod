@@ -14,9 +14,10 @@ internal data class OrderingStamp(
 )
 
 /**
- * The data stored with each db-scheduler task instance, encoded as a JSON string: the serialized trigger, its
- * retry count, for delayed reactions the earliest time they may run and, for ordered reactions, the ordering stamp, whether it is parked blocking its aggregate, and how
- * many times in a row it has waited for an earlier reaction (which backs off its rechecks).
+ * The data stored with each db-scheduler task instance, encoded as a JSON string: the serialized trigger and its
+ * retry count. A delayed reaction also stores [notBefore], the earliest time it may run, at full precision as an
+ * ISO-8601 string. An ordered reaction also stores its ordering stamp, whether it is parked blocking its
+ * aggregate, and how many times in a row it has waited for an earlier reaction (which backs off its rechecks).
  */
 @Serializable
 internal data class ReactionTaskData(
@@ -25,7 +26,7 @@ internal data class ReactionTaskData(
     val ordering: OrderingStamp? = null,
     val blocked: Boolean = false,
     val waits: Int = 0,
-    val notBeforeEpochMillis: Long? = null,
+    val notBefore: String? = null,
 ) {
     fun encode(): String = Json.encodeToString(serializer(), this)
 

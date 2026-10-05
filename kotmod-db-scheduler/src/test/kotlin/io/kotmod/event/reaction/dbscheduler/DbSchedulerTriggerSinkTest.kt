@@ -96,12 +96,12 @@ class DbSchedulerTriggerSinkTest {
     @Test
     fun `a delayed reaction is scheduled at notBefore and carries it in its task data`() {
         val instance = slot<TaskInstance<String>>()
-        val notBefore = kotlin.time.Instant.parse("2026-10-10T09:00:00Z")
+        val notBefore = kotlin.time.Instant.parse("2026-10-10T09:00:00.123456789Z")
         every { client.scheduleIfNotExists(capture(instance), any<Instant>()) } returns true
 
         runBlocking { sink.publish(EventReactionId("remind-e-1"), FakeTrigger("remind"), null, notBefore) }
 
-        verify(exactly = 1) { client.scheduleIfNotExists(any<TaskInstance<String>>(), Instant.parse("2026-10-10T09:00:00Z")) }
-        assertEquals(notBefore.toEpochMilliseconds(), ReactionTaskData.decode(instance.captured.data).notBeforeEpochMillis)
+        verify(exactly = 1) { client.scheduleIfNotExists(any<TaskInstance<String>>(), Instant.parse("2026-10-10T09:00:00.123456789Z")) }
+        assertEquals(notBefore.toString(), ReactionTaskData.decode(instance.captured.data).notBefore)
     }
 }

@@ -805,16 +805,20 @@ fun reviewReminderOutbox(
         backend = PostgresDomainPollingBackend(jdbc),
         executor = executor,
         eventToReactions = { event ->
-            when (serialization.deserialize(event.serialized)) {
-                is OrderShipped ->
-                    listOf(
-                        EventReaction(
-                            id = EventReactionId("review-reminder-${event.metadata.eventId.value}"),
-                            trigger = SendReviewReminder(orderId = event.metadata.aggregateId.value),
-                            notBefore = event.metadata.timestamp + 7.days,
-                        ),
-                    )
-                else -> emptyList()
+            if (event.metadata.aggregateType != Orders.type) {
+                emptyList()
+            } else {
+                when (serialization.deserialize(event.serialized)) {
+                    is OrderShipped ->
+                        listOf(
+                            EventReaction(
+                                id = EventReactionId("review-reminder-${event.metadata.eventId.value}"),
+                                trigger = SendReviewReminder(orderId = event.metadata.aggregateId.value),
+                                notBefore = event.metadata.timestamp + 7.days,
+                            ),
+                        )
+                    else -> emptyList()
+                }
             }
         },
         getPosition = { offsets.getPosition("review-reminders") },
@@ -827,8 +831,10 @@ fun reviewReminderOutbox(
 - If a queue delivers a reaction early, the executor puts it back until it is due. It doesn't run, and it
   doesn't count as a retry.
 - Delayed reactions can't be ordered: a delayed reaction would hold back every later reaction of its
-  aggregate. An ordered outbox or subscription that returns one fails with an `IllegalArgumentException`
-  naming it.
+  aggregate. If an ordered outbox or subscription returns one, dispatching fails with an
+  `IllegalArgumentException` naming it. The poller logs the failure and retries that batch on every poll, so
+  the outbox (or, for a contract, all its subscriptions) stops dispatching at that event until you fix the
+  code.
 
 ### Durable reactions with db-scheduler
 

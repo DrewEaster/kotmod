@@ -219,7 +219,7 @@ class EventReactionExecutor<T : EventReactionTrigger, ExecutionContext>(
     ) {
         require(ordering == null || sink.supportsOrdering) { "This executor's sink does not support ordering" }
         require(ordering == null || notBefore == null) {
-            "Delayed reactions can't be ordered: reaction ${id.value} has notBefore $notBefore but its subscription is ordered"
+            "Delayed reactions can't be ordered: reaction ${id.value} has both an ordering stamp and notBefore $notBefore"
         }
         sink.publish(id, trigger, ordering, notBefore)
     }
