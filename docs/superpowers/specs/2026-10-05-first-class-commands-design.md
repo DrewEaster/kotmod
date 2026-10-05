@@ -129,15 +129,16 @@ when (val result = payouts.handle(id, Release(ref), commandId = CommandId(reques
    - **Accept:** `saveMeta` with `expectedVersion = null` when the state was `null` (create) or with the
      loaded version (advance); `repository.save`; `appendEvents` (sequence numbers as today);
      `recordCommandHandled`.
-   - **Reject:** `recordCommandRejected` with the rejection's serial name and its JSON payload. No version
-     change, no events, no state write.
+   - **Reject:** `recordCommandRejected` with the rejection's JVM class name (informational, for operators
+     and error messages) and its JSON payload (encoded with the rejection serializer, which is all that is
+     needed to read it back). No version change, no events, no state write.
 
 **Conflict retries.** If the write loses a race — `OptimisticConcurrencyException`,
-`AggregateAlreadyExistsException` from a concurrent create, or a duplicate-key violation on the command
-history from the same command id being recorded concurrently — `handle` starts again from step 1, which
+`AggregateAlreadyExistsException` from a concurrent create, or a new `CommandAlreadyRecordedException`
+(which backends throw when the same command id is recorded twice) — `handle` starts again from step 1, which
 re-reads (and so returns the recorded answer if the other writer used the same command id) and re-decides.
-After `maxConflictRetries` retries it throws `OptimisticConcurrencyException`. Re-running is safe because
-deciding is pure.
+After `maxConflictRetries` retries it rethrows the last conflict exception (normally
+`OptimisticConcurrencyException`). Re-running is safe because deciding is pure.
 
 **Inside an outer `jdbc.transaction { }`** (detected through `backend.isInTransaction()`), `handle` never
 retries: a conflict propagates and the outer transaction rolls back, as documented today. A rejection is a
@@ -157,6 +158,8 @@ deserialized (the rejection class was renamed or reshaped), `handle` throws a ne
   `findHandledCommand(type, id, commandId): HandledCommand?`, where
   `sealed interface HandledCommand { data object Accepted; data class Rejected(val type: String, val payload: String) }`.
 - New `recordCommandRejected(type, id, commandId, rejectionType: String, payload: String)`.
+- `recordCommandHandled` and `recordCommandRejected` throw `CommandAlreadyRecordedException` when the command
+  id is already recorded for the aggregate (Postgres: unique violation on the primary key).
 - `EventProducer` switches to `findHandledCommand` (treating any recorded answer as "already handled");
   its behaviour does not change.
 
@@ -178,9 +181,10 @@ against a non-existent aggregate is recorded under that aggregate id even though
 row exists (there is no foreign key).
 
 **Exceptions:** `UnexpectedAggregateStateException` is deleted (nothing throws it any more).
-`AggregateNotFoundException` and `AggregateAlreadyExistsException` are kept only if something still throws
-them after the change (`saveMeta` uses `AggregateAlreadyExistsException` internally to detect a concurrent
-create); any that end up unused are deleted rather than left as dead API.
+`AggregateAlreadyExistsException` is kept: `saveMeta` throws it on a concurrent create, and `handle` treats
+it as a conflict. `AggregateNotFoundException` is kept for one inconsistency: the aggregate's bookkeeping
+exists (or its command was accepted) but the repository has no state for it. `DddException` gains an
+optional `cause`.
 
 ## Testing
 
