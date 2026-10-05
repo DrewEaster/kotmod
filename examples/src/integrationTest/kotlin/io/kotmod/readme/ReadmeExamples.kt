@@ -274,6 +274,7 @@ fun orderContract(
             getPosition = { offsets.getPosition("order-contract") },
             savePosition = { offsets.savePosition("order-contract", it) },
             isLeader = { true },
+            aggregateTypes = setOf(Orders.type),
         )
 
     contract.subscribe(billingExecutor) { envelope ->

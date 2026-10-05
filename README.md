@@ -1183,6 +1183,7 @@ fun orderContract(
             getPosition = { offsets.getPosition("order-contract") },
             savePosition = { offsets.savePosition("order-contract", it) },
             isLeader = { true },
+            aggregateTypes = setOf(Orders.type),
         )
 
     contract.subscribe(billingExecutor) { envelope ->
@@ -1206,13 +1207,14 @@ fun orderContract(
 - A contract can have several subscribers, each with its own executor. Subscribe before calling
   `start()`.
 - A contract reads the event log independently of the outbox, so give it its own consumer name.
-- A contract deserializes **every** event in the log before mapping it, so its `serialization` must be
-  able to read every event type your application writes. If you have several event families (orders and
-  audit events, say), register them all in one `jsonDataSerializationContext<DomainEvent>` and use
-  `DomainEvent` as the contract's internal type.
-- That includes the facts a [process manager](#process-managers) records: they are ordinary events in the
-  log, so register them as for any aggregate. kotmod skips process managers' internal events (the commands
-  and timeouts they have asked for) automatically, in contracts and outboxes alike.
+- `aggregateTypes` lists the aggregate types the contract publishes; events of other types are skipped
+  without being deserialized. The event log holds every aggregate's events, so with a filter, adding an
+  aggregate or a [process manager](#process-managers) to the context never stalls this contract on an event
+  type its `serialization` can't read.
+- Without `aggregateTypes`, a contract deserializes **every** event in the log before mapping it, so its
+  `serialization` must be able to read every event type your application writes, including the facts a
+  process manager records. If you have several event families (orders and audit events, say), register them
+  all in one `jsonDataSerializationContext<DomainEvent>` and use `DomainEvent` as the contract's internal type.
 
 ### Process managers
 
@@ -1279,10 +1281,9 @@ fun translateOrderEvent(
 The process id (`deadline-<orderId>`) names an instance of the process manager's own aggregate type, not the
 order.
 
-`translate` receives every event in this context's log except the process manager's own events and kotmod's
-internal events (the commands and timeouts process managers have asked for). Facts recorded by other process
-managers do reach it. Filter by aggregate type before deserializing, as `translateOrderEvent` does and as the
-quickstart's outbox does.
+`translate` receives every event in this context's log except this process manager's own. Facts recorded by
+other process managers do reach it. Filter by aggregate type before deserializing, as `translateOrderEvent` does
+and as the quickstart's outbox does.
 
 #### States own their inputs
 
@@ -1440,8 +1441,9 @@ how to turn a typed rejection back into an input for the process, like `Cancella
 `transition(events = …)` records events in the process's own stream (here `DispatchDeadlineMissed`, which says
 the deadline passed before the process saw a shipment; a cancellation refused because the order has shipped is
 how the process learns otherwise). They are internal, like any domain events, and they sit in the log with
-everything else, so a contract's `serialization` must be able to read them. To tell other contexts about them,
-publish them through a `PublicEventContract`, as in
+everything else, so a contract's `serialization` must be able to read them, unless the contract lists the
+aggregate types it publishes (`aggregateTypes`) and leaves the process manager's out. To tell other contexts
+about them, publish them through a `PublicEventContract`, as in
 [Publishing events to other contexts](#publishing-events-to-other-contexts).
 
 #### Wiring with db-scheduler

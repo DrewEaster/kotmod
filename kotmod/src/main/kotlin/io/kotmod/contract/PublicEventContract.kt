@@ -1,5 +1,6 @@
 package io.kotmod.contract
 
+import io.kotmod.AggregateType
 import io.kotmod.DataSerializationContext
 import io.kotmod.DomainEvent
 import io.kotmod.PublicDomainEvent
@@ -24,12 +25,17 @@ import kotlin.time.Duration.Companion.milliseconds
  *
  * While running, it polls the event log, deserializes each event with [serialization], maps it with
  * [internalToPublic] (returning `null` keeps an event private) and passes the public event to every
- * subscriber. Process managers' internal envelope events are skipped; their own facts are ordinary events,
- * so [serialization] must be able to read them. Each subscriber turns it into event reactions for its own executor. Positions, leadership
- * and redelivery work as in [io.kotmod.outbox.AggregateEventOutbox].
+ * subscriber. Each subscriber turns it into event reactions for its own executor. Positions, leadership and
+ * redelivery work as in [io.kotmod.outbox.AggregateEventOutbox].
+ *
+ * The event log holds every aggregate's events, process managers' facts included. kotmod's own internal events are
+ * always skipped, but without [aggregateTypes] [serialization] must be able to read every other event type in the log.
  *
  * @param I the internal domain event type.
  * @param E the public event type.
+ * @param aggregateTypes the aggregate types whose events this contract publishes; events of other types are skipped
+ *   without being deserialized. With a filter, adding aggregate types or process managers to the context never affects
+ *   this contract. `null` (the default) reads every aggregate type.
  */
 class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
     private val backend: DomainEventPollingBackend,
@@ -38,6 +44,7 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
     getPosition: () -> EventLogPosition,
     savePosition: (EventLogPosition) -> Unit,
     isLeader: () -> Boolean,
+    private val aggregateTypes: Set<AggregateType>? = null,
     pollInterval: Duration = 500.milliseconds,
     batchSize: Int = 100,
 ) {
@@ -118,6 +125,7 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
     private suspend fun handleEvent(envelope: PersistedEvent) {
         // A process manager's internal envelopes are only for that process manager; no app serialization can read them.
         if (ProcessEventSerialization.isEnvelope(envelope.serialized.type)) return
+        if (aggregateTypes != null && envelope.metadata.aggregateType !in aggregateTypes) return
         val internal: I = serialization.deserialize(envelope.serialized)
         val public: E = internalToPublic(internal) ?: return
         val publicEnvelope = PublicEventEnvelope(envelope.metadata, public)

@@ -1,5 +1,6 @@
 package io.kotmod.contract
 
+import io.kotmod.AggregateType
 import io.kotmod.EventLogPosition
 import io.kotmod.DataSerializationContext
 import io.kotmod.DomainEvent
@@ -104,6 +105,7 @@ class PublicEventContractTest {
             }
         },
         isLeader: () -> Boolean = { true },
+        aggregateTypes: Set<AggregateType>? = null,
     ) = PublicEventContract(
         backend = backend,
         serialization = serialization,
@@ -111,6 +113,7 @@ class PublicEventContractTest {
         getPosition = offsets::get,
         savePosition = offsets::save,
         isLeader = isLeader,
+        aggregateTypes = aggregateTypes,
         pollInterval = 50.milliseconds,
         batchSize = 100,
     )
@@ -243,6 +246,45 @@ class PublicEventContractTest {
         assertEquals(0, counting.deserializeCalls)
         coVerify(exactly = 0) { executorA.dispatch(any(), any(), any()) }
         assertEquals(listOf(10L, 11L), offsets.saved.map { it.globalOffset })
+    }
+
+    @Test
+    fun `with an aggregate type filter, events of other types are skipped without deserializing them`() {
+        givenEvents(
+            persistedEvent(globalOffset = 10, eventId = "e-10", aggregateType = "Shipment", eventType = "Unknown", eventPayload = "?"),
+            persistedEvent(globalOffset = 11, eventId = "e-11", aggregateType = "Document", eventType = "Opened", eventPayload = "Opened(id=doc-1)"),
+        )
+
+        val counting = CountingSerialization()
+        val contract = newContract(serialization = counting, aggregateTypes = setOf(AggregateType("Document")))
+        val seen = mutableListOf<TestPublicEvent>()
+        contract.subscribe(executorA) { envelope ->
+            seen += envelope.event
+            emptyList()
+        }
+        kotlinx.coroutines.runBlocking { contract.tickForTest() }
+
+        assertEquals(1, counting.deserializeCalls)
+        assertEquals(listOf<TestPublicEvent>(TestPublicEvent.OpenedPublic("doc-1")), seen)
+        assertEquals(listOf(10L, 11L), offsets.saved.map { it.globalOffset })
+    }
+
+    @Test
+    fun `without an aggregate type filter, events of every type are published`() {
+        givenEvents(
+            persistedEvent(globalOffset = 10, eventId = "e-10", aggregateType = "Shipment", eventType = "Opened", eventPayload = "Opened(id=s-1)"),
+            persistedEvent(globalOffset = 11, eventId = "e-11", aggregateType = "Document", eventType = "Opened", eventPayload = "Opened(id=doc-1)"),
+        )
+
+        val contract = newContract()
+        val seen = mutableListOf<TestPublicEvent>()
+        contract.subscribe(executorA) { envelope ->
+            seen += envelope.event
+            emptyList()
+        }
+        kotlinx.coroutines.runBlocking { contract.tickForTest() }
+
+        assertEquals(listOf<TestPublicEvent>(TestPublicEvent.OpenedPublic("s-1"), TestPublicEvent.OpenedPublic("doc-1")), seen)
     }
 
     @Test
