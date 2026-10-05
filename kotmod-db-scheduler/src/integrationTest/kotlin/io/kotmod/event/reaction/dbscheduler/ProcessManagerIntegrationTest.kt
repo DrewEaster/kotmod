@@ -11,6 +11,7 @@ import io.kotmod.jdbc.JdbcContext
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.PostgresDomainPollingBackend
 import io.kotmod.postgres.PostgresOffsetManager
+import io.kotmod.postgres.StartFrom
 import io.kotmod.postgres.support.IntegrationTest
 import io.kotmod.postgres.support.eventually
 import io.kotmod.postgres.support.orderEventSerialization
@@ -178,7 +179,7 @@ class ProcessManagerIntegrationTest : IntegrationTest() {
                     +WindowClosed.serializer().toEventSerializer()
                 },
             internalToPublic = { event -> if (event is OrderPlaced) OrderWasPlacedPublic(event.name) else null },
-            getPosition = { offsets.getPosition("order-contract") },
+            getPosition = { offsets.getPosition("order-contract", StartFrom.Beginning) },
             savePosition = { offsets.savePosition("order-contract", it) },
             isLeader = { true },
         )
@@ -216,7 +217,7 @@ class ProcessManagerIntegrationTest : IntegrationTest() {
                 targets = listOf(target(orders) { _, rejection -> ReleaseBlocked(rejection) }),
                 queues = queues,
                 inputOrdering = ReactionOrdering.PerAggregate(),
-                getPosition = { offsets.getPosition("windows") },
+                getPosition = { offsets.getPosition("windows", StartFrom.Beginning) },
                 savePosition = { offsets.savePosition("windows", it) },
                 isLeader = { true },
                 clock = clock,

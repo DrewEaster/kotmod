@@ -14,6 +14,7 @@ import io.kotmod.event.reaction.EventReactionTrigger
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.PostgresDomainPollingBackend
 import io.kotmod.postgres.PostgresOffsetManager
+import io.kotmod.postgres.StartFrom
 import io.kotmod.postgres.support.IntegrationTest
 import io.kotmod.postgres.support.orderEventSerialization
 import io.kotmod.postgres.support.recordingExecutor
@@ -88,7 +89,7 @@ class AggregateEventOutboxIntegrationTest : IntegrationTest() {
                 ),
             )
         },
-        getPosition = { offsets.getPosition(CONSUMER) },
+        getPosition = { offsets.getPosition(CONSUMER, StartFrom.Beginning) },
         savePosition = { offsets.savePosition(CONSUMER, it) },
         isLeader = isLeader,
         pollInterval = 50.milliseconds,
@@ -162,7 +163,7 @@ class AggregateEventOutboxIntegrationTest : IntegrationTest() {
             }
 
             assertEquals(emptyList(), dispatched.toList())
-            assertEquals(EventLogPosition.START, offsets.getPosition(CONSUMER))
+            assertEquals(EventLogPosition.START, offsets.getPosition(CONSUMER, StartFrom.Beginning))
         }
 
 

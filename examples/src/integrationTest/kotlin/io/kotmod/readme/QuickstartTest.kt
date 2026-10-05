@@ -19,6 +19,7 @@ import io.kotmod.outbox.AggregateEventOutbox
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.PostgresDomainPollingBackend
 import io.kotmod.postgres.PostgresOffsetManager
+import io.kotmod.postgres.StartFrom
 import io.kotmod.postgres.support.IntegrationTest
 import io.kotmod.postgres.support.eventually
 import io.kotmod.serialization.jsonDataSerializationContext
@@ -138,7 +139,7 @@ class QuickstartTest : IntegrationTest() {
                             }
                         }
                     },
-                    getPosition = { offsets.getPosition("order-notifications") },
+                    getPosition = { offsets.getPosition("order-notifications", startFrom = StartFrom.Beginning) },
                     savePosition = { offsets.savePosition("order-notifications", it) },
                     isLeader = { true },
                 )

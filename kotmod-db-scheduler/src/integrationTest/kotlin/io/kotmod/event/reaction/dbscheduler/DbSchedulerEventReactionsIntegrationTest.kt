@@ -15,6 +15,7 @@ import io.kotmod.outbox.AggregateEventOutbox
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.PostgresDomainPollingBackend
 import io.kotmod.postgres.PostgresOffsetManager
+import io.kotmod.postgres.StartFrom
 import io.kotmod.postgres.support.IntegrationTest
 import io.kotmod.postgres.support.eventually
 import io.kotmod.postgres.support.orderEventSerialization
@@ -282,7 +283,7 @@ class DbSchedulerEventReactionsIntegrationTest : IntegrationTest() {
                             ),
                         )
                     },
-                    getPosition = { offsets.getPosition("order-outbox") },
+                    getPosition = { offsets.getPosition("order-outbox", StartFrom.Beginning) },
                     savePosition = { offsets.savePosition("order-outbox", it) },
                     isLeader = { true },
                     pollInterval = 50.milliseconds,

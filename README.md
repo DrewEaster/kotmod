@@ -434,7 +434,9 @@ reaction. The event log holds the events of *every* aggregate type, so the outbo
 isn't an order before deserializing — an event it can't deserialize would stop it in its tracks. The
 reaction id is built from the event id, so if the same event is dispatched again while its reaction is
 still pending, it is recognised as the same reaction. `PostgresOffsetManager` remembers how far the
-outbox has read:
+outbox has read. A new consumer starts at the end of the log and only sees events written after it first
+reads its position; the quickstart asks for `StartFrom.Beginning` so its outbox also handles the order
+placed in step 4:
 
 ```kotlin
 val offsets = PostgresOffsetManager(jdbc)
@@ -460,7 +462,7 @@ val outbox =
                 }
             }
         },
-        getPosition = { offsets.getPosition("order-notifications") },
+        getPosition = { offsets.getPosition("order-notifications", startFrom = StartFrom.Beginning) },
         savePosition = { offsets.savePosition("order-notifications", it) },
         isLeader = { true },
     )
@@ -744,6 +746,12 @@ runs in a transaction opened by its backend's `JdbcContext`; `jdbc.inTransaction
 **Reading events.** `PostgresDomainPollingBackend` reads the event log for the outbox and public
 contracts. `PostgresOffsetManager` stores how far each of them has read; give every poller its own
 consumer name.
+
+**Starting positions.** A consumer with no saved position starts at the head of the event log, so deploying
+a new outbox, contract or process manager never replays history. Events in a transaction still open at that
+moment are not skipped. Pass `startFrom = StartFrom.Beginning` to `getPosition` for a consumer that must see
+history, such as a new projection. An existing consumer keeps its saved position; to reset one deliberately,
+save a position yourself with `savePosition`.
 
 #### Using SQLDelight
 
@@ -1215,6 +1223,9 @@ manager, not saga.)
 
 The example below is a dispatch deadline: when an order is placed, wait two days; if it still hasn't shipped,
 cancel it and record that the deadline was missed. If the customer cancels first, the deadline is abandoned.
+A new process manager starts at the head of the event log and sees only future events; to cover orders
+already in flight, pass `startFrom = StartFrom.Beginning` when it asks `PostgresOffsetManager` for its
+position.
 
 #### Inputs: the anti-corruption layer
 
@@ -1620,6 +1631,9 @@ failure in a specific spot to show up.
 6. If you implemented your own queue, add the `notBefore` parameter to your sink's `publish` and carry it
    to delivery, pass it to `block` as the fifth argument, and handle `ReactionOutcome.Wait` by delivering
    again after the delay without counting a retry.
+7. A consumer with no saved position (an outbox, public contract or process manager using
+   `PostgresOffsetManager`) now starts at the head of the event log, not the beginning. Where you relied on
+   replaying history, pass `startFrom = StartFrom.Beginning` to `getPosition`.
 
 ## Status and contributing
 

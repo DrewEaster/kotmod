@@ -17,6 +17,7 @@ import io.kotmod.event.reaction.EventReactionTrigger
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.PostgresDomainPollingBackend
 import io.kotmod.postgres.PostgresOffsetManager
+import io.kotmod.postgres.StartFrom
 import io.kotmod.postgres.support.IntegrationTest
 import io.kotmod.postgres.support.recordingExecutor
 import kotlinx.coroutines.delay
@@ -140,7 +141,7 @@ class PublicEventContractIntegrationTest : IntegrationTest() {
                             is TestInternalEvent.InternalNote -> null
                         }
                     },
-                    getPosition = { offsets.getPosition(CONSUMER) },
+                    getPosition = { offsets.getPosition(CONSUMER, StartFrom.Beginning) },
                     savePosition = { offsets.savePosition(CONSUMER, it) },
                     isLeader = { true },
                     pollInterval = 50.milliseconds,
