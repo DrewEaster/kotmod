@@ -45,7 +45,7 @@ import kotlin.time.Duration
 // Guide: Aggregates and commands
 
 suspend fun cancelOrder(
-    orders: AggregateManager<Order, OrderEvent, OrderCommand, OrderRejection>,
+    orders: AggregateManager<Order, OrderCommand, OrderEvent, OrderRejection>,
     orderId: AggregateId,
     reason: String,
     requestId: String,
@@ -62,8 +62,8 @@ suspend fun cancelOrder(
 
 suspend fun shipAndInvoice(
     jdbc: JdbcContext,
-    orders: AggregateManager<Order, OrderEvent, OrderCommand, OrderRejection>,
-    invoices: AggregateManager<Order, OrderEvent, OrderCommand, OrderRejection>,
+    orders: AggregateManager<Order, OrderCommand, OrderEvent, OrderRejection>,
+    invoices: AggregateManager<Order, OrderCommand, OrderEvent, OrderRejection>,
     orderId: AggregateId,
 ) {
     jdbc.transaction {

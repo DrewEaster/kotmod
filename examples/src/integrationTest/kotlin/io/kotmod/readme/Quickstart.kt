@@ -3,8 +3,9 @@ package io.kotmod.readme
 // Keep in sync with README.md (Quickstart, steps 2, 3 and 5).
 
 import io.kotmod.AggregateId
-import io.kotmod.CommandHandlers
+import io.kotmod.AggregateState
 import io.kotmod.DomainEvent
+import io.kotmod.InitialState
 import io.kotmod.Outcome
 import io.kotmod.Repository
 import io.kotmod.accept
@@ -15,21 +16,6 @@ import io.kotmod.event.reaction.EventReactionTriggerSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlin.time.Duration
-
-sealed interface Order
-
-data class PendingOrder(
-    val item: String,
-) : Order
-
-data class ShippedOrder(
-    val item: String,
-) : Order
-
-data class CancelledOrder(
-    val item: String,
-    val reason: String,
-) : Order
 
 @Serializable
 sealed interface OrderEvent : DomainEvent
@@ -86,32 +72,52 @@ data object CancellationReasonMissing : OrderRejection
 
 typealias OrderOutcome = Outcome<Order, OrderEvent, OrderRejection>
 
-fun placeOrder(item: String): OrderOutcome = accept(PendingOrder(item), OrderPlaced(item))
+sealed interface Order : AggregateState<Order, OrderCommand, OrderEvent, OrderRejection>
 
-fun PendingOrder.ship(): OrderOutcome = accept(ShippedOrder(item), OrderShipped(item))
+object NoOrder : InitialState<Order, OrderCommand, OrderEvent, OrderRejection> {
+    override suspend fun handle(command: OrderCommand): OrderOutcome =
+        when (command) {
+            is PlaceOrder -> accept(PendingOrder(command.item), OrderPlaced(command.item))
+            ShipOrder, is CancelOrder -> reject(OrderNotFound)
+        }
+}
 
-fun PendingOrder.cancel(reason: String): OrderOutcome =
-    if (reason.isBlank()) {
-        reject(CancellationReasonMissing)
-    } else {
-        accept(CancelledOrder(item, reason), OrderCancelled(item, reason))
-    }
-
-object OrderCommands : CommandHandlers<Order, OrderCommand, OrderEvent, OrderRejection>(
-    rejectionSerializer = OrderRejection.serializer(),
-) {
-    override fun OrderCommand.handler() =
-        when (this) {
-            is PlaceOrder -> creates(otherwise = { OrderAlreadyPlaced }) { placeOrder(item) }
-            ShipOrder -> on<PendingOrder>(otherwise = ::notPending) { it.ship() }
-            is CancelOrder -> on<PendingOrder>(otherwise = ::notPending) { it.cancel(reason) }
+data class PendingOrder(
+    val item: String,
+) : Order {
+    override suspend fun handle(command: OrderCommand): OrderOutcome =
+        when (command) {
+            is PlaceOrder -> reject(OrderAlreadyPlaced)
+            ShipOrder -> accept(ShippedOrder(item), OrderShipped(item))
+            is CancelOrder -> cancel(command.reason)
         }
 
-    private fun notPending(order: Order?): OrderRejection =
-        when (order) {
-            is ShippedOrder -> OrderAlreadyShipped
-            is CancelledOrder -> OrderAlreadyCancelled
-            else -> OrderNotFound
+    private fun cancel(reason: String): OrderOutcome =
+        if (reason.isBlank()) {
+            reject(CancellationReasonMissing)
+        } else {
+            accept(CancelledOrder(item, reason), OrderCancelled(item, reason))
+        }
+}
+
+data class ShippedOrder(
+    val item: String,
+) : Order {
+    override suspend fun handle(command: OrderCommand): OrderOutcome =
+        when (command) {
+            is PlaceOrder -> reject(OrderAlreadyPlaced)
+            ShipOrder, is CancelOrder -> reject(OrderAlreadyShipped)
+        }
+}
+
+data class CancelledOrder(
+    val item: String,
+    val reason: String,
+) : Order {
+    override suspend fun handle(command: OrderCommand): OrderOutcome =
+        when (command) {
+            is PlaceOrder -> reject(OrderAlreadyPlaced)
+            ShipOrder, is CancelOrder -> reject(OrderAlreadyCancelled)
         }
 }
 

@@ -117,27 +117,9 @@ db-scheduler's
 
 ### 2. Define state, events, commands and rejections
 
-An aggregate's **state** is whatever your application needs to make decisions — here, an order is
-pending, shipped or cancelled:
-
-```kotlin
-sealed interface Order
-
-data class PendingOrder(
-    val item: String,
-) : Order
-
-data class ShippedOrder(
-    val item: String,
-) : Order
-
-data class CancelledOrder(
-    val item: String,
-    val reason: String,
-) : Order
-```
-
-Its **events** record what happened. They are stored as JSON, so they are `@Serializable`:
+An aggregate's **state** is whatever your application needs to make decisions. Here, an order is pending,
+shipped or cancelled. Its **events** record what happened. They are stored as JSON, so they are
+`@Serializable`:
 
 ```kotlin
 @Serializable
@@ -162,13 +144,6 @@ data class OrderCancelled(
 
 A **command** asks the order to change. Commands are data, so they are `@Serializable`, and so is the
 aggregate's **rejection** type: every way a command can be refused, in your domain's own words.
-
-Write the decisions as plain functions on specific states. Each returns an outcome, `accept(newState,
-events…)` or `reject(rejection)`, so your domain decisions stay pure code that you can unit-test without a
-database. `OrderCommands` is the one place that routes each command to its function: `creates` only runs
-for an order that doesn't exist yet, `on<PendingOrder>` only runs for a pending order, and `otherwise`
-names the rejection in every other case. The `when` is exhaustive, so adding a command without routing it
-doesn't compile.
 
 ```kotlin
 @Serializable
@@ -204,35 +179,63 @@ data object OrderAlreadyCancelled : OrderRejection
 
 @Serializable
 data object CancellationReasonMissing : OrderRejection
+```
 
+Each state owns its behaviour. It implements `handle` and decides every command it might receive:
+`accept(newState, events…)` or `reject(rejection)`. `NoOrder` is the order before it exists: placing it is
+accepted there, and everything else is rejected. Each `when` lists every command and has no `else`, so adding
+a command doesn't compile until every state has decided what to do with it. Decisions are plain code that
+you can unit-test without a database.
+
+```kotlin
 typealias OrderOutcome = Outcome<Order, OrderEvent, OrderRejection>
 
-fun placeOrder(item: String): OrderOutcome = accept(PendingOrder(item), OrderPlaced(item))
+sealed interface Order : AggregateState<Order, OrderCommand, OrderEvent, OrderRejection>
 
-fun PendingOrder.ship(): OrderOutcome = accept(ShippedOrder(item), OrderShipped(item))
+object NoOrder : InitialState<Order, OrderCommand, OrderEvent, OrderRejection> {
+    override suspend fun handle(command: OrderCommand): OrderOutcome =
+        when (command) {
+            is PlaceOrder -> accept(PendingOrder(command.item), OrderPlaced(command.item))
+            ShipOrder, is CancelOrder -> reject(OrderNotFound)
+        }
+}
 
-fun PendingOrder.cancel(reason: String): OrderOutcome =
-    if (reason.isBlank()) {
-        reject(CancellationReasonMissing)
-    } else {
-        accept(CancelledOrder(item, reason), OrderCancelled(item, reason))
-    }
-
-object OrderCommands : CommandHandlers<Order, OrderCommand, OrderEvent, OrderRejection>(
-    rejectionSerializer = OrderRejection.serializer(),
-) {
-    override fun OrderCommand.handler() =
-        when (this) {
-            is PlaceOrder -> creates(otherwise = { OrderAlreadyPlaced }) { placeOrder(item) }
-            ShipOrder -> on<PendingOrder>(otherwise = ::notPending) { it.ship() }
-            is CancelOrder -> on<PendingOrder>(otherwise = ::notPending) { it.cancel(reason) }
+data class PendingOrder(
+    val item: String,
+) : Order {
+    override suspend fun handle(command: OrderCommand): OrderOutcome =
+        when (command) {
+            is PlaceOrder -> reject(OrderAlreadyPlaced)
+            ShipOrder -> accept(ShippedOrder(item), OrderShipped(item))
+            is CancelOrder -> cancel(command.reason)
         }
 
-    private fun notPending(order: Order?): OrderRejection =
-        when (order) {
-            is ShippedOrder -> OrderAlreadyShipped
-            is CancelledOrder -> OrderAlreadyCancelled
-            else -> OrderNotFound
+    private fun cancel(reason: String): OrderOutcome =
+        if (reason.isBlank()) {
+            reject(CancellationReasonMissing)
+        } else {
+            accept(CancelledOrder(item, reason), OrderCancelled(item, reason))
+        }
+}
+
+data class ShippedOrder(
+    val item: String,
+) : Order {
+    override suspend fun handle(command: OrderCommand): OrderOutcome =
+        when (command) {
+            is PlaceOrder -> reject(OrderAlreadyPlaced)
+            ShipOrder, is CancelOrder -> reject(OrderAlreadyShipped)
+        }
+}
+
+data class CancelledOrder(
+    val item: String,
+    val reason: String,
+) : Order {
+    override suspend fun handle(command: OrderCommand): OrderOutcome =
+        when (command) {
+            is PlaceOrder -> reject(OrderAlreadyPlaced)
+            ShipOrder, is CancelOrder -> reject(OrderAlreadyCancelled)
         }
 }
 ```
@@ -260,7 +263,8 @@ val orders =
         aggregateType = orderType,
         repository = OrderRepository(jdbc),
         backend = PostgresDomainPersistenceBackend(jdbc, serialization),
-        commands = OrderCommands,
+        initial = NoOrder,
+        rejectionSerializer = OrderRejection.serializer(),
     )
 ```
 
@@ -475,8 +479,8 @@ flowchart LR
 
 - **Aggregate** — a cluster of domain state changed only through commands, identified by an
   `AggregateType` and `AggregateId`.
-- **Command** — a request to change an aggregate, as serializable data. The aggregate accepts it (new state
-  and events) or rejects it. It is idempotent when given a `CommandId`.
+- **Command** — a request to change an aggregate, as serializable data. The aggregate's current state
+  decides it: accept it (new state and events) or reject it. It is idempotent when given a `CommandId`.
 - **Rejection** — why an aggregate refused a command, as one of your own types. Rejections are recorded,
   so a repeated command id gets the same answer.
 - **Domain event** — a fact recorded in the event log in the same transaction as the state change.
@@ -500,25 +504,26 @@ Every command runs in three phases:
 
 1. **Read** — if the command's id has already been handled, the recorded answer is returned and nothing
    else happens. Otherwise the aggregate's version and state are loaded.
-2. **Decide** — your pure function runs. kotmod does no database work while it runs, so keep side effects
+2. **Decide** — the aggregate's current state (or the initial state, if the aggregate doesn't exist yet) decides the command. kotmod does no database work while it runs, so keep side effects
    out of it; put them in event reactions instead.
 3. **Write** — in one transaction, the aggregate's version is advanced, your repository saves the new
    state, the events are appended and the command is recorded as handled. A rejected command writes only
    the rejection record.
 
-**Routing.** `CommandHandlers` routes each command to a function for the state it needs. `on<T>(otherwise)`
-runs only when the state is a `T`. `creates(otherwise)` runs only when the aggregate doesn't exist yet.
-`any { state -> … }` is for a command that is valid in several states. `otherwise` receives the actual
-state, or `null` when the aggregate doesn't exist, so you can reject differently by state.
+**States own their commands.** Each state implements `AggregateState` and decides every command in
+`handle`, returning `accept(newState, events…)` or `reject(rejection)`. An `InitialState` object (`NoOrder`)
+decides commands for an aggregate that doesn't exist yet, and accepting there creates it. Write each `when`
+without an `else`: then adding a command doesn't compile until every state, and the initial state, has
+decided what to do with it.
 
-Because decisions are pure, you can unit-test your routing without a database: `OrderCommands.decide(command,
-state)` returns the `Outcome` for a command against a state (`null` for an aggregate that doesn't exist yet).
+Decisions are plain code, so you can unit-test them without a database:
+`PendingOrder("book").handle(ShipOrder)` and `NoOrder.handle(PlaceOrder("book"))` return the `Outcome`.
 
 Callers match on the result; a rejection is a value, never an exception:
 
 ```kotlin
 suspend fun cancelOrder(
-    orders: AggregateManager<Order, OrderEvent, OrderCommand, OrderRejection>,
+    orders: AggregateManager<Order, OrderCommand, OrderEvent, OrderRejection>,
     orderId: AggregateId,
     reason: String,
     requestId: String,
@@ -535,7 +540,7 @@ suspend fun cancelOrder(
 ```
 
 **Why commands are data.** Every caller, whether an HTTP handler, an event reaction or, later, a process
-manager, runs a command the same way: through the one routing point. The rules for which state a command
+manager, runs a command the same way: through `handle`. The rules for which state a command
 needs and how it is refused live in one place.
 
 **Event sequence numbers.** Every event carries `event.metadata.sequence`: its number within its
@@ -575,8 +580,8 @@ aggregate — and kotmod would rather support that clearly than forbid it. If yo
 ```kotlin
 suspend fun shipAndInvoice(
     jdbc: JdbcContext,
-    orders: AggregateManager<Order, OrderEvent, OrderCommand, OrderRejection>,
-    invoices: AggregateManager<Order, OrderEvent, OrderCommand, OrderRejection>,
+    orders: AggregateManager<Order, OrderCommand, OrderEvent, OrderRejection>,
+    invoices: AggregateManager<Order, OrderCommand, OrderEvent, OrderRejection>,
     orderId: AggregateId,
 ) {
     jdbc.transaction {
@@ -1274,12 +1279,13 @@ failure in a specific spot to show up.
    ```
 
    Existing rows read as accepted commands.
-2. For each aggregate, define a sealed command type and a sealed rejection type, change your command
-   functions to return `accept(...)` or `reject(...)`, and route the commands in a `CommandHandlers` object,
-   as in [the quickstart](#2-define-state-events-commands-and-rejections).
-3. Pass that object as `commands` to `AggregateManager`, and replace `create { }` and `execute<T> { }` calls
-   with `handle(id, command)`.
-4. Replace `catch (e: UnexpectedAggregateStateException)` with a rejection from `otherwise`, and drop any
+2. For each aggregate, define a sealed command type and a sealed rejection type. Make your state type
+   implement `AggregateState` and decide each command in `handle`, returning `accept(...)` or `reject(...)`.
+   Then add an `InitialState` object for commands on an aggregate that doesn't exist yet, as in
+   [the quickstart](#2-define-state-events-commands-and-rejections).
+3. Pass that object as `initial`, and your rejection type's serializer as `rejectionSerializer`, to
+   `AggregateManager`, and replace `create { }` and `execute<T> { }` calls with `handle(id, command)`.
+4. Replace `catch (e: UnexpectedAggregateStateException)` with a rejection decided by the state, and drop any
    retry loop around `OptimisticConcurrencyException`: `handle` retries itself.
 5. If you implemented `DomainPersistenceBackend` yourself, replace `wasCommandHandled` with
    `findHandledCommand`, add `recordCommandRejected`, and throw `CommandAlreadyRecordedException` when a

@@ -68,7 +68,8 @@ class QuickstartTest : IntegrationTest() {
                     aggregateType = orderType,
                     repository = OrderRepository(jdbc),
                     backend = PostgresDomainPersistenceBackend(jdbc, serialization),
-                    commands = OrderCommands,
+                    initial = NoOrder,
+                    rejectionSerializer = OrderRejection.serializer(),
                 )
 
             // Another aggregate type writing to the same event log, as an app with an audit log would.
