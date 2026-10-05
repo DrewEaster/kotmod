@@ -177,3 +177,27 @@ feedback; publishing the process manager's own facts through a contract; wiring 
 - `EventProducer` targets, commands to other contexts, timeout cancellation.
 - A shared poller across process managers.
 - A ready-made JSON state table for process manager state (the app supplies a `Repository`).
+
+## Implementation notes (added while planning)
+
+- **Queues.** `ProcessManagerQueues` is a small core interface: `channel(name, triggerSerializer, ordered)` returns a
+  `ProcessChannel` (a sink and a source). `ProcessManager` asks for channels `inputs`, `internal`, `commands`, and
+  `contract-<name>` per contract subscription. `DbSchedulerProcessManagerQueues(name, jdbc)` (in
+  `kotmod-db-scheduler`) creates one `DbSchedulerEventReactions` task per channel, named `<name>-<channel>`, exposes
+  them as `tasks` (to register when building the `Scheduler`), and is bound to the scheduler with `bind(client)`
+  before `start()`. `jdbc` is needed only for ordered inputs.
+- **Contract subscriptions are named**, because the name becomes a db-scheduler task name that must stay stable across
+  restarts: `subscribeTo(name, contract) { envelope -> (processId, input)? }`.
+- **Reaction and input ids:** translated inputs `in-<eventId>`; scheduled inputs `sched-<eventId>`; requested
+  commands `cmd-<eventId>` on the commands channel, run with command id `<pmType>-<eventId>`; rejection feedback
+  `rejected-<commandId>`. Each input id is also the command id of the delivery on the process instance, so
+  redeliveries are deduplicated.
+- **Targets** are matched by `kind.type` (aggregate types must be distinct among a process manager's targets);
+  `AggregateManager.kind` becomes `internal` so `target(manager)` can read it.
+- **Clock:** `ProcessManager` takes an optional `clock` passed to its executors, so tests can drive the timeout path,
+  including an early delivery that waits and is rescheduled.
+- **Envelope serialization:** the process manager's stream is stored through a serialization context that handles
+  the two kotmod envelope types (`io.kotmod.process.CommandRequested`, `io.kotmod.process.InputScheduled`) and
+  delegates everything else to the app's event serialization.
+- **Test-fixture commands become serializable** (except the lambda-holding `DecideWith`), so the test aggregate can be
+  a process manager target.
