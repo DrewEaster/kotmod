@@ -21,4 +21,15 @@ class ReactionTaskDataTest {
         assertFailsWith<IllegalArgumentException> { ReactionTaskData.decode("not json") }
         assertFailsWith<IllegalArgumentException> { ReactionTaskData.decode("""{"trigger":"a"}""") }
     }
+
+    @Test
+    fun `task data written before notBefore existed decodes as not delayed`() {
+        assertEquals(ReactionTaskData(trigger = "t", retryCount = 0), ReactionTaskData.decode("""{"trigger":"t","retryCount":0}"""))
+    }
+
+    @Test
+    fun `notBefore round-trips`() {
+        val data = ReactionTaskData(trigger = "t", retryCount = 0, notBeforeEpochMillis = 1_760_000_000_000)
+        assertEquals(data, ReactionTaskData.decode(data.encode()))
+    }
 }

@@ -13,6 +13,7 @@ import io.kotmod.event.reaction.EventReactionTriggerSink
 import io.kotmod.event.reaction.EventReactionTriggerSource
 import io.kotmod.event.reaction.RetryCount
 import io.kotmod.event.reaction.RetrySignal
+import kotlin.time.Instant
 
 /**
  * Builds a minimal [EventReactionExecutor] whose sink hands every dispatch to [onDispatch].
@@ -28,11 +29,12 @@ fun <T : EventReactionTrigger> recordingExecutor(onDispatch: suspend (EventReact
                 id: EventReactionId,
                 trigger: T,
                 ordering: DispatchOrdering?,
+                notBefore: Instant?,
             ) = onDispatch(id, trigger)
         }
     val source =
         object : EventReactionTriggerSource<T> {
-            override fun subscribe(block: suspend (EventReactionId, EventReactionExecutionId, T, RetryCount) -> ReactionOutcome) =
+            override fun subscribe(block: suspend (EventReactionId, EventReactionExecutionId, T, RetryCount, Instant?) -> ReactionOutcome) =
                 object : Cancellable {
                     override fun cancel() {}
                 }

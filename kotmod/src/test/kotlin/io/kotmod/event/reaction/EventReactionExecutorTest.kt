@@ -12,20 +12,21 @@ import kotlin.test.assertEquals
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.Instant
 
 class EventReactionExecutorTest {
     private data class FakeTrigger(
         override val timeout: Duration? = null,
     ) : EventReactionTrigger
 
-    private lateinit var subscribed: suspend (EventReactionId, EventReactionExecutionId, FakeTrigger, RetryCount) -> ReactionOutcome
+    private lateinit var subscribed: suspend (EventReactionId, EventReactionExecutionId, FakeTrigger, RetryCount, Instant?) -> ReactionOutcome
     private val failureRetryCalls = AtomicInteger()
     private val timeoutRetryCalls = AtomicInteger()
 
     private val source =
         object : EventReactionTriggerSource<FakeTrigger> {
             override fun subscribe(
-                block: suspend (EventReactionId, EventReactionExecutionId, FakeTrigger, RetryCount) -> ReactionOutcome,
+                block: suspend (EventReactionId, EventReactionExecutionId, FakeTrigger, RetryCount, Instant?) -> ReactionOutcome,
             ): Cancellable {
                 subscribed = block
                 return object : Cancellable {
@@ -40,6 +41,7 @@ class EventReactionExecutorTest {
                 id: EventReactionId,
                 trigger: FakeTrigger,
                 ordering: DispatchOrdering?,
+                notBefore: Instant?,
             ) {}
         }
 
@@ -61,7 +63,7 @@ class EventReactionExecutorTest {
         ).also { it.start() }
 
     private suspend fun runReaction(trigger: FakeTrigger = FakeTrigger()) =
-        subscribed(EventReactionId("r-1"), EventReactionExecutionId("x-1"), trigger, 0)
+        subscribed(EventReactionId("r-1"), EventReactionExecutionId("x-1"), trigger, 0, null)
 
     @Test
     fun `a completed reaction finishes without giving up`() =

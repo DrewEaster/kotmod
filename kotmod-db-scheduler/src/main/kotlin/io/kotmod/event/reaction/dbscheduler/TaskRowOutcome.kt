@@ -31,8 +31,8 @@ internal sealed interface TaskRowOutcome {
 }
 
 /**
- * Removes the row if the reaction finished, or reschedules it after the requested delay with the retry count
- * incremented. An ordered reaction that gave up with [OnGiveUp.BlockAggregate] is instead parked and flagged blocked.
+ * Removes the row if the reaction finished, reschedules it after the requested delay with the retry count
+ * incremented for a retry, or unchanged for a wait. An ordered reaction that gave up with [OnGiveUp.BlockAggregate] is instead parked and flagged blocked.
  * Either way the reaction ran, so its wait count is reset.
  */
 internal fun outcomeAfterExecution(
@@ -45,6 +45,11 @@ internal fun outcomeAfterExecution(
             TaskRowOutcome.Reschedule(
                 at = now.plus(result.delay.coerceAtMost(MAX_RETRY_DELAY).toJavaDuration()),
                 taskData = data.copy(retryCount = data.retryCount + 1, waits = 0).encode(),
+            )
+        is ReactionOutcome.Wait ->
+            TaskRowOutcome.Reschedule(
+                at = now.plus(result.delay.coerceAtMost(MAX_RETRY_DELAY).toJavaDuration()),
+                taskData = data.encode(),
             )
         is ReactionOutcome.Finished -> {
             val ordering = data.ordering

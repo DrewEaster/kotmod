@@ -79,6 +79,7 @@ internal fun <T : EventReactionTrigger> reactionTask(
                                     executionId,
                                     triggerSerializer.deserialize(data.trigger),
                                     data.retryCount,
+                                    data.notBeforeEpochMillis?.let { kotlin.time.Instant.fromEpochMilliseconds(it) },
                                 )
                             }
                         outcomeAfterExecution(result, data, Instant.now())

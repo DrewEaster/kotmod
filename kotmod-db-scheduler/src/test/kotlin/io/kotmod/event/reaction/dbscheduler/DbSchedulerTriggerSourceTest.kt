@@ -14,8 +14,8 @@ class DbSchedulerTriggerSourceTest {
     ) : EventReactionTrigger
 
     private val source = DbSchedulerTriggerSource<FakeTrigger>()
-    private val first: ReactionHandler<FakeTrigger> = { _, _, _, _ -> ReactionOutcome.Finished(false) }
-    private val second: ReactionHandler<FakeTrigger> = { _, _, _, _ -> ReactionOutcome.Finished(false) }
+    private val first: ReactionHandler<FakeTrigger> = { _, _, _, _, _ -> ReactionOutcome.Finished(false) }
+    private val second: ReactionHandler<FakeTrigger> = { _, _, _, _, _ -> ReactionOutcome.Finished(false) }
 
     @Test
     fun `subscribe stores the handler`() {

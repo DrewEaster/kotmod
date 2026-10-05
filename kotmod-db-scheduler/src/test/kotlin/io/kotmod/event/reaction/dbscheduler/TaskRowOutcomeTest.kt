@@ -98,4 +98,12 @@ class TaskRowOutcomeTest {
         val parked = outcomeAfterExecution(ReactionOutcome.Finished(gaveUp = true), ordered, now) as TaskRowOutcome.Reschedule
         assertEquals(0, ReactionTaskData.decode(parked.taskData).waits)
     }
+
+    @Test
+    fun `wait reschedules after the delay without incrementing retryCount`() {
+        assertEquals(
+            TaskRowOutcome.Reschedule(at = Instant.parse("2026-10-03T10:01:30Z"), taskData = data.encode()),
+            outcomeAfterExecution(ReactionOutcome.Wait(90.seconds), data, now),
+        )
+    }
 }

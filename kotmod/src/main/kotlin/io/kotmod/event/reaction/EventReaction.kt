@@ -8,8 +8,10 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withTimeout
 import org.slf4j.LoggerFactory
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.time.Clock
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.Instant
 
 /** How many times an event reaction has already been retried; 0 on the first attempt. */
 typealias RetryCount = Int
@@ -29,10 +31,13 @@ interface EventReactionTrigger {
  * typically the event's id plus a label, e.g. `EventReactionId("charge-${eventId}")` — so that
  * re-dispatching the same event after a crash is recognised as a duplicate. A random id would create a
  * second reaction.
+ *
+ * [notBefore], if set, delays the reaction: it doesn't run before that time. Delayed reactions can't be ordered.
  */
 data class EventReaction<T : EventReactionTrigger>(
     val id: EventReactionId,
     val trigger: T,
+    val notBefore: Instant? = null,
 )
 
 /** Identifies one event reaction across all of its retries. */
@@ -109,12 +114,16 @@ interface EventReactionTriggerSink<T : EventReactionTrigger> {
     /**
      * Queues reaction [id] with [trigger]. Publishing an id that is already queued must not queue it twice.
      * An ordering stamp is only passed to sinks that support ordering; such sinks must run reactions with the
-     * same key one at a time, in (sequence, ordinal) order.
+     * same key one at a time, in (sequence, ordinal) order. [notBefore], if not null, is the earliest time the
+     * reaction may run: a sink that can schedule should hold the reaction back until then, and every sink must
+     * carry it to the source, which passes it back on delivery. A reaction never has both an ordering stamp and
+     * a [notBefore].
      */
     suspend fun publish(
         id: EventReactionId,
         trigger: T,
         ordering: DispatchOrdering?,
+        notBefore: Instant?,
     )
 }
 
@@ -128,10 +137,11 @@ interface Cancellable {
 interface EventReactionTriggerSource<T : EventReactionTrigger> {
     /**
      * Starts delivering reactions to [block], which runs one attempt and returns a [ReactionOutcome]:
-     * [ReactionOutcome.Retry] if the reaction should run again, or [ReactionOutcome.Finished] once it is done.
-     * Returns a handle that stops delivery.
+     * [ReactionOutcome.Retry] if the reaction should run again (counting a retry), [ReactionOutcome.Wait] if it
+     * isn't due yet (deliver again later without counting a retry), or [ReactionOutcome.Finished] once it is done.
+     * The last argument is the reaction's `notBefore`, as published. Returns a handle that stops delivery.
      */
-    fun subscribe(block: suspend (EventReactionId, EventReactionExecutionId, T, RetryCount) -> ReactionOutcome): Cancellable
+    fun subscribe(block: suspend (EventReactionId, EventReactionExecutionId, T, RetryCount, Instant?) -> ReactionOutcome): Cancellable
 }
 
 /** Exponential backoff for retries the executor schedules itself: 1s, 2s, 4s… capped at [maximumDuration]. */
@@ -160,6 +170,8 @@ class BackoffStrategy(
  * is retried after a [defaultBackoffStrategy] delay ([onCompletion] failures for cancelled reactions are
  * only logged). If [createExecutionContext] throws, or the attempt itself is cancelled (e.g. the
  * scheduler is shutting down), no handler is called and the exception is passed back to the [source].
+ * A delivery before its `notBefore` is put back with [ReactionOutcome.Wait] without creating an execution context
+ * or calling [execute].
  * Delivery is at-least-once, so [execute] and [onCompletion] must be idempotent.
  *
  * @param ExecutionContext app-defined per-attempt context, created by [createExecutionContext].
@@ -173,7 +185,8 @@ class EventReactionExecutor<T : EventReactionTrigger, ExecutionContext>(
     private val timeoutRetryHandler: suspend (EventReactionId, EventReactionExecutionId, T, RetryCount, ExecutionContext) -> RetrySignal,
     private val onCompletion: suspend (EventReactionId, EventReactionExecutionId, T, RetryCount, ExecutionContext, EventReactionCompletionResult) -> Unit,
     private val defaultTimeout: Duration = 60.seconds,
-    private val defaultBackoffStrategy: BackoffStrategy = BackoffStrategy()
+    private val defaultBackoffStrategy: BackoffStrategy = BackoffStrategy(),
+    private val clock: () -> Instant = { Clock.System.now() },
 ) {
     private val log = LoggerFactory.getLogger(EventReactionExecutor::class.java)
 
@@ -197,17 +210,30 @@ class EventReactionExecutor<T : EventReactionTrigger, ExecutionContext>(
         }
     }
 
-    /** Queues reaction [id] with [trigger] for execution, stamped with [ordering] if given. */
-    suspend fun dispatch(id: EventReactionId, trigger: T, ordering: DispatchOrdering? = null) {
+    /** Queues reaction [id] with [trigger] for execution, stamped with [ordering] if given, not before [notBefore] if given. */
+    suspend fun dispatch(
+        id: EventReactionId,
+        trigger: T,
+        ordering: DispatchOrdering? = null,
+        notBefore: Instant? = null,
+    ) {
         require(ordering == null || sink.supportsOrdering) { "This executor's sink does not support ordering" }
-        sink.publish(id, trigger, ordering)
+        require(ordering == null || notBefore == null) {
+            "Delayed reactions can't be ordered: reaction ${id.value} has notBefore $notBefore but its subscription is ordered"
+        }
+        sink.publish(id, trigger, ordering, notBefore)
     }
 
     /** Subscribes to the [source] so reactions start executing. */
     fun start() {
         log.info("Starting event reaction executor")
         subscribeJob =
-            source.subscribe { id, executionId, trigger, retryCount ->
+            source.subscribe { id, executionId, trigger, retryCount, notBefore ->
+                val now = clock()
+                if (notBefore != null && now < notBefore) {
+                    log.debug("Event reaction {} isn't due until {}; waiting", id.value, notBefore)
+                    return@subscribe ReactionOutcome.Wait(notBefore - now)
+                }
                 val executionContext = createExecutionContext(id, trigger)
 
                 runCatching {

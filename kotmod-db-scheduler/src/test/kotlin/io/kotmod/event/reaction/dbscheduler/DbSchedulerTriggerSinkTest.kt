@@ -42,7 +42,7 @@ class DbSchedulerTriggerSinkTest {
         val instance = slot<TaskInstance<String>>()
         every { client.scheduleIfNotExists(capture(instance), any<Instant>()) } returns true
 
-        runBlocking { sink.publish(EventReactionId("charge-e-1"), FakeTrigger("charge"), null) }
+        runBlocking { sink.publish(EventReactionId("charge-e-1"), FakeTrigger("charge"), null, null) }
 
         verify(exactly = 1) { client.scheduleIfNotExists(any<TaskInstance<String>>(), now) }
         assertEquals("billing-reactions", instance.captured.taskName)
@@ -54,13 +54,13 @@ class DbSchedulerTriggerSinkTest {
     fun `publish of an already-scheduled reaction is not an error`() {
         every { client.scheduleIfNotExists(any<TaskInstance<String>>(), any<Instant>()) } returns false
 
-        runBlocking { sink.publish(EventReactionId("charge-e-1"), FakeTrigger("charge"), null) }
+        runBlocking { sink.publish(EventReactionId("charge-e-1"), FakeTrigger("charge"), null, null) }
     }
 
     @Test
     fun `serializer failure propagates and nothing is scheduled`() {
         assertFailsWith<IllegalArgumentException> {
-            runBlocking { sink.publish(EventReactionId("charge-e-1"), FakeTrigger("unserializable"), null) }
+            runBlocking { sink.publish(EventReactionId("charge-e-1"), FakeTrigger("unserializable"), null, null) }
         }
         verify(exactly = 0) { client.scheduleIfNotExists(any<TaskInstance<String>>(), any<Instant>()) }
     }
@@ -71,7 +71,7 @@ class DbSchedulerTriggerSinkTest {
         every { client.scheduleIfNotExists(capture(instance), any<Instant>()) } returns true
 
         runBlocking {
-            orderedSink.publish(EventReactionId("charge-e-1"), FakeTrigger("charge"), DispatchOrdering("Order/o-1", 3, 1, OnGiveUp.BlockAggregate))
+            orderedSink.publish(EventReactionId("charge-e-1"), FakeTrigger("charge"), DispatchOrdering("Order/o-1", 3, 1, OnGiveUp.BlockAggregate), null)
         }
 
         assertEquals(orderedInstanceId("Order/o-1", 3, 1, "charge-e-1"), instance.captured.id)
@@ -88,8 +88,20 @@ class DbSchedulerTriggerSinkTest {
     @Test
     fun `ordered publish is rejected when ordering is not supported`() {
         assertFailsWith<IllegalArgumentException> {
-            runBlocking { sink.publish(EventReactionId("charge-e-1"), FakeTrigger("charge"), DispatchOrdering("Order/o-1", 3, 0, OnGiveUp.ContinueWithNext)) }
+            runBlocking { sink.publish(EventReactionId("charge-e-1"), FakeTrigger("charge"), DispatchOrdering("Order/o-1", 3, 0, OnGiveUp.ContinueWithNext), null) }
         }
         verify(exactly = 0) { client.scheduleIfNotExists(any<TaskInstance<String>>(), any<Instant>()) }
+    }
+
+    @Test
+    fun `a delayed reaction is scheduled at notBefore and carries it in its task data`() {
+        val instance = slot<TaskInstance<String>>()
+        val notBefore = kotlin.time.Instant.parse("2026-10-10T09:00:00Z")
+        every { client.scheduleIfNotExists(capture(instance), any<Instant>()) } returns true
+
+        runBlocking { sink.publish(EventReactionId("remind-e-1"), FakeTrigger("remind"), null, notBefore) }
+
+        verify(exactly = 1) { client.scheduleIfNotExists(any<TaskInstance<String>>(), Instant.parse("2026-10-10T09:00:00Z")) }
+        assertEquals(notBefore.toEpochMilliseconds(), ReactionTaskData.decode(instance.captured.data).notBeforeEpochMillis)
     }
 }

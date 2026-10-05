@@ -59,7 +59,7 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
                     envelope.metadata.eventId.value,
                     position,
                 )
-                executor.dispatch(reaction.id, reaction.trigger, ordering.stampFor(envelope.metadata, firstOrdinal + index))
+                executor.dispatch(reaction.id, reaction.trigger, ordering.stampFor(envelope.metadata, firstOrdinal + index), reaction.notBefore)
             }
             return firstOrdinal + reactions.size
         }

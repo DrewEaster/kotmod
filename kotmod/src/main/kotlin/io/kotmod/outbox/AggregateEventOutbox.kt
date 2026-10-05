@@ -58,14 +58,14 @@ class AggregateEventOutbox<T : EventReactionTrigger>(
             loggerName = "AggregateEventOutbox",
             handleEvent = { envelope ->
                 val reactions = eventToReactions(envelope)
-                reactions.forEachIndexed { ordinal, (id, trigger) ->
+                reactions.forEachIndexed { ordinal, (id, trigger, notBefore) ->
                     log.debug(
                         "Dispatching event reaction {} for DDD event {} [position={}]",
                         id.value,
                         envelope.metadata.eventId.value,
                         envelope.position,
                     )
-                    executor.dispatch(id, trigger, ordering.stampFor(envelope.metadata, ordinal))
+                    executor.dispatch(id, trigger, ordering.stampFor(envelope.metadata, ordinal), notBefore)
                 }
             },
         )

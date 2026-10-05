@@ -12,6 +12,7 @@ import io.mockk.mockk
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
 import kotlin.time.Duration
+import kotlin.time.Instant
 
 class OrderedSourceGuardTest {
     private data class FakeTrigger(
@@ -38,6 +39,7 @@ class OrderedSourceGuardTest {
                         id: EventReactionId,
                         trigger: FakeTrigger,
                         ordering: DispatchOrdering?,
+                        notBefore: Instant?,
                     ) {}
                 },
             source = mockk(),

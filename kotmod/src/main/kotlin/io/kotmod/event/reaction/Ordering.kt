@@ -41,6 +41,11 @@ sealed interface ReactionOutcome {
         val delay: Duration,
     ) : ReactionOutcome
 
+    /** The reaction isn't due yet: deliver it again after about [delay], without counting a retry. */
+    data class Wait(
+        val delay: Duration,
+    ) : ReactionOutcome
+
     /** The reaction is done; [gaveUp] is true when it ended as a failure. */
     data class Finished(
         val gaveUp: Boolean,

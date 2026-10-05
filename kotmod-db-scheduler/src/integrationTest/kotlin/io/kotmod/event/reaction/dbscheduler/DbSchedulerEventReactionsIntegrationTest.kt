@@ -26,7 +26,9 @@ import java.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
+import kotlin.time.Clock
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 
 class DbSchedulerEventReactionsIntegrationTest : IntegrationTest() {
     private fun rowExists(
@@ -305,5 +307,28 @@ class DbSchedulerEventReactionsIntegrationTest : IntegrationTest() {
             )
             assertEquals(2L, offsets.getPosition("order-outbox").globalOffset)
             assertTrue(scheduler.getScheduledExecutionsForTask("order-reactions", String::class.java).isEmpty())
+        }
+
+    @Test
+    fun `a delayed reaction does not run before notBefore, then runs once with retryCount 0`() =
+        runBlocking {
+            val reactions = DbSchedulerEventReactions("test-reactions", TestTriggerSerializer)
+            val scheduler = testScheduler(dataSource, reactions.task)
+            val recorder = ReactionRecorder()
+            val executor = testExecutor(reactions, scheduler, recorder)
+            val notBefore = Clock.System.now() + 3.seconds
+
+            running(scheduler, executor) {
+                executor.dispatch(EventReactionId("later"), TestTrigger("first"), notBefore = notBefore)
+                // A second dispatch of the pending reaction, with a different time, is ignored.
+                executor.dispatch(EventReactionId("later"), TestTrigger("second"), notBefore = Clock.System.now())
+                delay(1_500)
+                assertTrue(recorder.attempts.isEmpty(), "ran before notBefore")
+                eventually { recorder.completions.isNotEmpty() }
+            }
+
+            assertEquals(listOf(TestTrigger("first")), recorder.attempts.map { it.trigger })
+            assertEquals(0, recorder.attempts.single().retryCount)
+            assertTrue(Clock.System.now() >= notBefore)
         }
 }
