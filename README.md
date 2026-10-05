@@ -21,6 +21,7 @@ in**, so those events reliably drive follow-up work in your own service and in o
   - [Ordered reactions](#ordered-reactions)
   - [Using another queue (e.g. Google Pub/Sub)](#using-another-queue-eg-google-pubsub)
   - [Publishing events to other contexts](#publishing-events-to-other-contexts)
+  - [Process managers](#process-managers)
 - [Running in production](#running-in-production)
 - [Known limitations](#known-limitations)
 - [Upgrading from 0.1.0](#upgrading-from-010)
@@ -506,6 +507,8 @@ flowchart LR
   an implementation on db-scheduler; any other queue works too.
 - **Public event** — a stable event published to other bounded contexts, mapped from internal domain
   events.
+- **Process manager** — a long-running workflow that reacts to events, keeps its own state, and asks for
+  commands to be run and inputs to be delivered to it later.
 
 ## Guides
 
@@ -1198,6 +1201,201 @@ fun orderContract(
   able to read every event type your application writes. If you have several event families (orders and
   audit events, say), register them all in one `jsonDataSerializationContext<DomainEvent>` and use
   `DomainEvent` as the contract's internal type.
+
+### Process managers
+
+An aggregate receives commands and emits events. A **process manager** is the mirror image: it receives events,
+keeps its own state, and emits commands. Use one for a long-running workflow that spans several aggregates or
+needs to wait ("if the order hasn't shipped within two days, cancel it"). A process manager never does anything
+synchronously: it asks for commands to be run and for inputs to be delivered to it later. (kotmod says process
+manager, not saga.)
+
+The example below is a dispatch deadline: when an order is placed, wait two days; if it still hasn't shipped,
+cancel it and record that the deadline was missed.
+
+#### Inputs: the anti-corruption layer
+
+A process manager only ever sees its own input type. Everything else is translated into it. `translate` turns
+an event from this context into a `(processId, input)` pair, or `null` to ignore it, and
+`subscribeTo(name, contract) { envelope -> … }` does the same for the public events of another context.
+Inputs are facts, so they can't be rejected.
+
+```kotlin
+@Serializable
+sealed interface DispatchDeadlineInput
+
+@Serializable
+data class OrderWasPlaced(
+    val orderId: String,
+    val placedAt: Instant,
+) : DispatchDeadlineInput
+
+@Serializable
+data object OrderWasShipped : DispatchDeadlineInput
+
+@Serializable
+data object DeadlinePassed : DispatchDeadlineInput
+
+@Serializable
+data class CancellationRefused(
+    val rejection: OrderRejection,
+) : DispatchDeadlineInput
+```
+
+```kotlin
+fun translateOrderEvent(
+    event: PersistedEvent,
+    serialization: DataSerializationContext<OrderEvent>,
+): Pair<AggregateId, DispatchDeadlineInput>? {
+    if (event.metadata.aggregateType != Orders.type) return null
+    val deadline = AggregateId("deadline-${event.metadata.aggregateId.value}")
+    return when (serialization.deserialize(event.serialized)) {
+        is OrderPlaced -> deadline to OrderWasPlaced(event.metadata.aggregateId.value, event.metadata.timestamp)
+        is OrderShipped -> deadline to OrderWasShipped
+        else -> null
+    }
+}
+```
+
+`translate` receives every event in this context's log, except the process manager's own and those of other
+process managers, so filter by aggregate type before deserializing, as `translateOrderEvent` does and as the
+quickstart's outbox does.
+
+#### States own their inputs
+
+A process is an aggregate whose commands are its inputs: each state decides what an input means. `handle`
+returns `transition(newState, events, commands, schedule)` or `ignore()`. An input that is ignored for a process
+that doesn't exist yet creates nothing.
+
+```kotlin
+@Serializable
+sealed interface DispatchDeadlineEvent : DomainEvent
+
+@Serializable
+data class DispatchDeadlineMissed(
+    val orderId: String,
+) : DispatchDeadlineEvent
+
+typealias DispatchDeadlineOutcome = ProcessOutcome<DispatchDeadline, DispatchDeadlineEvent, DispatchDeadlineInput>
+
+sealed interface DispatchDeadline : ProcessState<DispatchDeadline, DispatchDeadlineInput, DispatchDeadlineEvent>
+
+object NoDispatchDeadline : ProcessInitialState<DispatchDeadline, DispatchDeadlineInput, DispatchDeadlineEvent> {
+    override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome =
+        when (input) {
+            is OrderWasPlaced ->
+                transition(
+                    AwaitingDispatch(input.orderId),
+                    schedule = listOf(schedule(DeadlinePassed, at = input.placedAt + 2.days)),
+                )
+            OrderWasShipped, DeadlinePassed, is CancellationRefused -> ignore()
+        }
+}
+
+data class AwaitingDispatch(
+    val orderId: String,
+) : DispatchDeadline {
+    override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome =
+        when (input) {
+            OrderWasShipped -> transition(Dispatched)
+            DeadlinePassed ->
+                transition(
+                    Missed,
+                    events = listOf(DispatchDeadlineMissed(orderId)),
+                    commands = listOf(Orders.command(AggregateId(orderId), CancelOrder("not shipped within 2 days"))),
+                )
+            is OrderWasPlaced, is CancellationRefused -> ignore()
+        }
+}
+
+data object Dispatched : DispatchDeadline {
+    override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome = ignore()
+}
+
+data object Missed : DispatchDeadline {
+    // A CancellationRefused here means the order shipped just before the cancellation reached it: nothing to undo.
+    override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome = ignore()
+}
+```
+
+#### Timeouts
+
+`schedule(input, at)` delivers an input to the same process instance at the given time. There is no way to
+cancel one: a state that has moved on simply ignores it, as `Dispatched` does with `DeadlinePassed` above. A
+timeout delivered early waits until it is due.
+
+#### Commands to other aggregates
+
+`Orders.command(id, command)` only accepts commands of that aggregate kind, so a wrong command doesn't compile.
+kotmod runs it through the target's `AggregateManager.handle` with a command id derived from the request, so a
+redelivery gets the same answer instead of running twice. `target(orders) { command, rejection -> input }` says
+how to turn a typed rejection back into an input for the process, like `CancellationRefused` above.
+
+#### Facts the process owns
+
+`transition(events = …)` records events in the process's own stream (here `DispatchDeadlineMissed`). They are
+internal, like any domain events. To tell other contexts about them, publish them through a
+`PublicEventContract`, as in [Publishing events to other contexts](#publishing-events-to-other-contexts).
+
+#### Wiring with db-scheduler
+
+```kotlin
+fun dispatchDeadlines(
+    jdbc: JdbcContext,
+    serialization: DataSerializationContext<OrderEvent>,
+    orders: AggregateManager<Order, OrderCommand, OrderEvent, OrderRejection>,
+    deadlines: Repository<DispatchDeadline>,
+    deadlineEvents: DataSerializationContext<DispatchDeadlineEvent>,
+    queues: DbSchedulerProcessManagerQueues,
+): ProcessManager<DispatchDeadline, DispatchDeadlineInput, DispatchDeadlineEvent> {
+    val offsets = PostgresOffsetManager(jdbc)
+    return ProcessManager(
+        type = AggregateType("DispatchDeadline"),
+        repository = deadlines,
+        jdbc = jdbc,
+        initial = NoDispatchDeadline,
+        inputSerializer = DispatchDeadlineInput.serializer(),
+        eventSerialization = deadlineEvents,
+        translate = { event -> translateOrderEvent(event, serialization) },
+        targets = listOf(target(orders) { _, rejection -> CancellationRefused(rejection) }),
+        queues = queues,
+        getPosition = { offsets.getPosition("dispatch-deadlines") },
+        savePosition = { offsets.savePosition("dispatch-deadlines", it) },
+        isLeader = { true },
+    )
+}
+
+fun startDispatchDeadlines(
+    dataSource: DataSource,
+    jdbc: JdbcContext,
+    serialization: DataSerializationContext<OrderEvent>,
+    orders: AggregateManager<Order, OrderCommand, OrderEvent, OrderRejection>,
+    deadlines: Repository<DispatchDeadline>,
+    deadlineEvents: DataSerializationContext<DispatchDeadlineEvent>,
+): Scheduler {
+    val queues = DbSchedulerProcessManagerQueues("dispatch-deadlines", jdbc)
+    val process = dispatchDeadlines(jdbc, serialization, orders, deadlines, deadlineEvents, queues)
+    val scheduler = Scheduler.create(dataSource, *queues.tasks.toTypedArray()).enableImmediateExecution().build()
+    queues.bind(scheduler)
+    process.start()
+    scheduler.start()
+    return scheduler
+}
+```
+
+- Start the process manager before the scheduler, and stop it after.
+- Read `queues.tasks` only after the process manager and all its `subscribeTo` calls are built. A channel
+  created later wouldn't be registered with the scheduler.
+- There is one channel per kind of work: inputs (pass `inputOrdering` to order them per source aggregate),
+  internal (timeouts and rejection feedback), commands, and one for each `subscribeTo`.
+- Inputs are stored as JSON with the input class's name. Renaming an input class breaks inputs that are already
+  scheduled or in flight, so keep the old name with `@SerialName`.
+
+#### When things fail
+
+Input delivery and commands are retried with capped backoff and never given up on. A command for an aggregate
+type that isn't one of the process manager's `targets` fails loudly when the process decides on it: nothing is
+recorded, and it is retried until you fix the wiring.
 
 ## Running in production
 

@@ -15,7 +15,9 @@ import io.kotmod.DomainEvent
 import io.kotmod.EventId
 import io.kotmod.EventProducer
 import io.kotmod.OptimisticConcurrencyException
+import io.kotmod.PersistedEvent
 import io.kotmod.PublicDomainEvent
+import io.kotmod.Repository
 import io.kotmod.contract.PublicEventContract
 import io.kotmod.event.reaction.EventReaction
 import io.kotmod.event.reaction.EventReactionExecutor
@@ -25,6 +27,7 @@ import io.kotmod.event.reaction.EventReactionTriggerSerializer
 import io.kotmod.event.reaction.OnGiveUp
 import io.kotmod.event.reaction.ReactionOrdering
 import io.kotmod.event.reaction.dbscheduler.DbSchedulerEventReactions
+import io.kotmod.event.reaction.dbscheduler.DbSchedulerProcessManagerQueues
 import io.kotmod.jdbc.JdbcContext
 import io.kotmod.jdbc.transaction
 import io.kotmod.outbox.AggregateEventOutbox
@@ -32,6 +35,14 @@ import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.PostgresDomainPollingBackend
 import io.kotmod.postgres.PostgresLeaderElection
 import io.kotmod.postgres.PostgresOffsetManager
+import io.kotmod.process.ProcessInitialState
+import io.kotmod.process.ProcessManager
+import io.kotmod.process.ProcessOutcome
+import io.kotmod.process.ProcessState
+import io.kotmod.process.ignore
+import io.kotmod.process.schedule
+import io.kotmod.process.target
+import io.kotmod.process.transition
 import io.kotmod.serialization.jsonDataSerializationContext
 import io.kotmod.serialization.toEventSerializer
 import kotlinx.serialization.Serializable
@@ -42,6 +53,7 @@ import java.sql.DriverManager
 import javax.sql.DataSource
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
+import kotlin.time.Instant
 
 // Guide: Aggregates and commands
 
@@ -302,3 +314,129 @@ fun outboxWithLeaderElection(
         savePosition = { offsets.savePosition("order-notifications", it) },
         isLeader = election::isLeader,
     )
+
+// Guide: Process managers
+
+@Serializable
+sealed interface DispatchDeadlineInput
+
+@Serializable
+data class OrderWasPlaced(
+    val orderId: String,
+    val placedAt: Instant,
+) : DispatchDeadlineInput
+
+@Serializable
+data object OrderWasShipped : DispatchDeadlineInput
+
+@Serializable
+data object DeadlinePassed : DispatchDeadlineInput
+
+@Serializable
+data class CancellationRefused(
+    val rejection: OrderRejection,
+) : DispatchDeadlineInput
+
+@Serializable
+sealed interface DispatchDeadlineEvent : DomainEvent
+
+@Serializable
+data class DispatchDeadlineMissed(
+    val orderId: String,
+) : DispatchDeadlineEvent
+
+typealias DispatchDeadlineOutcome = ProcessOutcome<DispatchDeadline, DispatchDeadlineEvent, DispatchDeadlineInput>
+
+sealed interface DispatchDeadline : ProcessState<DispatchDeadline, DispatchDeadlineInput, DispatchDeadlineEvent>
+
+object NoDispatchDeadline : ProcessInitialState<DispatchDeadline, DispatchDeadlineInput, DispatchDeadlineEvent> {
+    override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome =
+        when (input) {
+            is OrderWasPlaced ->
+                transition(
+                    AwaitingDispatch(input.orderId),
+                    schedule = listOf(schedule(DeadlinePassed, at = input.placedAt + 2.days)),
+                )
+            OrderWasShipped, DeadlinePassed, is CancellationRefused -> ignore()
+        }
+}
+
+data class AwaitingDispatch(
+    val orderId: String,
+) : DispatchDeadline {
+    override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome =
+        when (input) {
+            OrderWasShipped -> transition(Dispatched)
+            DeadlinePassed ->
+                transition(
+                    Missed,
+                    events = listOf(DispatchDeadlineMissed(orderId)),
+                    commands = listOf(Orders.command(AggregateId(orderId), CancelOrder("not shipped within 2 days"))),
+                )
+            is OrderWasPlaced, is CancellationRefused -> ignore()
+        }
+}
+
+data object Dispatched : DispatchDeadline {
+    override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome = ignore()
+}
+
+data object Missed : DispatchDeadline {
+    // A CancellationRefused here means the order shipped just before the cancellation reached it: nothing to undo.
+    override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome = ignore()
+}
+
+fun translateOrderEvent(
+    event: PersistedEvent,
+    serialization: DataSerializationContext<OrderEvent>,
+): Pair<AggregateId, DispatchDeadlineInput>? {
+    if (event.metadata.aggregateType != Orders.type) return null
+    val deadline = AggregateId("deadline-${event.metadata.aggregateId.value}")
+    return when (serialization.deserialize(event.serialized)) {
+        is OrderPlaced -> deadline to OrderWasPlaced(event.metadata.aggregateId.value, event.metadata.timestamp)
+        is OrderShipped -> deadline to OrderWasShipped
+        else -> null
+    }
+}
+
+fun dispatchDeadlines(
+    jdbc: JdbcContext,
+    serialization: DataSerializationContext<OrderEvent>,
+    orders: AggregateManager<Order, OrderCommand, OrderEvent, OrderRejection>,
+    deadlines: Repository<DispatchDeadline>,
+    deadlineEvents: DataSerializationContext<DispatchDeadlineEvent>,
+    queues: DbSchedulerProcessManagerQueues,
+): ProcessManager<DispatchDeadline, DispatchDeadlineInput, DispatchDeadlineEvent> {
+    val offsets = PostgresOffsetManager(jdbc)
+    return ProcessManager(
+        type = AggregateType("DispatchDeadline"),
+        repository = deadlines,
+        jdbc = jdbc,
+        initial = NoDispatchDeadline,
+        inputSerializer = DispatchDeadlineInput.serializer(),
+        eventSerialization = deadlineEvents,
+        translate = { event -> translateOrderEvent(event, serialization) },
+        targets = listOf(target(orders) { _, rejection -> CancellationRefused(rejection) }),
+        queues = queues,
+        getPosition = { offsets.getPosition("dispatch-deadlines") },
+        savePosition = { offsets.savePosition("dispatch-deadlines", it) },
+        isLeader = { true },
+    )
+}
+
+fun startDispatchDeadlines(
+    dataSource: DataSource,
+    jdbc: JdbcContext,
+    serialization: DataSerializationContext<OrderEvent>,
+    orders: AggregateManager<Order, OrderCommand, OrderEvent, OrderRejection>,
+    deadlines: Repository<DispatchDeadline>,
+    deadlineEvents: DataSerializationContext<DispatchDeadlineEvent>,
+): Scheduler {
+    val queues = DbSchedulerProcessManagerQueues("dispatch-deadlines", jdbc)
+    val process = dispatchDeadlines(jdbc, serialization, orders, deadlines, deadlineEvents, queues)
+    val scheduler = Scheduler.create(dataSource, *queues.tasks.toTypedArray()).enableImmediateExecution().build()
+    queues.bind(scheduler)
+    process.start()
+    scheduler.start()
+    return scheduler
+}
