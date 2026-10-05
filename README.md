@@ -704,10 +704,10 @@ kotmod's writes share one transaction whichever side opens it:
 
 - Inside `jdbc.transaction { }`, call your SQLDelight queries as usual — they join kotmod's transaction.
 - Inside your own `database.transaction { }`, call kotmod from blocking code (SQLDelight's block can't
-  suspend), e.g. `runBlocking { orders.handle(id, command) }`; commands join your transaction. Wrap several in
-  `runBlocking { jdbc.transaction { … } }` to get kotmod's thread checks too. In a transaction SQLDelight
-  opened, SQLDelight's rules apply: if a kotmod call fails and you catch it, SQLDelight rolls your
-  transaction back when it ends.
+  suspend), e.g. `runBlocking { orders.handle(id, command) }`; commands join your transaction. Wrap
+  several in `runBlocking { jdbc.transaction { … } }` to get kotmod's thread checks too. In a transaction
+  SQLDelight opened, SQLDelight's rules apply: if a kotmod call fails and you catch it, SQLDelight rolls
+  your transaction back when it ends.
 
 Repositories implemented with SQLDelight queries need no changes: they already run inside the transaction.
 
@@ -1178,7 +1178,7 @@ Pass `isLeader = election::isLeader` to each outbox and contract:
 | A node crashes mid-reaction | db-scheduler notices the missing heartbeat and runs it again |
 | The database is down while dispatching | The outbox batch stops and resumes from the last saved position on the next poll |
 | The outbox can't deserialize an event (e.g. another aggregate type's) | The batch stops and is retried every poll, so later events wait — filter by aggregate type as the quickstart does |
-| A command loses a concurrent update | `OptimisticConcurrencyException` — run the command again |
+| A command loses a concurrent update | `handle` reads and decides again, up to `maxConflictRetries` times (5 by default). `OptimisticConcurrencyException` only surfaces when those run out: reduce contention on that aggregate or raise `maxConflictRetries`. Inside an outer `jdbc.transaction { }` there are no retries: retry the whole transaction |
 
 **Tune throughput.** The outbox and contracts poll every 500ms (`pollInterval`) and read up to 100
 events per poll (`batchSize`). `Scheduler.threads(n)` caps how many reactions run at once.
