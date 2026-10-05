@@ -27,7 +27,8 @@ strings.
   and the pure function). IDE click-through navigability is explicitly *not* a design criterion; typed domain
   language that AI coding tools can follow is.
 - **Pure functions stay on specific state types** and return an `Outcome` (`accept(...)` or `reject(...)`)
-  instead of a `Pair`.
+  instead of a `Pair`. The blocks passed to `on`, `creates` and `any` are `suspend`, as today's
+  `create`/`execute` blocks are: decisions should be pure, but suspending is allowed for pragmatism.
 - **Every rejection is a domain type** (`R`), including "wrong state", "doesn't exist" and "already exists";
   kotmod defines no rejection cases of its own.
 - **`handle` replaces `create` and `execute`** (no deprecation cycle; released as 0.2.0).
@@ -86,12 +87,12 @@ when (val result = payouts.handle(id, Release(ref), commandId = CommandId(reques
   an abstract base, normally extended by an `object`, with:
   - `abstract fun C.handler(): CommandHandler<S, E, R>`: the routing point. Being abstract, it must be
     written; being an exhaustive `when` over a sealed command type, every command must be routed.
-  - `inline fun <reified T : S> on(noinline otherwise: (S?) -> R, noinline block: (T) -> Outcome<S, E, R>)`:
+  - `inline fun <reified T : S> on(noinline otherwise: (S?) -> R, noinline block: suspend (T) -> Outcome<S, E, R>)`:
     runs `block` when the current state is a `T`; otherwise rejects with `otherwise(state)` (`null` means the
     aggregate does not exist).
-  - `fun creates(otherwise: (S) -> R, block: () -> Outcome<S, E, R>)`: runs `block` only when the aggregate
+  - `fun creates(otherwise: (S) -> R, block: suspend () -> Outcome<S, E, R>)`: runs `block` only when the aggregate
     does not exist; otherwise rejects with `otherwise(existingState)`.
-  - `fun any(block: (S?) -> Outcome<S, E, R>)`: the escape hatch for a command valid in several states.
+  - `fun any(block: suspend (S?) -> Outcome<S, E, R>)`: the escape hatch for a command valid in several states.
   - These are members (not top-level functions) because Kotlin cannot infer `S`, `E` and `R` when a caller
     supplies only `T` in `on<Held>`; binding them on the class makes `on<Held>` compile with one type
     argument. The class is also the natural home for the rejection serializer.
@@ -138,7 +139,8 @@ when (val result = payouts.handle(id, Release(ref), commandId = CommandId(reques
 (which backends throw when the same command id is recorded twice) — `handle` starts again from step 1, which
 re-reads (and so returns the recorded answer if the other writer used the same command id) and re-decides.
 After `maxConflictRetries` retries it rethrows the last conflict exception (normally
-`OptimisticConcurrencyException`). Re-running is safe because deciding is pure.
+`OptimisticConcurrencyException`). Re-running is safe when deciding is pure; a suspending decision that calls
+out to something is called again on each attempt, which the README documents.
 
 **Inside an outer `jdbc.transaction { }`** (detected through `backend.isInTransaction()`), `handle` never
 retries: a conflict propagates and the outer transaction rolls back, as documented today. A rejection is a

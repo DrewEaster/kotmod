@@ -16,7 +16,7 @@
 - `handle` is the only method that changes an aggregate; `create`, `execute` and the narrowed `execute<T>` are removed (no deprecation cycle).
 - `CommandHandlers` members: `on<T>(otherwise: (S?) -> R, block: (T) -> Outcome<S, E, R>)`, `creates(otherwise: (S) -> R, block: () -> Outcome<S, E, R>)`, `any(block: (S?) -> Outcome<S, E, R>)`; abstract `fun C.handler(): CommandHandler<S, E, R>`; constructor parameter `rejectionSerializer: KSerializer<R>`.
 - `AggregateManager<S : Any, E : DomainEvent, C : Any, R : Any>(aggregateType, repository, backend, commands, maxConflictRetries: Int = 5)`.
-- Command functions are pure and **not** `suspend` (a change from `create`/`execute`, whose blocks were `suspend`).
+- The blocks passed to `on`, `creates` and `any` are `suspend`, like today's `create`/`execute` blocks. Decisions should be pure, but suspending is allowed for pragmatism; a decision re-runs on each conflict retry.
 - Rejections are recorded in `ddd_command_history.rejection_type VARCHAR(255)` (JVM class name, informational) and `rejection_payload TEXT` (JSON from the rejection serializer); a null `rejection_type` means accepted.
 - Conflicts (`OptimisticConcurrencyException`, `AggregateAlreadyExistsException`, `CommandAlreadyRecordedException`) are retried up to `maxConflictRetries` times, never inside an outer transaction; when retries run out, the last conflict exception is rethrown.
 - A duplicate command id returns the recorded answer: `Accepted(current state)` or the same `Rejected(r)`.
@@ -65,7 +65,7 @@
   - `sealed interface Outcome<out S, out E : DomainEvent, out R>` with `data class Accept<out S, out E : DomainEvent>(val state: S, val events: List<E>) : Outcome<S, E, Nothing>` and `data class Reject<out R>(val rejection: R) : Outcome<Nothing, Nothing, R>`
   - `fun <S, E : DomainEvent> accept(state: S, vararg events: E): Outcome<S, E, Nothing>`
   - `fun <R> reject(rejection: R): Outcome<Nothing, Nothing, R>`
-  - `class CommandHandler<S : Any, out E : DomainEvent, out R : Any>` with `internal val decide: (S?) -> Outcome<S, E, R>`
+  - `class CommandHandler<S : Any, out E : DomainEvent, out R : Any>` with `internal val decide: suspend (S?) -> Outcome<S, E, R>`
   - `abstract class CommandHandlers<S : Any, C : Any, E : DomainEvent, R : Any>(val rejectionSerializer: KSerializer<R>)` with `abstract fun C.handler()`, `on`, `creates`, `any`, and `internal fun handlerFor(command: C): CommandHandler<S, E, R>`
   - `sealed interface CommandResult<out S, out R>` with `data class Accepted<out S>(val state: S) : CommandResult<S, Nothing>` and `data class Rejected<out R>(val rejection: R) : CommandResult<Nothing, R>`
 
@@ -76,6 +76,8 @@ Create `kotmod/src/test/kotlin/io/kotmod/CommandHandlersTest.kt`. It defines its
 ```kotlin
 package io.kotmod
 
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.Serializable
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -132,14 +134,18 @@ class CommandHandlersTest {
                     on<Held>(otherwise = { state -> if (state == null) PayoutNotFound else PayoutNotHeld(state::class.simpleName!!) }) {
                         it.release(reference)
                     }
-                Inspect -> any { state -> accept(state ?: Held(0)) }
+                Inspect ->
+                    any { state ->
+                        delay(1) // blocks may suspend
+                        accept(state ?: Held(0))
+                    }
             }
     }
 
     private fun decide(
         command: PayoutCommand,
         state: Payout?,
-    ) = PayoutCommands.handlerFor(command).decide(state)
+    ) = kotlinx.coroutines.runBlocking { PayoutCommands.handlerFor(command).decide(state) }
 
     @Test
     fun `on runs the block when the state has the required type`() {
@@ -232,11 +238,13 @@ fun <R> reject(rejection: R): Outcome<Nothing, Nothing, R> = Outcome.Reject(reje
 class CommandHandler<S : Any, out E : DomainEvent, out R : Any>
     @PublishedApi
     internal constructor(
-        internal val decide: (S?) -> Outcome<S, E, R>,
+        internal val decide: suspend (S?) -> Outcome<S, E, R>,
     )
 
 /**
- * The commands of one aggregate type, and the single place that routes each command to a pure function.
+ * The commands of one aggregate type, and the single place that routes each command to a function that decides it.
+ * Decisions should be pure; they may suspend, but [AggregateManager.handle] runs a decision again on each conflict
+ * retry, so anything it calls out to may be called more than once.
  *
  * Extend it with an `object` and implement [handler] as an exhaustive `when` over your sealed command type, one
  * line per command:
@@ -269,18 +277,18 @@ abstract class CommandHandlers<S : Any, C : Any, E : DomainEvent, R : Any>(
      */
     inline fun <reified T : S> on(
         noinline otherwise: (S?) -> R,
-        noinline block: (T) -> Outcome<S, E, R>,
+        noinline block: suspend (T) -> Outcome<S, E, R>,
     ): CommandHandler<S, E, R> =
         CommandHandler { state -> if (state is T) block(state) else Outcome.Reject(otherwise(state)) }
 
     /** Runs [block] only when the aggregate does not exist yet. Otherwise rejects with [otherwise]. */
     fun creates(
         otherwise: (S) -> R,
-        block: () -> Outcome<S, E, R>,
+        block: suspend () -> Outcome<S, E, R>,
     ): CommandHandler<S, E, R> = CommandHandler { state -> if (state == null) block() else Outcome.Reject(otherwise(state)) }
 
     /** Runs [block] with the full current state (`null` when the aggregate does not exist), for commands valid in several states. */
-    fun any(block: (S?) -> Outcome<S, E, R>): CommandHandler<S, E, R> = CommandHandler(block)
+    fun any(block: suspend (S?) -> Outcome<S, E, R>): CommandHandler<S, E, R> = CommandHandler(block)
 
     internal fun handlerFor(command: C): CommandHandler<S, E, R> = command.handler()
 }
@@ -750,7 +758,7 @@ data class CancelOrder(
 
 /** Test-only: decides with [block], for scenarios such as a side effect between read and write. */
 class DecideWith(
-    val block: (Order?) -> Outcome<Order, OrderEvent, OrderRejection>,
+    val block: suspend (Order?) -> Outcome<Order, OrderEvent, OrderRejection>,
 ) : OrderCommand
 
 @Serializable
@@ -989,6 +997,23 @@ class AggregateManagerHandleTest {
 
             assertEquals(emptyList(), backend.writesOutsideTransaction)
             assertEquals(3, backend.transactionsCommitted)
+        }
+
+    @Test
+    fun `a decision may suspend`() =
+        runTest {
+            orders.handle(id, PlaceOrder("book"))
+
+            val result =
+                orders.handle(
+                    id,
+                    DecideWith { state ->
+                        kotlinx.coroutines.delay(1)
+                        (state as PendingOrder).ship()
+                    },
+                )
+
+            assertEquals(CommandResult.Accepted(ShippedOrder("book")), result)
         }
 
     @Test
@@ -1312,7 +1337,7 @@ class OptimisticConcurrencyException(
 - [ ] **Step 6: Run the unit tests to verify they pass**
 
 Run: `./gradlew :kotmod:test`
-Expected: PASS, including `AggregateManagerHandleTest` (19 tests) and `CommandHandlersTest`.
+Expected: PASS, including `AggregateManagerHandleTest` (20 tests) and `CommandHandlersTest`.
 
 - [ ] **Step 7: Migrate the JDBC contract tests**
 
@@ -1833,7 +1858,7 @@ Replace the guide section from `### Aggregates and commands` up to (not includin
 4. **Why commands are data**: every caller (an HTTP handler, an event reaction, and later a process manager) runs a command the same way, through the one routing point, so the rules for which state a command needs and how it is refused live in one place.
 5. **Event sequence numbers**: keep the existing paragraph unchanged.
 6. **Idempotency**: pass a `CommandId` you control. A repeated id returns the recorded answer: an accepted command returns the aggregate's *current* state without running again, and a rejected one returns the same rejection, even if the state would now allow the command. Without a command id, kotmod generates a random one and the call is not idempotent. Keep the existing `CorrelationId` sentence.
-7. **Concurrency**: each aggregate has a version. If someone else changes the aggregate between your read and your write, `handle` reads again and decides again, up to `maxConflictRetries` times (5 by default; deciding is pure, so that is safe), and then throws `OptimisticConcurrencyException`. Delete the `retryOnConflict` example.
+7. **Concurrency**: each aggregate has a version. If someone else changes the aggregate between your read and your write, `handle` reads again and decides again, up to `maxConflictRetries` times (5 by default), and then throws `OptimisticConcurrencyException`. Deciding again is safe when decisions are pure. Decision blocks may suspend, but anything a decision calls out to may then be called once per attempt. Delete the `retryOnConflict` example.
 8. **Your repository joins the transaction**: keep the existing paragraph unchanged.
 
 - [ ] **Step 5: Update "Several aggregates in one transaction"**
@@ -1874,8 +1899,8 @@ Add a section `## Upgrading from 0.1.0` before `## Status and contributing`, and
 >
 >    Existing rows read as accepted commands.
 > 2. For each aggregate, define a sealed command type and a sealed rejection type, change your command
->    functions to return `accept(...)` or `reject(...)` (they are no longer `suspend`), and route the commands in a
->    `CommandHandlers` object, as in [the quickstart](#2-define-state-events-commands-and-rejections).
+>    functions to return `accept(...)` or `reject(...)`, and route the commands in a `CommandHandlers` object,
+>    as in [the quickstart](#2-define-state-events-commands-and-rejections).
 > 3. Pass that object as `commands` to `AggregateManager`, and replace `create { }` and `execute<T> { }` calls
 >    with `handle(id, command)`.
 > 4. Replace `catch (e: UnexpectedAggregateStateException)` with a rejection from `otherwise`, and drop any
