@@ -78,7 +78,7 @@ class QuickstartTest : IntegrationTest() {
 
             orders.handle(orderId, PlaceOrder("book"))
 
-            val shipped = orders.handle(orderId, ShipOrder)
+            val result = orders.handle(orderId, ShipOrder)
 
             val notifications = DbSchedulerEventReactions("order-notifications", OrderNotificationSerializer)
 
@@ -158,7 +158,7 @@ class QuickstartTest : IntegrationTest() {
                 executor.stop()
             }
 
-            assertEquals(CommandResult.Accepted(ShippedOrder("book")), shipped)
+            assertEquals(CommandResult.Accepted(ShippedOrder("book")), result)
             assertEquals(listOf("order-1"), sentConfirmations.toList())
         }
 

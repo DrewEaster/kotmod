@@ -4,14 +4,17 @@ package io.kotmod.readme
 
 import com.github.kagkarlsson.scheduler.Scheduler
 import io.kotmod.AggregateId
+import io.kotmod.AggregateAlreadyExistsException
 import io.kotmod.AggregateManager
 import io.kotmod.AggregateType
+import io.kotmod.CommandAlreadyRecordedException
 import io.kotmod.CommandId
 import io.kotmod.CommandResult
 import io.kotmod.DataSerializationContext
 import io.kotmod.DomainEvent
 import io.kotmod.EventId
 import io.kotmod.EventProducer
+import io.kotmod.OptimisticConcurrencyException
 import io.kotmod.PublicDomainEvent
 import io.kotmod.contract.PublicEventContract
 import io.kotmod.event.reaction.EventReaction
@@ -70,6 +73,23 @@ suspend fun shipAndInvoice(
         val invoiced = invoices.handle(AggregateId("invoice-${orderId.value}"), PlaceOrder("invoice"))
         if (invoiced is CommandResult.Rejected) throw IllegalStateException("Can't invoice: ${invoiced.rejection}")
     }
+}
+
+suspend fun <T> retryTransaction(
+    jdbc: JdbcContext,
+    attempts: Int = 3,
+    block: suspend () -> T,
+): T {
+    repeat(attempts - 1) {
+        try {
+            return jdbc.transaction { block() }
+        } catch (e: OptimisticConcurrencyException) {
+            // Another writer got there first: run the whole transaction again.
+        } catch (e: AggregateAlreadyExistsException) {
+        } catch (e: CommandAlreadyRecordedException) {
+        }
+    }
+    return jdbc.transaction { block() }
 }
 
 // Guide: Event-only aggregates

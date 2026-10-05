@@ -64,7 +64,7 @@ class CommandHandlersTest {
     private fun decide(
         command: PayoutCommand,
         state: Payout?,
-    ) = kotlinx.coroutines.runBlocking { PayoutCommands.handlerFor(command).decide(state) }
+    ) = kotlinx.coroutines.runBlocking { PayoutCommands.decide(command, state) }
 
     @Test
     fun `on runs the block when the state has the required type`() {

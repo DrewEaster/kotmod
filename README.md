@@ -328,7 +328,7 @@ val orderId = AggregateId("order-1")
 
 orders.handle(orderId, PlaceOrder("book"))
 
-val shipped = orders.handle(orderId, ShipOrder)
+val result = orders.handle(orderId, ShipOrder)
 ```
 
 An accepted command saves the order's state, appends its events to the event log and records the command,
@@ -511,6 +511,9 @@ runs only when the state is a `T`. `creates(otherwise)` runs only when the aggre
 `any { state -> … }` is for a command that is valid in several states. `otherwise` receives the actual
 state, or `null` when the aggregate doesn't exist, so you can reject differently by state.
 
+Because decisions are pure, you can unit-test your routing without a database: `OrderCommands.decide(command,
+state)` returns the `Outcome` for a command against a state (`null` for an aggregate that doesn't exist yet).
+
 Callers match on the result; a rejection is a value, never an exception:
 
 ```kotlin
@@ -601,6 +604,28 @@ suspend fun shipAndInvoice(
 - This is the only way an aggregate's events can reach the event log out of order. kotmod still delivers
   them in order, but such aggregates pay a slower check when replayed (see
   [Known limitations](#known-limitations)).
+
+A conflict in a transaction is not retried for you. To retry, run the whole transaction again, for example
+with this helper:
+
+```kotlin
+suspend fun <T> retryTransaction(
+    jdbc: JdbcContext,
+    attempts: Int = 3,
+    block: suspend () -> T,
+): T {
+    repeat(attempts - 1) {
+        try {
+            return jdbc.transaction { block() }
+        } catch (e: OptimisticConcurrencyException) {
+            // Another writer got there first: run the whole transaction again.
+        } catch (e: AggregateAlreadyExistsException) {
+        } catch (e: CommandAlreadyRecordedException) {
+        }
+    }
+    return jdbc.transaction { block() }
+}
+```
 
 ### Event-only aggregates
 
@@ -1178,7 +1203,7 @@ Pass `isLeader = election::isLeader` to each outbox and contract:
 | A node crashes mid-reaction | db-scheduler notices the missing heartbeat and runs it again |
 | The database is down while dispatching | The outbox batch stops and resumes from the last saved position on the next poll |
 | The outbox can't deserialize an event (e.g. another aggregate type's) | The batch stops and is retried every poll, so later events wait — filter by aggregate type as the quickstart does |
-| A command loses a concurrent update | `handle` reads and decides again, up to `maxConflictRetries` times (5 by default). `OptimisticConcurrencyException` only surfaces when those run out: reduce contention on that aggregate or raise `maxConflictRetries`. Inside an outer `jdbc.transaction { }` there are no retries: retry the whole transaction |
+| A command loses a concurrent update | `handle` reads and decides again, up to `maxConflictRetries` times (5 by default). `OptimisticConcurrencyException` only surfaces when those run out: reduce contention on that aggregate or raise `maxConflictRetries`. Inside an outer `jdbc.transaction { }` there are no retries: retry the whole transaction (see [Several aggregates in one transaction](#several-aggregates-in-one-transaction)) |
 
 **Tune throughput.** The outbox and contracts poll every 500ms (`pollInterval`) and read up to 100
 events per poll (`batchSize`). `Scheduler.threads(n)` caps how many reactions run at once.

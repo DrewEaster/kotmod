@@ -46,6 +46,12 @@ class AggregateManager<S : Any, E : DomainEvent, C : Any, R : Any>(
      * If [commandId] has already been handled for [id], the recorded answer is returned without deciding again:
      * the current state if it was accepted, or the same rejection if it was rejected. A random command id is
      * used when none is given, which makes the call non-idempotent. [correlationId] is stored with every event.
+     *
+     * @throws OptimisticConcurrencyException (or the last conflict exception, such as
+     *   [AggregateAlreadyExistsException] or [CommandAlreadyRecordedException]) when the write keeps losing races
+     *   and the retries run out, or immediately when called inside an outer transaction.
+     * @throws AggregateNotFoundException if a recorded accepted answer refers to an aggregate whose state is gone.
+     * @throws RejectionDeserializationException if the recorded rejection can't be read back.
      */
     suspend fun handle(
         id: AggregateId,
@@ -59,6 +65,9 @@ class AggregateManager<S : Any, E : DomainEvent, C : Any, R : Any>(
         while (true) {
             try {
                 return handleOnce(id, command, resolvedCommandId, correlationId)
+            } catch (e: DecisionFailed) {
+                // Not this handle's own write conflict (it may come from a nested handle): never retried.
+                throw e.original
             } catch (e: DddException) {
                 if (!e.isConflict() || attempt >= retries) throw e
                 attempt++
@@ -68,6 +77,11 @@ class AggregateManager<S : Any, E : DomainEvent, C : Any, R : Any>(
 
     private suspend fun inOuterTransaction(): Boolean =
         currentCoroutineContext()[KotmodTransaction] != null || backend.isInTransaction()
+
+    /** Carries an exception out of the decide phase past the conflict retry in [handle]. */
+    private class DecisionFailed(
+        val original: DddException,
+    ) : RuntimeException(original)
 
     private fun DddException.isConflict(): Boolean =
         this is OptimisticConcurrencyException ||
@@ -99,7 +113,12 @@ class AggregateManager<S : Any, E : DomainEvent, C : Any, R : Any>(
             }
 
         // Phase 2: Decide — pure, no database work
-        val outcome = commands.handlerFor(command).decide(undecided.state)
+        val outcome =
+            try {
+                commands.decide(command, undecided.state)
+            } catch (e: DddException) {
+                throw DecisionFailed(e)
+            }
 
         // Phase 3: Write — tight transaction
         databaseWork(backend::isInTransaction) {
@@ -127,7 +146,8 @@ class AggregateManager<S : Any, E : DomainEvent, C : Any, R : Any>(
                             aggregateType,
                             id,
                             commandId,
-                            rejectionType = outcome.rejection::class.java.name,
+                            // rejection_type is VARCHAR(255) and only informational: truncate rather than fail the insert.
+                            rejectionType = outcome.rejection::class.java.name.take(MAX_REJECTION_TYPE_LENGTH),
                             payload = Json.encodeToString(commands.rejectionSerializer, outcome.rejection),
                         )
                 }
@@ -137,6 +157,10 @@ class AggregateManager<S : Any, E : DomainEvent, C : Any, R : Any>(
             is Outcome.Accept -> CommandResult.Accepted(outcome.state)
             is Outcome.Reject -> CommandResult.Rejected(outcome.rejection)
         }
+    }
+
+    private companion object {
+        const val MAX_REJECTION_TYPE_LENGTH = 255
     }
 
     private fun requireState(id: AggregateId): S = repository.get(id) ?: throw AggregateNotFoundException(aggregateType, id)

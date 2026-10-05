@@ -26,7 +26,8 @@ class EventProducer<E : DomainEvent>(
      * Appends [events] for aggregate [id], creating the aggregate's bookkeeping on first use.
      *
      * Does nothing if [commandId] has already been handled for [id]. Throws
-     * [OptimisticConcurrencyException] if another call changed the aggregate concurrently.
+     * [OptimisticConcurrencyException] if another call changed the aggregate concurrently. A concurrent call with
+     * the same command id surfaces as [CommandAlreadyRecordedException]. [emit] does not retry either.
      */
     suspend fun emit(
         id: AggregateId,

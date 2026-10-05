@@ -217,6 +217,24 @@ class AggregateManagerHandleTest {
         }
 
     @Test
+    fun `a conflict thrown by the decision propagates without a retry`() =
+        runTest {
+            var decisions = 0
+
+            assertFailsWith<OptimisticConcurrencyException> {
+                orders.handle(
+                    id,
+                    DecideWith {
+                        decisions++
+                        throw OptimisticConcurrencyException(type, id, 0)
+                    },
+                )
+            }
+
+            assertEquals(1, decisions)
+        }
+
+    @Test
     fun `when retries run out the last conflict exception is rethrown`() =
         runTest {
             orders.handle(id, PlaceOrder("book"))

@@ -91,7 +91,14 @@ abstract class CommandHandlers<S : Any, C : Any, E : DomainEvent, R : Any>(
     /** Runs [block] with the full current state (`null` when the aggregate does not exist), for commands valid in several states. */
     fun any(block: suspend (S?) -> Outcome<S, E, R>): CommandHandler<S, E, R> = CommandHandler(block)
 
-    internal fun handlerFor(command: C): CommandHandler<S, E, R> = command.handler()
+    /**
+     * Decides [command] against [state] (`null` when the aggregate does not exist) without touching the database.
+     * Use it to unit-test your routing and `otherwise` mappings.
+     */
+    suspend fun decide(
+        command: C,
+        state: S?,
+    ): Outcome<S, E, R> = command.handler().decide(state)
 }
 
 /** What [AggregateManager.handle] returns. */
