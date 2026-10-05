@@ -1055,7 +1055,7 @@ fun <C : Any, R : Any, I : Any> target(
         }
     }
 
-private val log = LoggerFactory.getLogger(ProcessManager::class.java)
+private val log = LoggerFactory.getLogger("io.kotmod.process.ProcessManager")
 
 /**
  * An executor for one process manager channel: [run] does the work; any exception is retried with capped backoff and
@@ -1085,8 +1085,6 @@ internal fun <T : EventReactionTrigger> processExecutor(
     )
 }
 ```
-
-`ProcessManager` doesn't exist until Task 4. Until then, use `LoggerFactory.getLogger("io.kotmod.process.ProcessManager")` (a string). Keep it as the string; no change is needed in Task 4.
 
 `AggregateManager<*, C, *, R>` is a star projection with a bounded first parameter. If the compiler rejects calling `handle` on it, declare the function with explicit type parameters instead: `fun <S : AggregateState<S, C, E, R>, C : Any, E : DomainEvent, R : Any, I : Any> target(manager: AggregateManager<S, C, E, R>, onRejected: (C, R) -> I)`. Record it in your report; callers' code doesn't change.
 
@@ -1662,7 +1660,6 @@ package io.kotmod.event.reaction.dbscheduler
 import io.kotmod.AggregateId
 import io.kotmod.AggregateManager
 import io.kotmod.AggregateType
-import io.kotmod.EventLogPosition
 import io.kotmod.Repository
 import io.kotmod.jdbc.JdbcContext
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
@@ -1836,7 +1833,7 @@ class ProcessManagerIntegrationTest : IntegrationTest() {
                 targets = listOf(target(orders) { _, rejection -> ReleaseBlocked(rejection) }),
                 queues = queues,
                 inputOrdering = ReactionOrdering.PerAggregate(),
-                getPosition = { offsets.getPosition("windows") ?: EventLogPosition.START },
+                getPosition = { offsets.getPosition("windows") },
                 savePosition = { offsets.savePosition("windows", it) },
                 isLeader = { true },
                 clock = clock,
@@ -1899,7 +1896,7 @@ class ProcessManagerIntegrationTest : IntegrationTest() {
 }
 ```
 
-Adapt to the real signatures if they differ: `PostgresOffsetManager.getPosition` may return a non-null `EventLogPosition`, in which case drop the `?: EventLogPosition.START`, and the event-type check may need the serialized type name used by `orderEventSerialization()`. Check `OrderPlaced`'s serialized type with a quick look at the fixture, and match it exactly rather than with `endsWith`.
+Adapt to the real signatures if they differ: the event-type check may need the serialized type name used by `orderEventSerialization()`. Check `OrderPlaced`'s serialized type with a quick look at the fixture, and match it exactly rather than with `endsWith`.
 
 - [ ] **Step 2: Run it to verify it fails**
 
@@ -2086,12 +2083,8 @@ data object Dispatched : DispatchDeadline {
 }
 
 data object Missed : DispatchDeadline {
-    override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome =
-        when (input) {
-            // The order shipped just before the cancellation reached it: nothing to undo.
-            is CancellationRefused -> ignore()
-            is OrderWasPlaced, OrderWasShipped, DeadlinePassed -> ignore()
-        }
+    // A CancellationRefused here means the order shipped just before the cancellation reached it: nothing to undo.
+    override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome = ignore()
 }
 
 fun translateOrderEvent(
@@ -2150,7 +2143,7 @@ fun startDispatchDeadlines(
 }
 ```
 
-`Instant` here is `kotlin.time.Instant`, and `event.metadata.timestamp` is already one. If `kotlin.time.Instant` isn't `@Serializable`-supported by kotlinx.serialization 1.11 in `OrderWasPlaced`, store `placedAtEpochSeconds: Long` instead, and use `Instant.fromEpochSeconds(input.placedAtEpochSeconds) + 2.days`. If `PostgresOffsetManager.getPosition` returns a nullable value, follow the existing outbox examples in this file exactly.
+`Instant` here is `kotlin.time.Instant`, and `event.metadata.timestamp` is already one. If `kotlin.time.Instant` isn't `@Serializable`-supported by kotlinx.serialization 1.11 in `OrderWasPlaced`, store `placedAtEpochSeconds: Long` instead, and use `Instant.fromEpochSeconds(input.placedAtEpochSeconds) + 2.days`.
 
 Run: `./gradlew :examples:integrationTest --rerun-tasks`
 Expected: PASS (the example compiles; the existing 4 tests pass).
