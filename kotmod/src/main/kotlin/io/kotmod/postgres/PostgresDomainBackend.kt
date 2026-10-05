@@ -21,6 +21,7 @@ import io.kotmod.EventMetadata
 import io.kotmod.PersistedEvent
 import io.kotmod.SequenceCheck
 import io.kotmod.SerializedEvent
+import io.kotmod.process.ProcessEventSerialization
 import java.sql.Connection
 import java.sql.ResultSet
 import java.sql.SQLException
@@ -245,13 +246,36 @@ class PostgresDomainPersistenceBackend<E : DomainEvent>(
     }
 }
 
-/** Postgres implementation of [DomainEventPollingBackend], reading `ddd_domain_event` in
- * `(transaction_id, global_offset)` order, only past transactions that have finished. */
-class PostgresDomainPollingBackend(
+/**
+ * Postgres implementation of [DomainEventPollingBackend], reading `ddd_domain_event` in
+ * `(transaction_id, global_offset)` order, only past transactions that have finished.
+ *
+ * kotmod's own internal events (the commands a process manager requests and the inputs it schedules, stored in its
+ * stream) are never returned: not by [readEventsAfter], and not by [checkSequence], which neither pulls one forward nor
+ * waits for one. Only a process manager's own poller reads them.
+ */
+class PostgresDomainPollingBackend private constructor(
     private val jdbc: JdbcContext,
-    private val eventAttributeColumns: Set<String> = setOf(),
+    private val eventAttributeColumns: Set<String>,
+    private val includeProcessEnvelopes: Boolean,
 ): DomainEventPollingBackend {
+    constructor(
+        jdbc: JdbcContext,
+        eventAttributeColumns: Set<String> = setOf(),
+    ) : this(jdbc, eventAttributeColumns, includeProcessEnvelopes = false)
 
+    /** The process manager's own backend, which also reads its internal events. */
+    internal constructor(jdbc: JdbcContext, includeProcessEnvelopes: Boolean) :
+        this(jdbc, setOf(), includeProcessEnvelopes)
+
+    /**
+     * The condition that hides kotmod's internal events, applied to every query that returns events or decides what
+     * has been passed, so a consumer reads a log in which they don't exist (see [checkSequence]).
+     */
+    private fun visible(eventType: String = "event_type"): String =
+        if (includeProcessEnvelopes) "" else "AND $eventType NOT IN ($ENVELOPE_TYPE_LITERALS) "
+
+    /** Returns up to [limit] events after [position]; kotmod's own internal events are never returned. */
     override fun readEventsAfter(
         position: EventLogPosition,
         limit: Int,
@@ -264,6 +288,7 @@ class PostgresDomainPollingBackend(
                         "FROM ddd_domain_event " +
                         "WHERE (transaction_id, global_offset) > (?::text::xid8, ?) " +
                         "AND transaction_id < pg_snapshot_xmin(pg_current_snapshot()) " +
+                        visible() +
                         "ORDER BY transaction_id, global_offset " +
                         "LIMIT ?",
                 ).use { ps ->
@@ -286,6 +311,9 @@ class PostgresDomainPollingBackend(
             // Fast path: an aggregate never written out of transaction order (see saveMeta) is read in sequence
             // order, so this primary-key lookup is all most events need.
             if (!hasOutOfOrderEvents(conn, event)) return@withConnection SequenceCheck.InOrder
+            // Hidden internal events are left out of both parts below, so this works on the log the consumer reads:
+            // their sequence numbers are just gaps. Counting one in highest_passed would skip a fact never pulled
+            // forward (the hidden event was never checked); listing one would deliver it or wait for it.
             // One statement: the highest sequence already passed (always returned, even with no earlier events
             // ahead) left-joined to the earlier events of the aggregate that sit after the saved position.
             conn
@@ -295,9 +323,12 @@ class PostgresDomainPollingBackend(
                         "hp.highest_passed " +
                         "FROM (SELECT max(aggregate_sequence) AS highest_passed FROM ddd_domain_event " +
                         "WHERE aggregate_type = ? AND aggregate_id = ? " +
-                        "AND (transaction_id, global_offset) <= (?::text::xid8, ?)) hp " +
+                        "AND (transaction_id, global_offset) <= (?::text::xid8, ?) " +
+                        visible() +
+                        ") hp " +
                         "LEFT JOIN ddd_domain_event e ON e.aggregate_type = ? AND e.aggregate_id = ? " +
                         "AND e.aggregate_sequence < ? AND (e.transaction_id, e.global_offset) > (?::text::xid8, ?) " +
+                        visible("e.event_type") +
                         "ORDER BY e.aggregate_sequence",
                 ).use { ps ->
                     val m = event.metadata
@@ -369,6 +400,8 @@ class PostgresDomainPollingBackend(
     }
 
     private companion object {
+        val ENVELOPE_TYPE_LITERALS = ProcessEventSerialization.ENVELOPE_TYPES.joinToString { "'$it'" }
+
         const val EVENT_COLUMNS =
             "global_offset, transaction_id::text::bigint AS transaction_id_value, aggregate_type, aggregate_id, " +
                 "aggregate_sequence, causation_id, correlation_id, event_id, event_type, event_version, " +

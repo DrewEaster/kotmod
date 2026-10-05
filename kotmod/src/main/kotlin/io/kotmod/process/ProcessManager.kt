@@ -92,7 +92,7 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
         type,
         repository,
         PostgresDomainPersistenceBackend(jdbc, ProcessEventSerialization(eventSerialization)),
-        PostgresDomainPollingBackend(jdbc),
+        PostgresDomainPollingBackend(jdbc, includeProcessEnvelopes = true),
         initial,
         inputSerializer,
         eventSerialization,

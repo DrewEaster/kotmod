@@ -25,3 +25,6 @@ dependencies {
     testFixturesApi("org.postgresql:postgresql:42.7.13")
     testFixturesApi("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
 }
+
+// Integration tests may use kotmod's internal API (e.g. the process manager's own polling backend).
+kotlin.target.compilations.getByName("integrationTest").associateWith(kotlin.target.compilations.getByName("main"))

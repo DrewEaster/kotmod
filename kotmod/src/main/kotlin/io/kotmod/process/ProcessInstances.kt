@@ -64,7 +64,7 @@ internal class ProcessEventSerialization<E : DomainEvent>(
         const val COMMAND_REQUESTED = "io.kotmod.process.CommandRequested"
         const val INPUT_SCHEDULED = "io.kotmod.process.InputScheduled"
 
-        private val ENVELOPE_TYPES = setOf(COMMAND_REQUESTED, INPUT_SCHEDULED)
+        internal val ENVELOPE_TYPES = setOf(COMMAND_REQUESTED, INPUT_SCHEDULED)
 
         /**
          * Whether [type] is one of kotmod's envelope types. Only the process manager that wrote an envelope reads it;
