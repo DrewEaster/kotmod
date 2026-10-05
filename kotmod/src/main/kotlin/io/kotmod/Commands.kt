@@ -80,7 +80,7 @@ abstract class CommandHandlers<S : Any, C : Any, E : DomainEvent, R : Any>(
         noinline otherwise: (S?) -> R,
         noinline block: suspend (T) -> Outcome<S, E, R>,
     ): CommandHandler<S, E, R> =
-        CommandHandler { state -> if (state is T) block(state as T) else Outcome.Reject(otherwise(state)) }
+        CommandHandler { state -> if (state is T) block(state) else Outcome.Reject(otherwise(state)) }
 
     /** Runs [block] only when the aggregate does not exist yet. Otherwise rejects with [otherwise]. */
     fun creates(

@@ -1,7 +1,6 @@
 package io.kotmod
 
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.Serializable
 import kotlin.test.Test
 import kotlin.test.assertEquals
