@@ -382,8 +382,12 @@ data object Dispatched : DispatchDeadline {
 }
 
 data object Missed : DispatchDeadline {
-    // A CancellationRefused here means the order shipped just before the cancellation reached it: nothing to undo.
-    override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome = ignore()
+    // A refused cancellation means the order had shipped before the process heard about it.
+    override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome =
+        when (input) {
+            is CancellationRefused -> transition(Dispatched)
+            OrderWasShipped, DeadlinePassed, is OrderWasPlaced -> ignore()
+        }
 }
 
 fun translateOrderEvent(
@@ -414,6 +418,7 @@ fun dispatchDeadlines(
         jdbc = jdbc,
         initial = NoDispatchDeadline,
         inputSerializer = DispatchDeadlineInput.serializer(),
+        inputOrdering = ReactionOrdering.PerAggregate(),
         eventSerialization = deadlineEvents,
         translate = { event -> translateOrderEvent(event, serialization) },
         targets = listOf(target(orders) { _, rejection -> CancellationRefused(rejection) }),

@@ -1257,6 +1257,9 @@ fun translateOrderEvent(
 }
 ```
 
+The process id (`deadline-<orderId>`) names an instance of the process manager's own aggregate type, not the
+order.
+
 `translate` receives every event in this context's log, except the process manager's own and those of other
 process managers, so filter by aggregate type before deserializing, as `translateOrderEvent` does and as the
 quickstart's outbox does.
@@ -1313,8 +1316,12 @@ data object Dispatched : DispatchDeadline {
 }
 
 data object Missed : DispatchDeadline {
-    // A CancellationRefused here means the order shipped just before the cancellation reached it: nothing to undo.
-    override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome = ignore()
+    // A refused cancellation means the order had shipped before the process heard about it.
+    override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome =
+        when (input) {
+            is CancellationRefused -> transition(Dispatched)
+            OrderWasShipped, DeadlinePassed, is OrderWasPlaced -> ignore()
+        }
 }
 ```
 
@@ -1333,7 +1340,9 @@ how to turn a typed rejection back into an input for the process, like `Cancella
 
 #### Facts the process owns
 
-`transition(events = …)` records events in the process's own stream (here `DispatchDeadlineMissed`). They are
+`transition(events = …)` records events in the process's own stream (here `DispatchDeadlineMissed`, which says
+the deadline passed before the process saw a shipment; a refused cancellation, because the order shipped in the
+meantime, is how the process learns otherwise). They are
 internal, like any domain events. To tell other contexts about them, publish them through a
 `PublicEventContract`, as in [Publishing events to other contexts](#publishing-events-to-other-contexts).
 
@@ -1355,6 +1364,7 @@ fun dispatchDeadlines(
         jdbc = jdbc,
         initial = NoDispatchDeadline,
         inputSerializer = DispatchDeadlineInput.serializer(),
+        inputOrdering = ReactionOrdering.PerAggregate(),
         eventSerialization = deadlineEvents,
         translate = { event -> translateOrderEvent(event, serialization) },
         targets = listOf(target(orders) { _, rejection -> CancellationRefused(rejection) }),
@@ -1386,7 +1396,9 @@ fun startDispatchDeadlines(
 - Start the process manager before the scheduler, and stop it after.
 - Read `queues.tasks` only after the process manager and all its `subscribeTo` calls are built. A channel
   created later wouldn't be registered with the scheduler.
-- There is one channel per kind of work: inputs (pass `inputOrdering` to order them per source aggregate),
+- Per-aggregate ordering (`inputOrdering`) delivers an order's events in order, which this process relies on:
+  an input the initial state ignores is gone, so out-of-order delivery could lose "shipped".
+- There is one channel per kind of work: inputs (ordered per source aggregate here),
   internal (timeouts and rejection feedback), commands, and one for each `subscribeTo`.
 - Inputs are stored as JSON with the input class's name. Renaming an input class breaks inputs that are already
   scheduled or in flight, so keep the old name with `@SerialName`.
