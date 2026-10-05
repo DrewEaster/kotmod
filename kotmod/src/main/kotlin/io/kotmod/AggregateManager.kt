@@ -32,7 +32,7 @@ import kotlin.time.toKotlinInstant
  * @param kind names the aggregate type and how its commands and rejections are serialized.
  */
 class AggregateManager<S : AggregateState<S, C, E, R>, C : Any, E : DomainEvent, R : Any>(
-    private val kind: AggregateKind<C, R>,
+    internal val kind: AggregateKind<C, R>,
     private val repository: Repository<S>,
     private val backend: DomainPersistenceBackend<E>,
     private val initial: InitialState<S, C, E, R>,

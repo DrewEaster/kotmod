@@ -120,17 +120,35 @@ data class OrderCancelled(
     val reason: String,
 ) : OrderEvent
 
-/** Test commands are never serialized (DecideWith holds a lambda), so the test kind's command serializer refuses. */
+/** Serializes test commands as short strings, so the test aggregate can be a process manager target; DecideWith can't be. */
 object TestOrderCommandSerializer : KSerializer<OrderCommand> {
     override val descriptor: SerialDescriptor = PrimitiveSerialDescriptor("io.kotmod.support.TestOrderCommand", PrimitiveKind.STRING)
 
     override fun serialize(
         encoder: Encoder,
         value: OrderCommand,
-    ): Unit = error("test commands are not serialized")
+    ) = encoder.encodeString(
+        when (value) {
+            is PlaceOrder -> "place:${value.name}"
+            ShipOrder -> "ship"
+            is CancelOrder -> "cancel:${value.reason}"
+            is DecideWith -> error("DecideWith holds a lambda and can't be serialized")
+        },
+    )
 
-    override fun deserialize(decoder: Decoder): OrderCommand = error("test commands are not serialized")
+    override fun deserialize(decoder: Decoder): OrderCommand {
+        val text = decoder.decodeString()
+        return when {
+            text == "ship" -> ShipOrder
+            text.startsWith("place:") -> PlaceOrder(text.removePrefix("place:"))
+            text.startsWith("cancel:") -> CancelOrder(text.removePrefix("cancel:"))
+            else -> error("unknown test command $text")
+        }
+    }
 }
 
 fun testOrderKind(type: String = "Order"): AggregateKind<OrderCommand, OrderRejection> =
     AggregateKind(AggregateType(type), TestOrderCommandSerializer, OrderRejection.serializer())
+
+/** The test order kind, shared so requested commands compare equal. */
+val testOrders: AggregateKind<OrderCommand, OrderRejection> = testOrderKind()

@@ -1,6 +1,7 @@
 package io.kotmod
 
 import kotlinx.serialization.KSerializer
+import kotlinx.serialization.json.Json
 
 /**
  * Names one kind of aggregate, such as orders, together with how its commands and rejections are serialized.
@@ -23,4 +24,19 @@ open class AggregateKind<C : Any, R : Any>(
     val type: AggregateType,
     val commandSerializer: KSerializer<C>,
     val rejectionSerializer: KSerializer<R>,
-)
+) {
+    /** Requests [command] for the aggregate [id] of this kind; a process manager runs it later, asynchronously. */
+    fun command(
+        id: AggregateId,
+        command: C,
+    ): RequestedCommand<C> = RequestedCommand(this, id, command)
+}
+
+/** A command a process manager asks to be run against aggregate [targetId] of [kind]. Build it with [AggregateKind.command]. */
+data class RequestedCommand<C : Any>(
+    val kind: AggregateKind<C, *>,
+    val targetId: AggregateId,
+    val command: C,
+) {
+    internal fun encodeCommand(): String = Json.encodeToString(kind.commandSerializer, command)
+}
