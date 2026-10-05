@@ -23,6 +23,7 @@ in**, so those events reliably drive follow-up work in your own service and in o
   - [Publishing events to other contexts](#publishing-events-to-other-contexts)
 - [Running in production](#running-in-production)
 - [Known limitations](#known-limitations)
+- [Upgrading from 0.1.0](#upgrading-from-010)
 - [Status and contributing](#status-and-contributing)
 
 ## Why kotmod
@@ -55,9 +56,9 @@ plugins {
 }
 
 dependencies {
-    implementation("io.github.dreweaster:kotmod:0.1.0")
-    implementation("io.github.dreweaster:kotmod-db-scheduler:0.1.0") // optional: the ready-made reaction queue
-    // implementation("io.github.dreweaster:kotmod-sqldelight:0.1.0") // only if your app uses SQLDelight
+    implementation("io.github.dreweaster:kotmod:0.2.0")
+    implementation("io.github.dreweaster:kotmod-db-scheduler:0.2.0") // optional: the ready-made reaction queue
+    // implementation("io.github.dreweaster:kotmod-sqldelight:0.2.0") // only if your app uses SQLDelight
 
     // Used directly by the code in this README:
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
@@ -114,7 +115,7 @@ offsets. Event reactions run on db-scheduler, which needs its `scheduled_tasks` 
 db-scheduler's
 [`postgresql_tables.sql`](https://github.com/kagkarlsson/db-scheduler/blob/v16.12.0/db-scheduler/src/test/resources/postgresql_tables.sql).
 
-### 2. Define state, events and commands
+### 2. Define state, events, commands and rejections
 
 An aggregate's **state** is whatever your application needs to make decisions — here, an order is
 pending, shipped or cancelled:
@@ -159,19 +160,81 @@ data class OrderCancelled(
 ) : OrderEvent
 ```
 
-Write each **command** as a plain function: it takes the current state and returns the new state plus the
-events it raised. Extension functions on the state types read naturally and keep your domain decisions in
-pure code you can unit-test without a database; kotmod only runs them:
+A **command** asks the order to change. Commands are data, so they are `@Serializable`, and so is the
+aggregate's **rejection** type: every way a command can be refused, in your domain's own words.
+
+Write the decisions as plain functions on specific states. Each returns an outcome, `accept(newState,
+events…)` or `reject(rejection)`, so your domain decisions stay pure code that you can unit-test without a
+database. `OrderCommands` is the one place that routes each command to its function: `creates` only runs
+for an order that doesn't exist yet, `on<PendingOrder>` only runs for a pending order, and `otherwise`
+names the rejection in every other case. The `when` is exhaustive, so adding a command without routing it
+doesn't compile.
 
 ```kotlin
-fun placeOrder(item: String): Pair<PendingOrder, List<OrderEvent>> =
-    PendingOrder(item) to listOf(OrderPlaced(item))
+@Serializable
+sealed interface OrderCommand
 
-fun PendingOrder.ship(): Pair<ShippedOrder, List<OrderEvent>> =
-    ShippedOrder(item) to listOf(OrderShipped(item))
+@Serializable
+data class PlaceOrder(
+    val item: String,
+) : OrderCommand
 
-fun PendingOrder.cancel(reason: String): Pair<CancelledOrder, List<OrderEvent>> =
-    CancelledOrder(item, reason) to listOf(OrderCancelled(item, reason))
+@Serializable
+data object ShipOrder : OrderCommand
+
+@Serializable
+data class CancelOrder(
+    val reason: String,
+) : OrderCommand
+
+@Serializable
+sealed interface OrderRejection
+
+@Serializable
+data object OrderAlreadyPlaced : OrderRejection
+
+@Serializable
+data object OrderNotFound : OrderRejection
+
+@Serializable
+data object OrderAlreadyShipped : OrderRejection
+
+@Serializable
+data object OrderAlreadyCancelled : OrderRejection
+
+@Serializable
+data object CancellationReasonMissing : OrderRejection
+
+typealias OrderOutcome = Outcome<Order, OrderEvent, OrderRejection>
+
+fun placeOrder(item: String): OrderOutcome = accept(PendingOrder(item), OrderPlaced(item))
+
+fun PendingOrder.ship(): OrderOutcome = accept(ShippedOrder(item), OrderShipped(item))
+
+fun PendingOrder.cancel(reason: String): OrderOutcome =
+    if (reason.isBlank()) {
+        reject(CancellationReasonMissing)
+    } else {
+        accept(CancelledOrder(item, reason), OrderCancelled(item, reason))
+    }
+
+object OrderCommands : CommandHandlers<Order, OrderCommand, OrderEvent, OrderRejection>(
+    rejectionSerializer = OrderRejection.serializer(),
+) {
+    override fun OrderCommand.handler() =
+        when (this) {
+            is PlaceOrder -> creates(otherwise = { OrderAlreadyPlaced }) { placeOrder(item) }
+            ShipOrder -> on<PendingOrder>(otherwise = ::notPending) { it.ship() }
+            is CancelOrder -> on<PendingOrder>(otherwise = ::notPending) { it.cancel(reason) }
+        }
+
+    private fun notPending(order: Order?): OrderRejection =
+        when (order) {
+            is ShippedOrder -> OrderAlreadyShipped
+            is CancelledOrder -> OrderAlreadyCancelled
+            else -> OrderNotFound
+        }
+}
 ```
 
 ### 3. Wire up persistence
@@ -197,6 +260,7 @@ val orders =
         aggregateType = orderType,
         repository = OrderRepository(jdbc),
         backend = PostgresDomainPersistenceBackend(jdbc, serialization),
+        commands = OrderCommands,
     )
 ```
 
@@ -255,20 +319,20 @@ class OrderRepository(
 
 ### 4. Run commands
 
-Run the commands from step 2 through the aggregate manager. `create` starts a new aggregate;
-`execute<PendingOrder>` loads the order and only runs the command if it is still pending, so `ship()` can
-only ever be called on a `PendingOrder`. Both are `suspend` functions:
+Send the commands from step 2 through the aggregate manager. `handle` is a `suspend` function, and it
+returns either `CommandResult.Accepted` with the new state or `CommandResult.Rejected` with one of your
+rejections:
 
 ```kotlin
 val orderId = AggregateId("order-1")
 
-orders.create(orderId) { placeOrder("book") }
+orders.handle(orderId, PlaceOrder("book"))
 
-val shipped = orders.execute<PendingOrder>(orderId) { it.ship() }
+val shipped = orders.handle(orderId, ShipOrder)
 ```
 
-Each call saves the order's state, appends its events to the event log and records the command, all in
-one transaction.
+An accepted command saves the order's state, appends its events to the event log and records the command,
+all in one transaction. A rejected command changes nothing, but its rejection is recorded too.
 
 ### 5. React to events
 
@@ -411,8 +475,10 @@ flowchart LR
 
 - **Aggregate** — a cluster of domain state changed only through commands, identified by an
   `AggregateType` and `AggregateId`.
-- **Command** — a request to change an aggregate. It returns the new state and the events it raised, and
-  is idempotent when given a `CommandId`.
+- **Command** — a request to change an aggregate, as serializable data. The aggregate accepts it (new state
+  and events) or rejects it. It is idempotent when given a `CommandId`.
+- **Rejection** — why an aggregate refused a command, as one of your own types. Rejections are recorded,
+  so a repeated command id gets the same answer.
 - **Domain event** — a fact recorded in the event log in the same transaction as the state change.
 - **Event reaction** — durable, retried follow-up work triggered by a domain event.
 - **Trigger** — the stored input of an event reaction.
@@ -432,60 +498,57 @@ Use `AggregateManager` for anything whose state you store and change through com
 
 Every command runs in three phases:
 
-1. **Read** — if the command's id has already been handled, the stored state is returned and nothing
+1. **Read** — if the command's id has already been handled, the recorded answer is returned and nothing
    else happens. Otherwise the aggregate's version and state are loaded.
-2. **Command** — your block runs and returns the new state and the events it raised. kotmod does no
-   database work while it runs, so keep side effects out of it; put them in event reactions instead.
+2. **Decide** — your pure function runs. kotmod does no database work while it runs, so keep side effects
+   out of it; put them in event reactions instead.
 3. **Write** — in one transaction, the aggregate's version is advanced, your repository saves the new
-   state, the events are appended and the command is recorded as handled.
+   state, the events are appended and the command is recorded as handled. A rejected command writes only
+   the rejection record.
 
-`create` starts a new aggregate and throws `AggregateAlreadyExistsException` if it exists. `execute`
-changes an existing one and throws `AggregateNotFoundException` if it doesn't. The narrowed form,
-`execute<PendingOrder>`, only runs when the current state is that subtype and throws
-`UnexpectedAggregateStateException` otherwise, which makes state machines easy to express:
+**Routing.** `CommandHandlers` routes each command to a function for the state it needs. `on<T>(otherwise)`
+runs only when the state is a `T`. `creates(otherwise)` runs only when the aggregate doesn't exist yet.
+`any { state -> … }` is for a command that is valid in several states. `otherwise` receives the actual
+state, or `null` when the aggregate doesn't exist, so you can reject differently by state.
+
+Callers match on the result; a rejection is a value, never an exception:
 
 ```kotlin
 suspend fun cancelOrder(
-    orders: AggregateManager<Order, OrderEvent>,
+    orders: AggregateManager<Order, OrderEvent, OrderCommand, OrderRejection>,
     orderId: AggregateId,
     reason: String,
     requestId: String,
-): Order =
-    try {
-        orders.execute<PendingOrder>(orderId, commandId = CommandId(requestId)) { it.cancel(reason) }
-    } catch (e: UnexpectedAggregateStateException) {
-        throw IllegalStateException("Only pending orders can be cancelled", e)
+): String =
+    when (val result = orders.handle(orderId, CancelOrder(reason), commandId = CommandId(requestId))) {
+        is CommandResult.Accepted -> "Cancelled"
+        is CommandResult.Rejected ->
+            when (result.rejection) {
+                OrderAlreadyShipped -> "Too late: the order has shipped"
+                CancellationReasonMissing -> "Please give a reason"
+                else -> "Can't cancel: ${result.rejection}"
+            }
     }
 ```
+
+**Why commands are data.** Every caller, whether an HTTP handler, an event reaction or, later, a process
+manager, runs a command the same way: through the one routing point. The rules for which state a command
+needs and how it is refused live in one place.
 
 **Event sequence numbers.** Every event carries `event.metadata.sequence`: its number within its
 aggregate, counting 1, 2, 3… with no gaps. Reactions and public contracts can use it to tell which of an
 aggregate's events came first.
 
-**Idempotency.** Pass a `CommandId` you control — a request id, a message id — and a retried command
-returns the aggregate's current state without running again. Without one, kotmod generates a random
-id and the call is not idempotent. Pass a `CorrelationId` to tie together all the events of one wider
-flow; it is stored with every event.
+**Idempotency.** Pass a `CommandId` you control — a request id, a message id. A repeated id returns the
+recorded answer: an accepted command returns the aggregate's *current* state without running again, and a
+rejected one returns the same rejection, even if the state would now allow the command. Without a command
+id, kotmod generates a random one and the call is not idempotent. Pass a `CorrelationId` to tie together all
+the events of one wider flow; it is stored with every event.
 
-**Concurrency.** Each aggregate has a version. If someone else changes the aggregate between your read
-and your write, the write fails with `OptimisticConcurrencyException`; run the command again and it will
-see the latest state:
-
-```kotlin
-suspend fun <T> retryOnConflict(
-    attempts: Int = 3,
-    command: suspend () -> T,
-): T {
-    repeat(attempts - 1) {
-        try {
-            return command()
-        } catch (e: OptimisticConcurrencyException) {
-            // Someone else changed the aggregate first: run the command again against the latest state.
-        }
-    }
-    return command()
-}
-```
+**Concurrency.** Each aggregate has a version. If someone else changes the aggregate between your read and
+your write, `handle` reads again and decides again, up to `maxConflictRetries` times (5 by default), and
+then throws `OptimisticConcurrencyException`. Deciding again is safe when decisions are pure. Decision
+blocks may suspend, but anything a decision calls out to may then be called once per attempt.
 
 **Your repository joins the transaction.** `Repository.save` is called inside kotmod's transaction, so it
 must borrow its connection from the same `JdbcContext` as the backend — as `OrderRepository` does with
@@ -509,21 +572,26 @@ aggregate — and kotmod would rather support that clearly than forbid it. If yo
 ```kotlin
 suspend fun shipAndInvoice(
     jdbc: JdbcContext,
-    orders: AggregateManager<Order, OrderEvent>,
-    invoices: AggregateManager<Order, OrderEvent>,
+    orders: AggregateManager<Order, OrderEvent, OrderCommand, OrderRejection>,
+    invoices: AggregateManager<Order, OrderEvent, OrderCommand, OrderRejection>,
     orderId: AggregateId,
 ) {
     jdbc.transaction {
-        orders.execute<PendingOrder>(orderId) { it.ship() }
-        invoices.create(AggregateId("invoice-${orderId.value}")) { placeOrder("invoice") }
+        // A rejection is a value: throw to roll the whole transaction back.
+        val shipped = orders.handle(orderId, ShipOrder)
+        if (shipped is CommandResult.Rejected) throw IllegalStateException("Can't ship: ${shipped.rejection}")
+        val invoiced = invoices.handle(AggregateId("invoice-${orderId.value}"), PlaceOrder("invoice"))
+        if (invoiced is CommandResult.Rejected) throw IllegalStateException("Can't invoice: ${invoiced.rejection}")
     }
 }
 ```
 
-- If any command fails — including an `OptimisticConcurrencyException` on one aggregate — everything rolls
-  back, including the other aggregates' events. Let the exception propagate: if you catch it and carry on,
-  the transaction is still rolled back and kotmod throws `TransactionRolledBackException` rather than commit
-  a partial result.
+- If any command fails — including a conflict — everything rolls back, including the other aggregates'
+  events. Let the exception propagate: if you catch it and carry on, the transaction is still rolled back
+  and kotmod throws `TransactionRolledBackException` rather than commit a partial result. Inside the block,
+  `handle` does not retry conflicts; the exception propagates and the whole transaction rolls back.
+- A rejection is a value. If you carry on, its record commits with everything else; to undo the other
+  commands, throw, as `shipAndInvoice` does.
 - Commands inside the block see each other's uncommitted writes.
 - Run commands one after another, never in parallel, and don't switch threads inside the block (for
   example with `withContext`) — for kotmod commands or your own SQL; kotmod throws `IllegalStateException`
@@ -636,7 +704,7 @@ kotmod's writes share one transaction whichever side opens it:
 
 - Inside `jdbc.transaction { }`, call your SQLDelight queries as usual — they join kotmod's transaction.
 - Inside your own `database.transaction { }`, call kotmod from blocking code (SQLDelight's block can't
-  suspend), e.g. `runBlocking { orders.create(…) }`; commands join your transaction. Wrap several in
+  suspend), e.g. `runBlocking { orders.handle(id, command) }`; commands join your transaction. Wrap several in
   `runBlocking { jdbc.transaction { … } }` to get kotmod's thread checks too. In a transaction SQLDelight
   opened, SQLDelight's rules apply: if a kotmod call fails and you catch it, SQLDelight rolls your
   transaction back when it ends.
@@ -1120,6 +1188,13 @@ events per poll (`batchSize`). `Scheduler.threads(n)` caps how many reactions ru
 These are known gaps in the current release. None of them loses events; most need an unusual setup or a
 failure in a specific spot to show up.
 
+**Commands**
+
+- **Renaming a rejection class breaks reading back old rejections.** Recorded rejections are plain JSON,
+  without the versioned migrations events have. If a duplicate of a command rejected under the old name
+  arrives, `handle` throws `RejectionDeserializationException`. Keep old names readable with `@SerialName`.
+  Duplicates normally arrive within minutes of the original, so this rarely matters.
+
 **Leader election**
 
 - **`stop()` must not be cancelled.** If the coroutine calling `election.stop()` is cancelled part-way, the
@@ -1161,6 +1236,29 @@ failure in a specific spot to show up.
   pays a full check whose cost grows with the aggregate's history. This only applies to aggregates written by
   an outer transaction that changed several aggregates in a racing order, and only matters for very long
   histories.
+
+## Upgrading from 0.1.0
+
+0.2.0 replaces `create` and `execute` with `handle`, and commands become data. To upgrade:
+
+1. Add the rejection columns to the command history:
+
+   ```sql
+   ALTER TABLE ddd_command_history ADD COLUMN rejection_type    VARCHAR(255);
+   ALTER TABLE ddd_command_history ADD COLUMN rejection_payload TEXT;
+   ```
+
+   Existing rows read as accepted commands.
+2. For each aggregate, define a sealed command type and a sealed rejection type, change your command
+   functions to return `accept(...)` or `reject(...)`, and route the commands in a `CommandHandlers` object,
+   as in [the quickstart](#2-define-state-events-commands-and-rejections).
+3. Pass that object as `commands` to `AggregateManager`, and replace `create { }` and `execute<T> { }` calls
+   with `handle(id, command)`.
+4. Replace `catch (e: UnexpectedAggregateStateException)` with a rejection from `otherwise`, and drop any
+   retry loop around `OptimisticConcurrencyException`: `handle` retries itself.
+5. If you implemented `DomainPersistenceBackend` yourself, replace `wasCommandHandled` with
+   `findHandledCommand`, add `recordCommandRejected`, and throw `CommandAlreadyRecordedException` when a
+   command id is recorded twice.
 
 ## Status and contributing
 
