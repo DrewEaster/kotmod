@@ -3,11 +3,13 @@ package io.kotmod.postgres
 import io.kotmod.AggregateAlreadyExistsException
 import io.kotmod.AggregateId
 import io.kotmod.AggregateType
+import io.kotmod.CommandAlreadyRecordedException
 import io.kotmod.CommandId
 import io.kotmod.CorrelationId
 import io.kotmod.EventId
 import io.kotmod.EventLogPosition
 import io.kotmod.EventMetadata
+import io.kotmod.HandledCommand
 import io.kotmod.OptimisticConcurrencyException
 import io.kotmod.PendingEvent
 import io.kotmod.postgres.support.IntegrationTest
@@ -219,34 +221,96 @@ class PostgresDomainBackendIntegrationTest : IntegrationTest() {
         }
 
     @Test
-    fun `wasCommandHandled returns false when unseen`() =
+    fun `findHandledCommand returns null when unseen`() =
         runTest {
-            val seen = backend.wasCommandHandled(AggregateType("Order"), AggregateId("o-1"), CommandId("cmd-1"))
-            assertEquals(false, seen)
+            assertNull(backend.findHandledCommand(AggregateType("Order"), AggregateId("o-1"), CommandId("cmd-1")))
         }
 
     @Test
-    fun `recordCommandHandled then wasCommandHandled returns true`() =
-        runTest {
-            val type = AggregateType("Order")
-            val id = AggregateId("o-1")
-            val cmd = CommandId("cmd-1")
-
-            backend.recordCommandHandled(type, id, cmd)
-            val seen = backend.wasCommandHandled(type, id, cmd)
-
-            assertTrue(seen)
-        }
-
-    @Test
-    fun `wasCommandHandled is scoped per type, id, and commandId`() =
+    fun `an accepted command reads back as accepted`() =
         runTest {
             backend.recordCommandHandled(AggregateType("Order"), AggregateId("o-1"), CommandId("cmd-1"))
 
-            assertEquals(false, backend.wasCommandHandled(AggregateType("Order"), AggregateId("o-2"), CommandId("cmd-1")))
-            assertEquals(false, backend.wasCommandHandled(AggregateType("Order"), AggregateId("o-1"), CommandId("cmd-2")))
-            assertEquals(false, backend.wasCommandHandled(AggregateType("Widget"), AggregateId("o-1"), CommandId("cmd-1")))
+            assertEquals(HandledCommand.Accepted, backend.findHandledCommand(AggregateType("Order"), AggregateId("o-1"), CommandId("cmd-1")))
         }
+
+    @Test
+    fun `a rejected command reads back with its type and payload`() =
+        runTest {
+            backend.recordCommandRejected(
+                AggregateType("Order"),
+                AggregateId("o-1"),
+                CommandId("cmd-1"),
+                rejectionType = "com.example.OrderNotPending",
+                payload = """{"type":"OrderNotPending"}""",
+            )
+
+            assertEquals(
+                HandledCommand.Rejected("com.example.OrderNotPending", """{"type":"OrderNotPending"}"""),
+                backend.findHandledCommand(AggregateType("Order"), AggregateId("o-1"), CommandId("cmd-1")),
+            )
+        }
+
+    @Test
+    fun `a row written before rejections were recorded reads as accepted`() =
+        runTest {
+            dataSource.connection.use { conn ->
+                conn.createStatement().use {
+                    it.execute("INSERT INTO ddd_command_history (aggregate_type, aggregate_id, command_id) VALUES ('Order', 'o-1', 'old')")
+                }
+            }
+
+            assertEquals(HandledCommand.Accepted, backend.findHandledCommand(AggregateType("Order"), AggregateId("o-1"), CommandId("old")))
+        }
+
+    @Test
+    fun `recording the same command id twice throws CommandAlreadyRecordedException`() =
+        runTest {
+            val type = AggregateType("Order")
+            val id = AggregateId("o-1")
+            backend.recordCommandHandled(type, id, CommandId("cmd-1"))
+
+            assertFailsWith<CommandAlreadyRecordedException> { backend.recordCommandHandled(type, id, CommandId("cmd-1")) }
+            assertFailsWith<CommandAlreadyRecordedException> {
+                backend.recordCommandRejected(type, id, CommandId("cmd-1"), "T", "{}")
+            }
+        }
+
+    @Test
+    fun `findHandledCommand is scoped per type, id, and commandId`() =
+        runTest {
+            backend.recordCommandHandled(AggregateType("Order"), AggregateId("o-1"), CommandId("cmd-1"))
+
+            assertNull(backend.findHandledCommand(AggregateType("Order"), AggregateId("o-2"), CommandId("cmd-1")))
+            assertNull(backend.findHandledCommand(AggregateType("Order"), AggregateId("o-1"), CommandId("cmd-2")))
+            assertNull(backend.findHandledCommand(AggregateType("Widget"), AggregateId("o-1"), CommandId("cmd-1")))
+        }
+
+    @Test
+    fun `the 0_1_0 upgrade statements add the rejection columns`() {
+        dataSource.connection.use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("DROP SCHEMA IF EXISTS upgrade_check CASCADE")
+                stmt.execute("CREATE SCHEMA upgrade_check")
+                stmt.execute(
+                    "CREATE TABLE upgrade_check.ddd_command_history (aggregate_type VARCHAR(72) NOT NULL, " +
+                        "aggregate_id VARCHAR(72) NOT NULL, command_id VARCHAR(72) NOT NULL, " +
+                        "PRIMARY KEY (aggregate_type, aggregate_id, command_id))",
+                )
+                // Must match the "Upgrading from 0.1.0" section of README.md.
+                stmt.execute("ALTER TABLE upgrade_check.ddd_command_history ADD COLUMN rejection_type    VARCHAR(255)")
+                stmt.execute("ALTER TABLE upgrade_check.ddd_command_history ADD COLUMN rejection_payload TEXT")
+                val columns =
+                    stmt
+                        .executeQuery(
+                            "SELECT column_name FROM information_schema.columns " +
+                                "WHERE table_schema = 'upgrade_check' AND table_name = 'ddd_command_history' ORDER BY ordinal_position",
+                        ).use { rs -> generateSequence { if (rs.next()) rs.getString(1) else null }.toList() }
+                assertEquals(listOf("aggregate_type", "aggregate_id", "command_id", "rejection_type", "rejection_payload"), columns)
+                stmt.execute("DROP SCHEMA upgrade_check CASCADE")
+            }
+        }
+    }
 
     @Test
     fun `backend operations inside a JdbcContext transaction roll back together`() =

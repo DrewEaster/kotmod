@@ -4,7 +4,9 @@ import io.kotmod.AggregateAlreadyExistsException
 import io.kotmod.AggregateId
 import io.kotmod.AggregateMeta
 import io.kotmod.AggregateType
+import io.kotmod.CommandAlreadyRecordedException
 import io.kotmod.CommandId
+import io.kotmod.HandledCommand
 import io.kotmod.DataSerializationContext
 import io.kotmod.DomainPersistenceBackend
 import io.kotmod.DomainEvent
@@ -172,21 +174,27 @@ class PostgresDomainPersistenceBackend<E : DomainEvent>(
         }
     }
 
-    override fun wasCommandHandled(
+    override fun findHandledCommand(
         type: AggregateType,
         id: AggregateId,
         commandId: CommandId,
-    ): Boolean =
+    ): HandledCommand? =
         jdbc.withConnection { conn ->
             conn
                 .prepareStatement(
-                    "SELECT 1 FROM ddd_command_history " +
+                    "SELECT rejection_type, rejection_payload FROM ddd_command_history " +
                         "WHERE aggregate_type = ? AND aggregate_id = ? AND command_id = ?",
                 ).use { ps ->
                     ps.setString(1, type.value)
                     ps.setString(2, id.value)
                     ps.setString(3, commandId.value)
-                    ps.executeQuery().use { rs -> rs.next() }
+                    ps.executeQuery().use { rs ->
+                        when {
+                            !rs.next() -> null
+                            rs.getString(1) == null -> HandledCommand.Accepted
+                            else -> HandledCommand.Rejected(rs.getString(1), rs.getString(2))
+                        }
+                    }
                 }
         }
 
@@ -194,21 +202,43 @@ class PostgresDomainPersistenceBackend<E : DomainEvent>(
         type: AggregateType,
         id: AggregateId,
         commandId: CommandId,
+    ) = insertCommand(type, id, commandId, rejectionType = null, payload = null)
+
+    override fun recordCommandRejected(
+        type: AggregateType,
+        id: AggregateId,
+        commandId: CommandId,
+        rejectionType: String,
+        payload: String,
+    ) = insertCommand(type, id, commandId, rejectionType, payload)
+
+    private fun insertCommand(
+        type: AggregateType,
+        id: AggregateId,
+        commandId: CommandId,
+        rejectionType: String?,
+        payload: String?,
     ) {
         jdbc.withConnection { conn ->
-            conn
-                .prepareStatement(
-                    "INSERT INTO ddd_command_history (aggregate_type, aggregate_id, command_id) " +
-                        "VALUES (?, ?, ?)",
-                ).use { ps ->
-                    ps.setString(1, type.value)
-                    ps.setString(2, id.value)
-                    ps.setString(3, commandId.value)
-                    ps.executeUpdate()
-                }
+            try {
+                conn
+                    .prepareStatement(
+                        "INSERT INTO ddd_command_history " +
+                            "(aggregate_type, aggregate_id, command_id, rejection_type, rejection_payload) VALUES (?, ?, ?, ?, ?)",
+                    ).use { ps ->
+                        ps.setString(1, type.value)
+                        ps.setString(2, id.value)
+                        ps.setString(3, commandId.value)
+                        ps.setString(4, rejectionType)
+                        ps.setString(5, payload)
+                        ps.executeUpdate()
+                    }
+            } catch (e: SQLException) {
+                if (e.sqlState == UNIQUE_VIOLATION) throw CommandAlreadyRecordedException(type, id, commandId)
+                throw e
+            }
         }
     }
-
 
     private companion object {
         const val UNIQUE_VIOLATION = "23505"

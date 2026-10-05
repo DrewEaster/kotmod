@@ -65,6 +65,6 @@ class EventProducerTest {
             val meta = backend.metas[StubPersistenceBackend.Key(AggregateType("Audit"), id)]
             assertEquals(1L, meta!!.version)
             assertEquals(0, backend.events.size)
-            assertTrue(backend.commands.any { it.commandId == CommandId("c-1") })
+            assertTrue(backend.commands.keys.any { it.commandId == CommandId("c-1") })
         }
 }

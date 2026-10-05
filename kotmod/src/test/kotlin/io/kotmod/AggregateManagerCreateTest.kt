@@ -77,7 +77,7 @@ class AggregateManagerCreateTest {
             orders.create(id, commandId = CommandId("cmd-1")) {
                 PendingOrder("widgets") to listOf(OrderPlaced("widgets"))
             }
-            assertTrue(backend.commands.any { it.commandId == CommandId("cmd-1") })
+            assertTrue(backend.commands.keys.any { it.commandId == CommandId("cmd-1") })
         }
 
     @Test

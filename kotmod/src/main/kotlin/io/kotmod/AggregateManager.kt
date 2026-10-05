@@ -46,7 +46,7 @@ class AggregateManager<S : Any, E : DomainEvent>(
         // Phase 1: Read — dedup check
         val dedupResult: S? =
             databaseWork(backend::isInTransaction) {
-                if (backend.wasCommandHandled(aggregateType, id, resolvedCommandId)) {
+                if (backend.findHandledCommand(aggregateType, id, resolvedCommandId) != null) {
                     repository.get(id) ?: throw AggregateNotFoundException(
                         aggregateType,
                         id
@@ -135,7 +135,7 @@ class AggregateManager<S : Any, E : DomainEvent>(
         // Phase 1: Read — dedup check, load meta, load state
         val readResult =
             databaseWork(backend::isInTransaction) {
-                if (backend.wasCommandHandled(aggregateType, id, resolvedCommandId)) {
+                if (backend.findHandledCommand(aggregateType, id, resolvedCommandId) != null) {
                     val current = repository.get(id) ?: throw AggregateNotFoundException(
                         aggregateType,
                         id

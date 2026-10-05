@@ -42,19 +42,47 @@ interface DomainPersistenceBackend<E : DomainEvent> {
     /** Appends [events] to the event log in order. */
     fun appendEvents(events: List<PendingEvent<E>>)
 
-    /** Returns whether [commandId] has already been applied to aggregate [type]/[id]. */
-    fun wasCommandHandled(
+    /** Returns what was recorded for [commandId] on aggregate [type]/[id], or `null` if nothing was. */
+    fun findHandledCommand(
         type: AggregateType,
         id: AggregateId,
         commandId: CommandId,
-    ): Boolean
+    ): HandledCommand?
 
-    /** Records that [commandId] has been applied to aggregate [type]/[id]. */
+    /**
+     * Records that [commandId] was accepted by aggregate [type]/[id]. Throws [CommandAlreadyRecordedException] if
+     * the command id is already recorded for that aggregate.
+     */
     fun recordCommandHandled(
         type: AggregateType,
         id: AggregateId,
         commandId: CommandId,
     )
+
+    /**
+     * Records that [commandId] was rejected by aggregate [type]/[id]: [rejectionType] names the rejection's class and
+     * [payload] is its JSON. Throws [CommandAlreadyRecordedException] if the command id is already recorded for that
+     * aggregate.
+     */
+    fun recordCommandRejected(
+        type: AggregateType,
+        id: AggregateId,
+        commandId: CommandId,
+        rejectionType: String,
+        payload: String,
+    )
+}
+
+/** What [DomainPersistenceBackend.findHandledCommand] knows about a command id. */
+sealed interface HandledCommand {
+    /** The command was accepted. */
+    data object Accepted : HandledCommand
+
+    /** The command was rejected; [type] names the rejection's class and [payload] is its JSON. */
+    data class Rejected(
+        val type: String,
+        val payload: String,
+    ) : HandledCommand
 }
 
 /**

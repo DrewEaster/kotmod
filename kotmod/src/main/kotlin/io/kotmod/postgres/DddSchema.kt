@@ -42,9 +42,11 @@ object DddSchema {
             ON ddd_domain_event (aggregate_type, aggregate_id, aggregate_sequence);
 
         CREATE TABLE ddd_command_history (
-            aggregate_type VARCHAR(72) NOT NULL,
-            aggregate_id   VARCHAR(72) NOT NULL,
-            command_id     VARCHAR(72) NOT NULL,
+            aggregate_type    VARCHAR(72)  NOT NULL,
+            aggregate_id      VARCHAR(72)  NOT NULL,
+            command_id        VARCHAR(72)  NOT NULL,
+            rejection_type    VARCHAR(255),
+            rejection_payload TEXT,
             PRIMARY KEY (aggregate_type, aggregate_id, command_id)
         );
 

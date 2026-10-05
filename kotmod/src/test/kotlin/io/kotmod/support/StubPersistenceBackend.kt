@@ -4,7 +4,9 @@ import io.kotmod.AggregateAlreadyExistsException
 import io.kotmod.AggregateId
 import io.kotmod.AggregateMeta
 import io.kotmod.AggregateType
+import io.kotmod.CommandAlreadyRecordedException
 import io.kotmod.CommandId
+import io.kotmod.HandledCommand
 import io.kotmod.DomainPersistenceBackend
 import io.kotmod.DomainEvent
 import io.kotmod.OptimisticConcurrencyException
@@ -25,7 +27,7 @@ class StubPersistenceBackend<E : DomainEvent> : DomainPersistenceBackend<E> {
 
     val metas = mutableMapOf<Key, AggregateMeta>()
     val events = mutableListOf<PendingEvent<E>>()
-    val commands = mutableSetOf<CommandKey>()
+    val commands = mutableMapOf<CommandKey, HandledCommand>()
 
     private var transactionDepth = 0
     var transactionsCommitted = 0
@@ -42,6 +44,8 @@ class StubPersistenceBackend<E : DomainEvent> : DomainPersistenceBackend<E> {
             transactionDepth--
         }
     }
+
+    override fun isInTransaction(): Boolean = transactionDepth > 0
 
     private fun recordWrite(name: String) {
         if (transactionDepth == 0) writesOutsideTransaction += name
@@ -86,18 +90,36 @@ class StubPersistenceBackend<E : DomainEvent> : DomainPersistenceBackend<E> {
         this.events.addAll(events)
     }
 
-    override fun wasCommandHandled(
+    override fun findHandledCommand(
         type: AggregateType,
         id: AggregateId,
         commandId: CommandId,
-    ): Boolean = CommandKey(type, id, commandId) in commands
+    ): HandledCommand? = commands[CommandKey(type, id, commandId)]
 
     override fun recordCommandHandled(
         type: AggregateType,
         id: AggregateId,
         commandId: CommandId,
+    ) = record(type, id, commandId, HandledCommand.Accepted, "recordCommandHandled")
+
+    override fun recordCommandRejected(
+        type: AggregateType,
+        id: AggregateId,
+        commandId: CommandId,
+        rejectionType: String,
+        payload: String,
+    ) = record(type, id, commandId, HandledCommand.Rejected(rejectionType, payload), "recordCommandRejected")
+
+    private fun record(
+        type: AggregateType,
+        id: AggregateId,
+        commandId: CommandId,
+        handled: HandledCommand,
+        name: String,
     ) {
-        recordWrite("recordCommandHandled")
-        commands.add(CommandKey(type, id, commandId))
+        recordWrite(name)
+        val key = CommandKey(type, id, commandId)
+        if (key in commands) throw CommandAlreadyRecordedException(type, id, commandId)
+        commands[key] = handled
     }
 }

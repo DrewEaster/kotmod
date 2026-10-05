@@ -3,7 +3,8 @@ package io.kotmod
 /** Base class for all exceptions thrown by the library. */
 sealed class DddException(
     message: String,
-) : RuntimeException(message)
+    cause: Throwable? = null,
+) : RuntimeException(message, cause)
 
 /** Thrown when a command targets an aggregate that does not exist. */
 class AggregateNotFoundException(
@@ -26,6 +27,33 @@ class OptimisticConcurrencyException(
     val aggregateId: AggregateId,
     val expectedVersion: Long,
 ) : DddException("Optimistic concurrency conflict on ${aggregateType.value}/${aggregateId.value} (expected version $expectedVersion)")
+
+/**
+ * Thrown by a [DomainPersistenceBackend] when [commandId] is already recorded for an aggregate, which happens when
+ * two writers handle the same command id at the same time. [AggregateManager.handle] retries, and the retry
+ * returns the recorded answer.
+ */
+class CommandAlreadyRecordedException(
+    val aggregateType: AggregateType,
+    val aggregateId: AggregateId,
+    val commandId: CommandId,
+) : DddException("Command ${commandId.value} is already recorded for ${aggregateType.value}/${aggregateId.value}")
+
+/**
+ * Thrown by [AggregateManager.handle] when a command id was rejected earlier but the recorded rejection can no
+ * longer be read, usually because its class was renamed or reshaped. Keep old names with `@SerialName`.
+ */
+class RejectionDeserializationException(
+    val aggregateType: AggregateType,
+    val aggregateId: AggregateId,
+    val commandId: CommandId,
+    val rejectionType: String,
+    cause: Throwable,
+) : DddException(
+        "Recorded rejection $rejectionType for command ${commandId.value} on ${aggregateType.value}/${aggregateId.value} " +
+            "can't be read; keep renamed rejection classes readable with @SerialName",
+        cause,
+    )
 
 /**
  * Thrown by the narrowed [AggregateManager.execute] when the aggregate's current state is not the
