@@ -518,7 +518,7 @@ without an `else`: then adding a command doesn't compile until every state, and 
 decided what to do with it.
 
 Decisions are plain code, so you can unit-test them without a database:
-`PendingOrder("book").handle(ShipOrder)` and `NoOrder.handle(PlaceOrder("book"))` return the `Outcome`.
+`PendingOrder("book").handle(ShipOrder)` and `NoOrder.handle(PlaceOrder("book"))` return the `Outcome`. `handle` is a `suspend` function, so call it from a coroutine such as `runTest`.
 
 Callers match on the result; a rejection is a value, never an exception:
 
@@ -1284,8 +1284,11 @@ failure in a specific spot to show up.
    implement `AggregateState` and decide each command in `handle`, returning `accept(...)` or `reject(...)`.
    Then add an `InitialState` object for commands on an aggregate that doesn't exist yet, as in
    [the quickstart](#2-define-state-events-commands-and-rejections).
-3. Pass that object as `initial`, and your rejection type's serializer as `rejectionSerializer`, to
+3. Pass the `InitialState` object as `initial`, and your rejection type's serializer as `rejectionSerializer`, to
    `AggregateManager`, and replace `create { }` and `execute<T> { }` calls with `handle(id, command)`.
+   `AggregateManager`'s type arguments are now `<S, C, E, R>` (state, command, event, rejection), e.g.
+   `AggregateManager<Order, OrderCommand, OrderEvent, OrderRejection>` where 0.1.0 had
+   `AggregateManager<Order, OrderEvent>`.
 4. Replace `catch (e: UnexpectedAggregateStateException)` with a rejection decided by the state, and drop any
    retry loop around `OptimisticConcurrencyException`: `handle` retries itself.
 5. If you implemented `DomainPersistenceBackend` yourself, replace `wasCommandHandled` with

@@ -9,8 +9,8 @@ import io.kotmod.Repository
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.support.orderEventSerialization
 import io.kotmod.support.DecideWith
-import io.kotmod.support.Order
 import io.kotmod.support.NoOrder
+import io.kotmod.support.Order
 import io.kotmod.support.OrderRejection
 import io.kotmod.support.PendingOrder
 import io.kotmod.support.PlaceOrder

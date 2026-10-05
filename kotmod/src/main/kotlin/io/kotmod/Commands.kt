@@ -51,6 +51,14 @@ interface AggregateState<S : AggregateState<S, C, E, R>, C : Any, E : DomainEven
 /**
  * Decides commands for an aggregate that doesn't exist yet. Accepting a command here creates the aggregate.
  * It is not one of the aggregate's stored states, so your [Repository] never saves or loads it.
+ *
+ * Its decisions should be pure too (see [AggregateState]). If a concurrent create wins, [AggregateManager.handle]
+ * retries and the stored state decides the command instead.
+ *
+ * @param S the aggregate's state type (your sealed state type).
+ * @param C the aggregate's command type.
+ * @param E the aggregate's domain event type.
+ * @param R the aggregate's rejection type.
  */
 interface InitialState<S : AggregateState<S, C, E, R>, C : Any, E : DomainEvent, R : Any> {
     /** Decides [command] for an aggregate that doesn't exist yet: accepting it creates the aggregate. */

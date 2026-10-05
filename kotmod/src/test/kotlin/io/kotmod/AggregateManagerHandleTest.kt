@@ -3,10 +3,10 @@ package io.kotmod
 import io.kotmod.support.CancelOrder
 import io.kotmod.support.CancelledOrder
 import io.kotmod.support.DecideWith
+import io.kotmod.support.NoOrder
 import io.kotmod.support.Order
 import io.kotmod.support.OrderAlreadyExists
 import io.kotmod.support.OrderCommand
-import io.kotmod.support.NoOrder
 import io.kotmod.support.OrderEvent
 import io.kotmod.support.OrderNotFound
 import io.kotmod.support.OrderNotPending

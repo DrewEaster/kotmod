@@ -12,9 +12,9 @@ import io.kotmod.postgres.support.IntegrationTest
 import io.kotmod.postgres.support.orderEventSerialization
 import io.kotmod.reject
 import io.kotmod.support.DecideWith
+import io.kotmod.support.NoOrder
 import io.kotmod.support.Order
 import io.kotmod.support.OrderAlreadyExists
-import io.kotmod.support.NoOrder
 import io.kotmod.support.PendingOrder
 import io.kotmod.support.PlaceOrder
 import io.kotmod.support.ShipOrder
