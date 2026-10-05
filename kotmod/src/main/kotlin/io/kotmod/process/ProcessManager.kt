@@ -123,6 +123,7 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
     private val commands =
         processExecutor(queues.channel("commands", JsonTriggerSerializer(CommandTrigger.serializer()), ordered = false), clock, ::runCommand)
     private val contractExecutors = mutableListOf<EventReactionExecutor<InputTrigger, Unit>>()
+    private val subscriptionNames = mutableSetOf<String>()
     private var started = false
 
     init {
@@ -144,8 +145,8 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
 
     /**
      * Delivers another context's public events to this process manager: [translate] turns each one into the process id
-     * and input it is for, or `null` to ignore it. [name] names the channel and must stay the same across restarts.
-     * Must be called before [start].
+     * and input it is for, or `null` to ignore it. [name] names the channel, must be unique within this process manager
+     * and must stay the same across restarts. Must be called before [start].
      */
     fun <P : PublicDomainEvent> subscribeTo(
         name: String,
@@ -153,13 +154,15 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
         translate: (PublicEventEnvelope<P>) -> Pair<AggregateId, I>?,
     ) {
         check(!started) { "subscribeTo() must be called before start()" }
+        require(name !in subscriptionNames) { "This process manager already subscribes to a contract named $name" }
         val executor = processExecutor(queues.channel("contract-$name", inputTriggers, ordered), clock, ::deliverInput)
-        contractExecutors += executor
         contract.subscribe(executor, inputOrdering) { envelope ->
             val (processId, input) = translate(envelope) ?: return@subscribe emptyList()
             val inputId = "in-${envelope.metadata.eventId.value}"
             listOf(EventReaction(EventReactionId(inputId), InputTrigger(processId.value, encode(input), inputId)))
         }
+        subscriptionNames += name
+        contractExecutors += executor
     }
 
     /** Starts the channels' executors and the poller. */
@@ -204,6 +207,8 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
             }
             return
         }
+        // Another process manager's envelopes are its own business, never an input to this one.
+        if (event.serialized.type in ENVELOPE_TYPES) return
         val (processId, input) = translate(event) ?: return
         val inputId = "in-$eventId"
         inputs.dispatch(EventReactionId(inputId), InputTrigger(processId.value, encode(input), inputId), inputOrdering.stampFor(event.metadata, 0))
@@ -227,5 +232,9 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
             ) ?: return
         val inputId = "rejected-${trigger.commandId}"
         internal.dispatch(EventReactionId(inputId), InputTrigger(trigger.processId, encode(feedback), inputId))
+    }
+
+    private companion object {
+        val ENVELOPE_TYPES = setOf(ProcessEventSerialization.COMMAND_REQUESTED, ProcessEventSerialization.INPUT_SCHEDULED)
     }
 }

@@ -3,11 +3,16 @@ package io.kotmod.process
 import io.kotmod.AggregateId
 import io.kotmod.AggregateManager
 import io.kotmod.AggregateType
+import io.kotmod.DataSerializationContext
 import io.kotmod.DomainEvent
 import io.kotmod.DomainEventPollingBackend
 import io.kotmod.EventId
 import io.kotmod.EventLogPosition
 import io.kotmod.PersistedEvent
+import io.kotmod.PublicDomainEvent
+import io.kotmod.SerializedEvent
+import io.kotmod.contract.PublicEventContract
+import io.kotmod.event.reaction.EventReactionId
 import io.kotmod.event.reaction.ReactionOrdering
 import io.kotmod.event.reaction.ReactionOutcome
 import io.kotmod.support.ClosedWindow
@@ -77,6 +82,7 @@ class ProcessManagerTest {
     private fun manager(
         targets: List<ProcessTarget<WindowInput>> = listOf(target(orders) { _, rejection -> ReleaseBlocked(rejection) }),
         inputOrdering: ReactionOrdering = ReactionOrdering.Unordered,
+        start: Boolean = true,
     ) = ProcessManager(
         type = windowType,
         repository = windows,
@@ -100,7 +106,53 @@ class ProcessManagerTest {
         savePosition = { position = it },
         isLeader = { true },
         clock = { now },
-    ).also { it.startExecutorsForTest() }
+    ).also { if (start) it.startExecutorsForTest() }
+
+    private data class OrderGoneInternal(
+        val orderId: String,
+    ) : DomainEvent
+
+    private data class OrderGone(
+        val orderId: String,
+    ) : PublicDomainEvent
+
+    private val contractEvents = mutableListOf<PersistedEvent>()
+
+    private val contract =
+        PublicEventContract<OrderGoneInternal, OrderGone>(
+            backend =
+                object : DomainEventPollingBackend {
+                    override fun readEventsAfter(
+                        position: EventLogPosition,
+                        limit: Int,
+                    ): List<PersistedEvent> = contractEvents.filter { it.position > position }.take(limit)
+                },
+            serialization =
+                object : DataSerializationContext<OrderGoneInternal> {
+                    override fun serialize(event: OrderGoneInternal) = SerializedEvent("OrderGone", 1, event.orderId)
+
+                    override fun deserialize(serialized: SerializedEvent) = OrderGoneInternal(serialized.payload)
+                },
+            internalToPublic = { OrderGone(it.orderId) },
+            getPosition = { EventLogPosition.START },
+            savePosition = {},
+            isLeader = { true },
+        )
+
+    private fun publishOrderGone(
+        eventId: String,
+        orderId: String,
+    ) {
+        val offset = contractEvents.size + 1L
+        contractEvents +=
+            persistedEvent(globalOffset = offset, eventId = eventId, aggregateId = orderId, eventType = "OrderGone", eventPayload = orderId)
+    }
+
+    private fun ProcessManager<Window, WindowInput, *>.subscribeToOrders(name: String = "orders") =
+        subscribeTo(name, contract) { envelope ->
+            val orderId = envelope.event.orderId
+            if (orderId == "skip") null else AggregateId("window-$orderId") to Opened(orderId, closeAt.epochSeconds)
+        }
 
     private suspend fun ProcessManager<Window, WindowInput, *>.openWindowFor(orderId: String) {
         log.add(persistedEvent(globalOffset = 0, eventId = "e-$orderId", aggregateType = "Order", aggregateId = orderId))
@@ -237,4 +289,69 @@ class ProcessManagerTest {
             manager(targets = listOf(target(orders) { _, r -> ReleaseBlocked(r) }, target(orders) { _, r -> ReleaseBlocked(r) }))
         }
     }
+
+    @Test
+    fun `a contract subscription asks for its own channel, ordered like the inputs`() {
+        manager(start = false).subscribeToOrders()
+        manager(inputOrdering = ReactionOrdering.PerAggregate(), start = false).subscribeToOrders("ordered-orders")
+
+        assertEquals("contract-orders" to false, queues.channels[3])
+        assertEquals("contract-ordered-orders" to true, queues.channels[7])
+    }
+
+    @Test
+    fun `a translated public event becomes an input on the contract channel and starts the process`() =
+        runBlocking {
+            val pm = manager(start = false)
+            pm.subscribeToOrders()
+            pm.startExecutorsForTest()
+            publishOrderGone(eventId = "p-1", orderId = "o-1")
+
+            contract.tickForTest()
+
+            assertEquals(EventReactionId("in-p-1"), queues.pending("contract-orders").single().id)
+            queues.deliver("contract-orders")
+            assertEquals(OpenWindow("o-1"), windows.store[AggregateId("window-o-1")])
+        }
+
+    @Test
+    fun `a public event translated to null dispatches nothing`() =
+        runBlocking {
+            val pm = manager(start = false)
+            pm.subscribeToOrders()
+            pm.startExecutorsForTest()
+            publishOrderGone(eventId = "p-1", orderId = "skip")
+
+            contract.tickForTest()
+
+            assertTrue(queues.pending("contract-orders").isEmpty())
+        }
+
+    @Test
+    fun `subscribing after the executors have started is refused`() {
+        val pm = manager()
+
+        assertFailsWith<IllegalStateException> { pm.subscribeToOrders() }
+    }
+
+    @Test
+    fun `two subscriptions with the same name are refused`() {
+        val pm = manager(start = false)
+        pm.subscribeToOrders()
+
+        assertFailsWith<IllegalArgumentException> { pm.subscribeToOrders() }
+    }
+
+    @Test
+    fun `another process manager's envelopes are never translated`() =
+        runBlocking {
+            val pm = manager()
+            log.add(persistedEvent(globalOffset = 0, eventId = "c-1", aggregateType = "Other", eventType = ProcessEventSerialization.COMMAND_REQUESTED))
+            log.add(persistedEvent(globalOffset = 0, eventId = "s-1", aggregateType = "Other", eventType = ProcessEventSerialization.INPUT_SCHEDULED))
+
+            pm.tickForTest()
+
+            assertTrue(translated.isEmpty())
+            assertTrue(queues.published.isEmpty())
+        }
 }
