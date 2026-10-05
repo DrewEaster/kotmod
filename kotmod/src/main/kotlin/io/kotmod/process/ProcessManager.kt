@@ -165,8 +165,9 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
         contractExecutors += executor
     }
 
-    /** Starts the channels' executors and the poller. */
+    /** Starts the channels' executors and the poller. Does nothing if already started. */
     fun start() {
+        if (started) return
         startExecutorsForTest()
         poller.start()
     }
@@ -208,7 +209,7 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
             return
         }
         // Another process manager's envelopes are its own business, never an input to this one.
-        if (event.serialized.type in ENVELOPE_TYPES) return
+        if (ProcessEventSerialization.isEnvelope(event.serialized.type)) return
         val (processId, input) = translate(event) ?: return
         val inputId = "in-$eventId"
         inputs.dispatch(EventReactionId(inputId), InputTrigger(processId.value, encode(input), inputId), inputOrdering.stampFor(event.metadata, 0))
@@ -232,9 +233,5 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
             ) ?: return
         val inputId = "rejected-${trigger.commandId}"
         internal.dispatch(EventReactionId(inputId), InputTrigger(trigger.processId, encode(feedback), inputId))
-    }
-
-    private companion object {
-        val ENVELOPE_TYPES = setOf(ProcessEventSerialization.COMMAND_REQUESTED, ProcessEventSerialization.INPUT_SCHEDULED)
     }
 }

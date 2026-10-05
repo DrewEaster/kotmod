@@ -8,6 +8,7 @@ import io.kotmod.event.reaction.EventReactionExecutor
 import io.kotmod.event.reaction.EventReactionTrigger
 import io.kotmod.event.reaction.ReactionOrdering
 import io.kotmod.event.reaction.stampFor
+import io.kotmod.process.ProcessEventSerialization
 import org.slf4j.LoggerFactory
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
@@ -19,7 +20,8 @@ import kotlin.time.Duration.Companion.milliseconds
  * [eventToReactions] for each event and dispatches the resulting reactions to [executor]. The position is
  * saved after all of an event's reactions are dispatched, so an event is never skipped; after a crash
  * it may be dispatched again, which is why reaction ids should be deterministic. Polling only happens
- * while [isLeader] returns `true`, so run one instance per cluster.
+ * while [isLeader] returns `true`, so run one instance per cluster. Process managers' internal envelope
+ * events never reach [eventToReactions].
  *
  * @param pollInterval pause between polls.
  * @param batchSize maximum number of events read per poll.
@@ -56,7 +58,9 @@ class AggregateEventOutbox<T : EventReactionTrigger>(
             isLeader = isLeader,
             pollInterval = pollInterval,
             loggerName = "AggregateEventOutbox",
-            handleEvent = { envelope ->
+            handleEvent = handle@{ envelope ->
+                // A process manager's internal envelopes are only for that process manager.
+                if (ProcessEventSerialization.isEnvelope(envelope.serialized.type)) return@handle
                 val reactions = eventToReactions(envelope)
                 reactions.forEachIndexed { ordinal, (id, trigger, notBefore) ->
                     log.debug(

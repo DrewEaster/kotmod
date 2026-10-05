@@ -229,6 +229,23 @@ class PublicEventContractTest {
     }
 
     @Test
+    fun `a process manager's internal envelope events are skipped without deserializing them`() {
+        givenEvents(
+            persistedEvent(globalOffset = 10, eventId = "e-10", eventType = "io.kotmod.process.CommandRequested", eventPayload = "{}"),
+            persistedEvent(globalOffset = 11, eventId = "e-11", eventType = "io.kotmod.process.InputScheduled", eventPayload = "{}"),
+        )
+
+        val counting = CountingSerialization()
+        val contract = newContract(serialization = counting)
+        contract.subscribe(executorA) { error("should not be invoked — envelope events are skipped") }
+        kotlinx.coroutines.runBlocking { contract.tickForTest() }
+
+        assertEquals(0, counting.deserializeCalls)
+        coVerify(exactly = 0) { executorA.dispatch(any(), any(), any()) }
+        assertEquals(listOf(10L, 11L), offsets.saved.map { it.globalOffset })
+    }
+
+    @Test
     fun `subscriber block that throws halts the batch — cursor does not advance`() {
         givenEvents(
             persistedEvent(globalOffset = 10, eventId = "e-10", eventType = "Opened", eventPayload = "Opened(id=doc-1)"),

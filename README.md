@@ -1201,6 +1201,9 @@ fun orderContract(
   able to read every event type your application writes. If you have several event families (orders and
   audit events, say), register them all in one `jsonDataSerializationContext<DomainEvent>` and use
   `DomainEvent` as the contract's internal type.
+- That includes the facts a [process manager](#process-managers) records: they are ordinary events in the
+  log, so register them as for any aggregate. kotmod skips process managers' internal events (the commands
+  and timeouts they have asked for) automatically, in contracts and outboxes alike.
 
 ### Process managers
 
@@ -1211,7 +1214,7 @@ synchronously: it asks for commands to be run and for inputs to be delivered to 
 manager, not saga.)
 
 The example below is a dispatch deadline: when an order is placed, wait two days; if it still hasn't shipped,
-cancel it and record that the deadline was missed.
+cancel it and record that the deadline was missed. If the customer cancels first, the deadline is abandoned.
 
 #### Inputs: the anti-corruption layer
 
@@ -1234,6 +1237,9 @@ data class OrderWasPlaced(
 data object OrderWasShipped : DispatchDeadlineInput
 
 @Serializable
+data object OrderWasCancelled : DispatchDeadlineInput
+
+@Serializable
 data object DeadlinePassed : DispatchDeadlineInput
 
 @Serializable
@@ -1252,7 +1258,7 @@ fun translateOrderEvent(
     return when (serialization.deserialize(event.serialized)) {
         is OrderPlaced -> deadline to OrderWasPlaced(event.metadata.aggregateId.value, event.metadata.timestamp)
         is OrderShipped -> deadline to OrderWasShipped
-        else -> null
+        is OrderCancelled -> deadline to OrderWasCancelled
     }
 }
 ```
@@ -1260,8 +1266,9 @@ fun translateOrderEvent(
 The process id (`deadline-<orderId>`) names an instance of the process manager's own aggregate type, not the
 order.
 
-`translate` receives every event in this context's log, except the process manager's own and those of other
-process managers, so filter by aggregate type before deserializing, as `translateOrderEvent` does and as the
+`translate` receives every event in this context's log except the process manager's own events and kotmod's
+internal events (the commands and timeouts process managers have asked for). Facts recorded by other process
+managers do reach it. Filter by aggregate type before deserializing, as `translateOrderEvent` does and as the
 quickstart's outbox does.
 
 #### States own their inputs
@@ -1291,7 +1298,7 @@ object NoDispatchDeadline : ProcessInitialState<DispatchDeadline, DispatchDeadli
                     AwaitingDispatch(input.orderId),
                     schedule = listOf(schedule(DeadlinePassed, at = input.placedAt + 2.days)),
                 )
-            OrderWasShipped, DeadlinePassed, is CancellationRefused -> ignore()
+            OrderWasShipped, OrderWasCancelled, DeadlinePassed, is CancellationRefused -> ignore()
         }
 }
 
@@ -1301,6 +1308,7 @@ data class AwaitingDispatch(
     override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome =
         when (input) {
             OrderWasShipped -> transition(Dispatched)
+            OrderWasCancelled -> transition(Abandoned)
             DeadlinePassed ->
                 transition(
                     Missed,
@@ -1315,12 +1323,20 @@ data object Dispatched : DispatchDeadline {
     override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome = ignore()
 }
 
+data object Abandoned : DispatchDeadline {
+    override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome = ignore()
+}
+
 data object Missed : DispatchDeadline {
-    // A refused cancellation means the order had shipped before the process heard about it.
+    // A cancellation refused because the order has shipped: it shipped before the process heard about it.
     override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome =
         when (input) {
-            is CancellationRefused -> transition(Dispatched)
-            OrderWasShipped, DeadlinePassed, is OrderWasPlaced -> ignore()
+            is CancellationRefused ->
+                when (input.rejection) {
+                    OrderAlreadyShipped -> transition(Dispatched)
+                    else -> ignore()
+                }
+            OrderWasShipped, OrderWasCancelled, DeadlinePassed, is OrderWasPlaced -> ignore()
         }
 }
 ```
@@ -1341,10 +1357,11 @@ how to turn a typed rejection back into an input for the process, like `Cancella
 #### Facts the process owns
 
 `transition(events = …)` records events in the process's own stream (here `DispatchDeadlineMissed`, which says
-the deadline passed before the process saw a shipment; a refused cancellation, because the order shipped in the
-meantime, is how the process learns otherwise). They are
-internal, like any domain events. To tell other contexts about them, publish them through a
-`PublicEventContract`, as in [Publishing events to other contexts](#publishing-events-to-other-contexts).
+the deadline passed before the process saw a shipment; a cancellation refused because the order has shipped is
+how the process learns otherwise). They are internal, like any domain events, and they sit in the log with
+everything else, so a contract's `serialization` must be able to read them. To tell other contexts about them,
+publish them through a `PublicEventContract`, as in
+[Publishing events to other contexts](#publishing-events-to-other-contexts).
 
 #### Wiring with db-scheduler
 
@@ -1408,6 +1425,15 @@ fun startDispatchDeadlines(
 Input delivery and commands are retried with capped backoff and never given up on. A command for an aggregate
 type that isn't one of the process manager's `targets` fails loudly when the process decides on it: nothing is
 recorded, and it is retried until you fix the wiring.
+
+- A `translate` that throws stops the poller at that event: its batch is retried on every poll, and nothing
+  after it reaches the process manager. The poller also hands out the commands and timeouts the process asks
+  for, so those wait too.
+- With ordered inputs, an input that keeps failing holds back the later inputs from the same source aggregate
+  until it succeeds.
+- The internal channel must be able to hold a reaction until its `notBefore` for as long as your timeouts are.
+  db-scheduler does; a plain Pub/Sub subscription doesn't (see
+  [Using another queue](#using-another-queue-eg-google-pubsub)).
 
 ## Running in production
 

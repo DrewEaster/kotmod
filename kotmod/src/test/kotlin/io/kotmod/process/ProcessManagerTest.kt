@@ -284,6 +284,25 @@ class ProcessManagerTest {
         }
 
     @Test
+    fun `a target kept in a val narrower than the input type can be one of the targets`() {
+        val shipping = target(orders) { _, rejection -> ReleaseBlocked(rejection) }
+
+        manager(targets = listOf(shipping))
+    }
+
+    @Test
+    fun `starting twice starts the channels once`() =
+        runBlocking {
+            val pm = manager(start = false)
+
+            pm.start()
+            pm.start()
+            pm.stop()
+
+            assertEquals(3, queues.subscriptions)
+        }
+
+    @Test
     fun `two targets for the same aggregate type are refused`() {
         assertFailsWith<IllegalArgumentException> {
             manager(targets = listOf(target(orders) { _, r -> ReleaseBlocked(r) }, target(orders) { _, r -> ReleaseBlocked(r) }))

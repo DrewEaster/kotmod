@@ -71,7 +71,7 @@ internal class JsonTriggerSerializer<T : EventReactionTrigger>(
 }
 
 /** An aggregate a process manager may send commands to, with how its rejections come back as inputs. Build it with [target]. */
-class ProcessTarget<I : Any> internal constructor(
+class ProcessTarget<out I : Any> internal constructor(
     internal val type: AggregateType,
     internal val send: suspend (targetId: AggregateId, command: String, commandId: CommandId, correlationId: CorrelationId) -> I?,
 )
@@ -96,8 +96,9 @@ fun <C : Any, R : Any, I : Any> target(
 private val log = LoggerFactory.getLogger("io.kotmod.process.ProcessManager")
 
 /**
- * An executor for one process manager channel: [run] does the work; any exception is retried with capped backoff and
- * never given up, so an input or command is never silently dropped.
+ * An executor for one process manager channel: [run] does the work; any exception, and any timeout (60 seconds unless
+ * the trigger sets one), is retried with capped backoff and never given up, so an input or command is never silently
+ * dropped.
  */
 internal fun <T : EventReactionTrigger> processExecutor(
     channel: ProcessChannel<T>,

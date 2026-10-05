@@ -26,7 +26,7 @@ import kotlin.time.Instant
  * scheduler.start()
  * ```
  *
- * [jdbc] is needed only when the process manager's inputs are ordered.
+ * Use one instance per process manager. [jdbc] is needed only when the process manager's inputs are ordered.
  */
 class DbSchedulerProcessManagerQueues(
     private val name: String,
@@ -34,12 +34,21 @@ class DbSchedulerProcessManagerQueues(
     private val unsubscribedRetryDelay: Duration = 5.seconds,
 ) : ProcessManagerQueues {
     private val reactions = mutableListOf<DbSchedulerEventReactions<*>>()
+    private val channelNames = mutableSetOf<String>()
+    private var tasksRead = false
 
     @Volatile
     private var client: SchedulerClient? = null
 
-    /** The tasks to register with the app's `Scheduler`, once the process manager (and its subscriptions) are built. */
-    val tasks: List<Task<*>> get() = reactions.flatMap { it.tasks }
+    /**
+     * The tasks to register with the app's `Scheduler`, once the process manager (and its subscriptions) are built. No
+     * channel can be added after this is read.
+     */
+    val tasks: List<Task<*>>
+        get() {
+            tasksRead = true
+            return reactions.flatMap { it.tasks }
+        }
 
     /** Publishes through [client] (usually the app's `Scheduler`). Call it before starting the process manager. */
     fun bind(client: SchedulerClient) {
@@ -51,10 +60,18 @@ class DbSchedulerProcessManagerQueues(
         triggerSerializer: EventReactionTriggerSerializer<T>,
         ordered: Boolean,
     ): ProcessChannel<T> {
+        check(!tasksRead) {
+            "Channel $name was asked for after DbSchedulerProcessManagerQueues(${this.name}).tasks was read, so its task " +
+                "would never be registered: register tasks after building the process manager and all its subscribeTo calls"
+        }
+        require(name !in channelNames) {
+            "DbSchedulerProcessManagerQueues(${this.name}) already has a channel named $name; give each process manager its own queues"
+        }
         require(!ordered || jdbc != null) { "Ordered process inputs need DbSchedulerProcessManagerQueues to be created with a JdbcContext" }
         val channelReactions =
             DbSchedulerEventReactions("${this.name}-$name", triggerSerializer, unsubscribedRetryDelay, jdbc = if (ordered) jdbc else null)
         reactions += channelReactions
+        channelNames += name
         val sink =
             object : EventReactionTriggerSink<T> {
                 override val supportsOrdering: Boolean = channelReactions.supportsOrdering

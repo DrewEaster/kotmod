@@ -42,8 +42,11 @@ internal class ProcessEventSerialization<E : DomainEvent>(
 ) : DataSerializationContext<DomainEvent> {
     override fun serialize(event: DomainEvent): SerializedEvent =
         when (event) {
-            is CommandRequested -> SerializedEvent(COMMAND_REQUESTED, 1, Json.encodeToString(CommandRequested.serializer(), event))
-            is InputScheduled -> SerializedEvent(INPUT_SCHEDULED, 1, Json.encodeToString(InputScheduled.serializer(), event))
+            is ProcessEnvelope ->
+                when (event) {
+                    is CommandRequested -> SerializedEvent(COMMAND_REQUESTED, 1, Json.encodeToString(CommandRequested.serializer(), event))
+                    is InputScheduled -> SerializedEvent(INPUT_SCHEDULED, 1, Json.encodeToString(InputScheduled.serializer(), event))
+                }
             else -> {
                 @Suppress("UNCHECKED_CAST")
                 events.serialize(event as E)
@@ -60,6 +63,14 @@ internal class ProcessEventSerialization<E : DomainEvent>(
     companion object {
         const val COMMAND_REQUESTED = "io.kotmod.process.CommandRequested"
         const val INPUT_SCHEDULED = "io.kotmod.process.InputScheduled"
+
+        private val ENVELOPE_TYPES = setOf(COMMAND_REQUESTED, INPUT_SCHEDULED)
+
+        /**
+         * Whether [type] is one of kotmod's envelope types. Only the process manager that wrote an envelope reads it;
+         * outboxes, contracts and other process managers skip it.
+         */
+        fun isEnvelope(type: String): Boolean = type in ENVELOPE_TYPES
     }
 }
 

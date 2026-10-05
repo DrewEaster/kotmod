@@ -3,9 +3,13 @@ package io.kotmod.event.reaction.dbscheduler
 import io.kotmod.AggregateId
 import io.kotmod.AggregateManager
 import io.kotmod.AggregateType
+import io.kotmod.DomainEvent
+import io.kotmod.PublicDomainEvent
 import io.kotmod.Repository
+import io.kotmod.contract.PublicEventContract
 import io.kotmod.jdbc.JdbcContext
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
+import io.kotmod.postgres.PostgresDomainPollingBackend
 import io.kotmod.postgres.PostgresOffsetManager
 import io.kotmod.postgres.support.IntegrationTest
 import io.kotmod.postgres.support.eventually
@@ -21,16 +25,22 @@ import io.kotmod.support.NoWindow
 import io.kotmod.support.OpenWindow
 import io.kotmod.support.Opened
 import io.kotmod.support.Order
+import io.kotmod.support.OrderCancelled
 import io.kotmod.support.OrderNotPending
+import io.kotmod.support.OrderPlaced
 import io.kotmod.support.OrderRejection
 import io.kotmod.support.PendingOrder
+import io.kotmod.support.OrderShipped
 import io.kotmod.support.PlaceOrder
 import io.kotmod.support.ReleaseBlocked
 import io.kotmod.support.ShippedOrder
 import io.kotmod.support.Window
+import io.kotmod.support.WindowClosed
 import io.kotmod.support.WindowInput
 import io.kotmod.support.testOrders
 import io.kotmod.support.windowEventSerialization
+import io.kotmod.serialization.jsonDataSerializationContext
+import io.kotmod.serialization.toEventSerializer
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -149,10 +159,38 @@ class ProcessManagerIntegrationTest : IntegrationTest() {
         AggregateManager(testOrders, OrderTable(jdbc), PostgresDomainPersistenceBackend(jdbc, orderEventSerialization()), NoOrder)
     }
 
-    /** Runs a window process: every OrderPlaced opens a window that closes [closeAfter] later. */
+    private data class OrderWasPlacedPublic(
+        val orderId: String,
+    ) : PublicDomainEvent
+
+    /**
+     * A contract over the same log as the window process: it must read the process's own facts (WindowClosed), as for
+     * any aggregate, and never sees the process's internal envelopes.
+     */
+    private fun orderContract(offsets: PostgresOffsetManager) =
+        PublicEventContract(
+            backend = PostgresDomainPollingBackend(jdbc),
+            serialization =
+                jsonDataSerializationContext<DomainEvent> {
+                    +OrderPlaced.serializer().toEventSerializer()
+                    +OrderShipped.serializer().toEventSerializer()
+                    +OrderCancelled.serializer().toEventSerializer()
+                    +WindowClosed.serializer().toEventSerializer()
+                },
+            internalToPublic = { event -> if (event is OrderPlaced) OrderWasPlacedPublic(event.name) else null },
+            getPosition = { offsets.getPosition("order-contract") },
+            savePosition = { offsets.savePosition("order-contract", it) },
+            isLeader = { true },
+        )
+
+    /**
+     * Runs a window process: every OrderPlaced opens a window that closes [closeAfter] later. With [viaContract], the
+     * process hears of placed orders through a public event contract instead of reading them from the log itself.
+     */
     private suspend fun runningWindows(
         closeAfter: Duration,
         clock: () -> Instant = { Clock.System.now() },
+        viaContract: Boolean = false,
         block: suspend () -> Unit,
     ) {
         val queues = DbSchedulerProcessManagerQueues("windows", jdbc)
@@ -166,7 +204,9 @@ class ProcessManagerIntegrationTest : IntegrationTest() {
                 inputSerializer = WindowInput.serializer(),
                 eventSerialization = windowEventSerialization(),
                 translate = { event ->
-                    if (event.metadata.aggregateType == testOrders.type && event.serialized.type == "io.kotmod.support.OrderPlaced") {
+                    if (viaContract) {
+                        null
+                    } else if (event.metadata.aggregateType == testOrders.type && event.serialized.type == "io.kotmod.support.OrderPlaced") {
                         val orderId = event.metadata.aggregateId.value
                         AggregateId("window-$orderId") to Opened(orderId, (Clock.System.now() + closeAfter).epochSeconds)
                     } else {
@@ -181,14 +221,27 @@ class ProcessManagerIntegrationTest : IntegrationTest() {
                 isLeader = { true },
                 clock = clock,
             )
+        val contract =
+            if (viaContract) {
+                orderContract(offsets).also { contract ->
+                    windows.subscribeTo("orders", contract) { envelope ->
+                        val orderId = envelope.event.orderId
+                        AggregateId("window-$orderId") to Opened(orderId, (Clock.System.now() + closeAfter).epochSeconds)
+                    }
+                }
+            } else {
+                null
+            }
         val scheduler = testScheduler(dataSource, *queues.tasks.toTypedArray())
         queues.bind(scheduler)
         windows.start()
+        contract?.start()
         scheduler.start()
         try {
             block()
         } finally {
             scheduler.stop()
+            contract?.stop()
             windows.stop()
         }
     }
@@ -234,6 +287,23 @@ class ProcessManagerIntegrationTest : IntegrationTest() {
                 delay(1_500)
                 assertEquals(OpenWindow("o-3"), window("o-3"), "ran before its notBefore by the process's clock")
                 eventually { window("o-3") == ClosedWindow("o-3") }
+            }
+        }
+
+    @Test
+    fun `a contract on the same log keeps working while a process manager it feeds writes its envelopes`() =
+        runBlocking {
+            runningWindows(closeAfter = 1.seconds, viaContract = true) {
+                orders.handle(AggregateId("o-4"), PlaceOrder("o-4"))
+
+                eventually { window("o-4") == OpenWindow("o-4") }
+                eventually { order("o-4") == ShippedOrder("o-4") }
+                eventually { window("o-4") == ClosedWindow("o-4") }
+
+                // By now the log holds the process's envelopes and its WindowClosed; the contract must have read past them.
+                orders.handle(AggregateId("o-5"), PlaceOrder("o-5"))
+                eventually { window("o-5") == OpenWindow("o-5") }
+                eventually { order("o-5") == ShippedOrder("o-5") }
             }
         }
 }

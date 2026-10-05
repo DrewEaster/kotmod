@@ -5,7 +5,6 @@ import io.kotmod.AggregateType
 import io.kotmod.CommandId
 import io.kotmod.DomainEvent
 import io.kotmod.HandledCommand
-import io.kotmod.SerializedEvent
 import io.kotmod.support.ClosedWindow
 import io.kotmod.support.Elapsed
 import io.kotmod.support.NoWindow

@@ -11,7 +11,7 @@ import kotlin.time.Instant
  *
  * Write the `when` over your sealed input type without an `else`, so adding an input doesn't compile until every state
  * has decided what to do with it. Decisions should be pure; they may suspend, but a decision runs again if its write
- * loses a race.
+ * loses a race (a bounded number of times; inside an outer transaction it isn't retried, the conflict is thrown).
  *
  * @param S the process's state type (your sealed state type itself).
  * @param I the process's input type.
@@ -24,7 +24,8 @@ interface ProcessState<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> {
 
 /**
  * Decides inputs for a process that doesn't exist yet: [transition] starts it, [ignore] leaves it unstarted (the input
- * is still recorded, so a redelivery is recognised). Your repository never stores it.
+ * is still recorded, so a redelivery is recognised). It isn't a state your repository stores: an instance with no
+ * stored state is decided by it, and the first transition saves the state it moves to.
  */
 interface ProcessInitialState<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> {
     /** Decides [input] for a process that doesn't exist yet. */

@@ -15,6 +15,10 @@ import kotlin.time.Instant
 /**
  * In-memory queues for tests: a publish of an id that is still pending is ignored, as real queues do. [deliver] runs
  * every pending reaction of a channel once and removes the ones that finish.
+ *
+ * Unlike a real queue: every delivery has retry count 0; a [ReactionOutcome.Wait] or retry delay is ignored (the
+ * reaction just stays pending for the next [deliver]); ordering stamps are recorded but not enforced; and [deliver]
+ * works on a snapshot, so reactions published while it runs wait for the next call.
  */
 class ManualQueues(
     private val supportsOrdering: Boolean = true,
@@ -32,6 +36,10 @@ class ManualQueues(
     private val handlers =
         mutableMapOf<String, suspend (EventReactionId, EventReactionExecutionId, EventReactionTrigger, RetryCount, Instant?) -> ReactionOutcome>()
     val channels = mutableListOf<Pair<String, Boolean>>()
+
+    /** How many times an executor subscribed to any channel. */
+    var subscriptions = 0
+        private set
 
     override fun <T : EventReactionTrigger> channel(
         name: String,
@@ -59,6 +67,7 @@ class ManualQueues(
                 override fun subscribe(
                     block: suspend (EventReactionId, EventReactionExecutionId, T, RetryCount, Instant?) -> ReactionOutcome,
                 ): Cancellable {
+                    subscriptions++
                     handlers[name] = { id, executionId, trigger, retryCount, notBefore ->
                         @Suppress("UNCHECKED_CAST")
                         block(id, executionId, trigger as T, retryCount, notBefore)

@@ -330,6 +330,9 @@ data class OrderWasPlaced(
 data object OrderWasShipped : DispatchDeadlineInput
 
 @Serializable
+data object OrderWasCancelled : DispatchDeadlineInput
+
+@Serializable
 data object DeadlinePassed : DispatchDeadlineInput
 
 @Serializable
@@ -357,7 +360,7 @@ object NoDispatchDeadline : ProcessInitialState<DispatchDeadline, DispatchDeadli
                     AwaitingDispatch(input.orderId),
                     schedule = listOf(schedule(DeadlinePassed, at = input.placedAt + 2.days)),
                 )
-            OrderWasShipped, DeadlinePassed, is CancellationRefused -> ignore()
+            OrderWasShipped, OrderWasCancelled, DeadlinePassed, is CancellationRefused -> ignore()
         }
 }
 
@@ -367,6 +370,7 @@ data class AwaitingDispatch(
     override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome =
         when (input) {
             OrderWasShipped -> transition(Dispatched)
+            OrderWasCancelled -> transition(Abandoned)
             DeadlinePassed ->
                 transition(
                     Missed,
@@ -381,12 +385,20 @@ data object Dispatched : DispatchDeadline {
     override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome = ignore()
 }
 
+data object Abandoned : DispatchDeadline {
+    override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome = ignore()
+}
+
 data object Missed : DispatchDeadline {
-    // A refused cancellation means the order had shipped before the process heard about it.
+    // A cancellation refused because the order has shipped: it shipped before the process heard about it.
     override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome =
         when (input) {
-            is CancellationRefused -> transition(Dispatched)
-            OrderWasShipped, DeadlinePassed, is OrderWasPlaced -> ignore()
+            is CancellationRefused ->
+                when (input.rejection) {
+                    OrderAlreadyShipped -> transition(Dispatched)
+                    else -> ignore()
+                }
+            OrderWasShipped, OrderWasCancelled, DeadlinePassed, is OrderWasPlaced -> ignore()
         }
 }
 
@@ -399,7 +411,7 @@ fun translateOrderEvent(
     return when (serialization.deserialize(event.serialized)) {
         is OrderPlaced -> deadline to OrderWasPlaced(event.metadata.aggregateId.value, event.metadata.timestamp)
         is OrderShipped -> deadline to OrderWasShipped
-        else -> null
+        is OrderCancelled -> deadline to OrderWasCancelled
     }
 }
 

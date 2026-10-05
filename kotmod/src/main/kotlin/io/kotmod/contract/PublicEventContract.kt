@@ -13,6 +13,7 @@ import io.kotmod.event.reaction.EventReactionExecutor
 import io.kotmod.event.reaction.EventReactionTrigger
 import io.kotmod.event.reaction.ReactionOrdering
 import io.kotmod.event.reaction.stampFor
+import io.kotmod.process.ProcessEventSerialization
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import kotlin.time.Duration
@@ -23,7 +24,8 @@ import kotlin.time.Duration.Companion.milliseconds
  *
  * While running, it polls the event log, deserializes each event with [serialization], maps it with
  * [internalToPublic] (returning `null` keeps an event private) and passes the public event to every
- * subscriber. Each subscriber turns it into event reactions for its own executor. Positions, leadership
+ * subscriber. Process managers' internal envelope events are skipped; their own facts are ordinary events,
+ * so [serialization] must be able to read them. Each subscriber turns it into event reactions for its own executor. Positions, leadership
  * and redelivery work as in [io.kotmod.outbox.AggregateEventOutbox].
  *
  * @param I the internal domain event type.
@@ -114,6 +116,8 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
     internal suspend fun tickForTest() = poller.tickForTest()
 
     private suspend fun handleEvent(envelope: PersistedEvent) {
+        // A process manager's internal envelopes are only for that process manager; no app serialization can read them.
+        if (ProcessEventSerialization.isEnvelope(envelope.serialized.type)) return
         val internal: I = serialization.deserialize(envelope.serialized)
         val public: E = internalToPublic(internal) ?: return
         val publicEnvelope = PublicEventEnvelope(envelope.metadata, public)

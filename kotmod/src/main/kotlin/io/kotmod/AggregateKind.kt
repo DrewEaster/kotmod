@@ -32,7 +32,12 @@ open class AggregateKind<C : Any, R : Any>(
     ): RequestedCommand<C> = RequestedCommand(this, id, command)
 }
 
-/** A command a process manager asks to be run against aggregate [targetId] of [kind]. Build it with [AggregateKind.command]. */
+/**
+ * A command a process manager asks to be run against aggregate [targetId] of [kind]. Build it with [AggregateKind.command].
+ *
+ * Two requested commands are equal only if their kinds are the same instance (kinds compare by identity), so declare
+ * each kind once, as an `object`, and request commands from it.
+ */
 data class RequestedCommand<C : Any>(
     val kind: AggregateKind<C, *>,
     val targetId: AggregateId,

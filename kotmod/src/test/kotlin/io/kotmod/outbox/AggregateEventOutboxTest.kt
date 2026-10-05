@@ -115,6 +115,20 @@ class AggregateEventOutboxTest {
     }
 
     @Test
+    fun `a process manager's internal envelope events are skipped without calling eventToReactions`() {
+        givenEvents(
+            persistedEvent(globalOffset = 10, eventType = "io.kotmod.process.CommandRequested"),
+            persistedEvent(globalOffset = 11, eventType = "io.kotmod.process.InputScheduled"),
+        )
+
+        val outbox = newOutbox(eventToReactions = { error("should not be invoked — envelope events are skipped") })
+        kotlinx.coroutines.runBlocking { outbox.tickForTest() }
+
+        coVerify(exactly = 0) { executor.dispatch(any(), any(), any()) }
+        assertEquals(listOf(10L, 11L), offsets.saved.map { it.globalOffset })
+    }
+
+    @Test
     fun `dispatch failure on the 2nd of 3 reactions for one event halts the batch`() {
         givenEvents(persistedEvent(globalOffset = 10, eventId = "e-1"), persistedEvent(globalOffset = 11, eventId = "e-2"))
 
