@@ -504,8 +504,9 @@ Every command runs in three phases:
 
 1. **Read** — if the command's id has already been handled, the recorded answer is returned and nothing
    else happens. Otherwise the aggregate's version and state are loaded.
-2. **Decide** — the aggregate's current state (or the initial state, if the aggregate doesn't exist yet) decides the command. kotmod does no database work while it runs, so keep side effects
-   out of it; put them in event reactions instead.
+2. **Decide** — the aggregate's current state (or the initial state, if the aggregate doesn't exist yet)
+   decides the command. kotmod does no database work while it runs, so keep side effects out of it; put
+   them in event reactions instead.
 3. **Write** — in one transaction, the aggregate's version is advanced, your repository saves the new
    state, the events are appended and the command is recorded as handled. A rejected command writes only
    the rejection record.
@@ -540,8 +541,8 @@ suspend fun cancelOrder(
 ```
 
 **Why commands are data.** Every caller, whether an HTTP handler, an event reaction or, later, a process
-manager, runs a command the same way: through `handle`. The rules for which state a command
-needs and how it is refused live in one place.
+manager, runs a command the same way: through `AggregateManager.handle`. The rules for which state accepts a
+command and how it is refused live in the states themselves, not in each caller.
 
 **Event sequence numbers.** Every event carries `event.metadata.sequence`: its number within its
 aggregate, counting 1, 2, 3… with no gaps. Reactions and public contracts can use it to tell which of an
@@ -555,8 +556,8 @@ the events of one wider flow; it is stored with every event.
 
 **Concurrency.** Each aggregate has a version. If someone else changes the aggregate between your read and
 your write, `handle` reads again and decides again, up to `maxConflictRetries` times (5 by default), and
-then throws `OptimisticConcurrencyException`. Deciding again is safe when decisions are pure. Decision
-blocks may suspend, but anything a decision calls out to may then be called once per attempt.
+then throws `OptimisticConcurrencyException`. Deciding again is safe when decisions are pure. A state's
+`handle` may suspend, but anything it calls out to is called once per attempt.
 
 **Your repository joins the transaction.** `Repository.save` is called inside kotmod's transaction, so it
 must borrow its connection from the same `JdbcContext` as the backend — as `OrderRepository` does with
