@@ -1,9 +1,7 @@
 package io.kotmod
 
-import kotlinx.serialization.KSerializer
-
 /**
- * What a command function decides: accept the command with a new state and events, or reject it with one of
+ * What a state decides about a command: accept the command with a new state and events, or reject it with one of
  * the aggregate's own rejection types. Build one with [accept] or [reject].
  *
  * @param S the aggregate's state type.
@@ -33,72 +31,30 @@ fun <S, E : DomainEvent> accept(
 fun <R> reject(rejection: R): Outcome<Nothing, Nothing, R> = Outcome.Reject(rejection)
 
 /**
- * What one branch of [CommandHandlers.handler] does with the aggregate's current state (`null` if the aggregate
- * does not exist). Built with [CommandHandlers.on], [CommandHandlers.creates] or [CommandHandlers.any].
+ * A behavioural position of an aggregate that decides the commands it receives. Implement it on your sealed state
+ * type, and decide every command in [handle]: accept it with [accept], or reject it with [reject].
+ *
+ * Write the `when` over your sealed command type without an `else`, so adding a command doesn't compile until every
+ * state has decided what to do with it. Decisions should be pure; they may suspend, but [AggregateManager.handle]
+ * runs a decision again on each conflict retry, so anything it calls out to may be called more than once.
+ *
+ * @param S the aggregate's state type (your sealed state type itself).
+ * @param C the aggregate's command type.
+ * @param E the aggregate's domain event type.
+ * @param R the aggregate's rejection type.
  */
-class CommandHandler<S : Any, out E : DomainEvent, out R : Any>
-    @PublishedApi
-    internal constructor(
-        internal val decide: suspend (S?) -> Outcome<S, E, R>,
-    )
+interface AggregateState<S : AggregateState<S, C, E, R>, C : Any, E : DomainEvent, R : Any> {
+    /** Decides [command] in this state: accept it with a new state and events, or reject it. */
+    suspend fun handle(command: C): Outcome<S, E, R>
+}
 
 /**
- * The commands of one aggregate type, and the single place that routes each command to a function that decides it.
- * Decisions should be pure; they may suspend, but [AggregateManager.handle] runs a decision again on each conflict
- * retry, so anything it calls out to may be called more than once.
- *
- * Extend it with an `object` and implement [handler] as an exhaustive `when` over your sealed command type, one
- * line per command:
- *
- * ```
- * object PayoutCommands : CommandHandlers<Payout, PayoutCommand, PayoutEvent, PayoutRejection>(
- *     rejectionSerializer = PayoutRejection.serializer(),
- * ) {
- *     override fun PayoutCommand.handler() = when (this) {
- *         is Hold    -> creates(otherwise = { PayoutAlreadyExists }) { hold(amount) }
- *         is Release -> on<Held>(otherwise = { PayoutNotHeld }) { it.release(reference) }
- *     }
- * }
- * ```
- *
- * Every rejection is one of your own types, so callers can match on them exhaustively.
- *
- * @param rejectionSerializer serializes rejections, which are recorded so a repeated command id gets the same
- *   answer.
+ * Decides commands for an aggregate that doesn't exist yet. Accepting a command here creates the aggregate.
+ * It is not one of the aggregate's stored states, so your [Repository] never saves or loads it.
  */
-abstract class CommandHandlers<S : Any, C : Any, E : DomainEvent, R : Any>(
-    val rejectionSerializer: KSerializer<R>,
-) {
-    /** Routes this command to the function that decides it. */
-    abstract fun C.handler(): CommandHandler<S, E, R>
-
-    /**
-     * Runs [block] when the current state is a [T]. Otherwise rejects with [otherwise], which receives the actual
-     * state (`null` when the aggregate does not exist).
-     */
-    inline fun <reified T : S> on(
-        noinline otherwise: (S?) -> R,
-        noinline block: suspend (T) -> Outcome<S, E, R>,
-    ): CommandHandler<S, E, R> =
-        CommandHandler { state -> if (state is T) block(state) else Outcome.Reject(otherwise(state)) }
-
-    /** Runs [block] only when the aggregate does not exist yet. Otherwise rejects with [otherwise]. */
-    fun creates(
-        otherwise: (S) -> R,
-        block: suspend () -> Outcome<S, E, R>,
-    ): CommandHandler<S, E, R> = CommandHandler { state -> if (state == null) block() else Outcome.Reject(otherwise(state)) }
-
-    /** Runs [block] with the full current state (`null` when the aggregate does not exist), for commands valid in several states. */
-    fun any(block: suspend (S?) -> Outcome<S, E, R>): CommandHandler<S, E, R> = CommandHandler(block)
-
-    /**
-     * Decides [command] against [state] (`null` when the aggregate does not exist) without touching the database.
-     * Use it to unit-test your routing and `otherwise` mappings.
-     */
-    suspend fun decide(
-        command: C,
-        state: S?,
-    ): Outcome<S, E, R> = command.handler().decide(state)
+interface InitialState<S : AggregateState<S, C, E, R>, C : Any, E : DomainEvent, R : Any> {
+    /** Decides [command] for an aggregate that doesn't exist yet: accepting it creates the aggregate. */
+    suspend fun handle(command: C): Outcome<S, E, R>
 }
 
 /** What [AggregateManager.handle] returns. */

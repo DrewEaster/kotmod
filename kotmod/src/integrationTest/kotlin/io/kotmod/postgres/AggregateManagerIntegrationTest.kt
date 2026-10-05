@@ -14,7 +14,7 @@ import io.kotmod.reject
 import io.kotmod.support.DecideWith
 import io.kotmod.support.Order
 import io.kotmod.support.OrderAlreadyExists
-import io.kotmod.support.OrderCommands
+import io.kotmod.support.NoOrder
 import io.kotmod.support.PendingOrder
 import io.kotmod.support.PlaceOrder
 import io.kotmod.support.ShipOrder
@@ -71,7 +71,7 @@ class AggregateManagerIntegrationTest : IntegrationTest() {
         }
     }
 
-    private lateinit var orders: AggregateManager<Order, io.kotmod.support.OrderEvent, io.kotmod.support.OrderCommand, io.kotmod.support.OrderRejection>
+    private lateinit var orders: AggregateManager<Order, io.kotmod.support.OrderCommand, io.kotmod.support.OrderEvent, io.kotmod.support.OrderRejection>
 
     @BeforeEach
     fun setUp() {
@@ -81,7 +81,14 @@ class AggregateManagerIntegrationTest : IntegrationTest() {
                 stmt.execute("TRUNCATE handle_test_order")
             }
         }
-        orders = AggregateManager(AggregateType("Order"), OrderTable(jdbc), PostgresDomainPersistenceBackend(jdbc, orderEventSerialization()), OrderCommands)
+        orders =
+            AggregateManager(
+                AggregateType("Order"),
+                OrderTable(jdbc),
+                PostgresDomainPersistenceBackend(jdbc, orderEventSerialization()),
+                NoOrder,
+                io.kotmod.support.OrderRejection.serializer(),
+            )
     }
 
     private fun count(sql: String): Int =

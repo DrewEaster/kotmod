@@ -10,7 +10,8 @@ import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.support.orderEventSerialization
 import io.kotmod.support.DecideWith
 import io.kotmod.support.Order
-import io.kotmod.support.OrderCommands
+import io.kotmod.support.NoOrder
+import io.kotmod.support.OrderRejection
 import io.kotmod.support.PendingOrder
 import io.kotmod.support.PlaceOrder
 import io.kotmod.support.ShipOrder
@@ -164,7 +165,8 @@ abstract class JdbcContextContract : IntegrationTest() {
         aggregateType = AggregateType(type),
         repository = ProbeOrderRepository(jdbc),
         backend = PostgresDomainPersistenceBackend(jdbc, orderEventSerialization()),
-        commands = OrderCommands,
+        initial = NoOrder,
+        rejectionSerializer = OrderRejection.serializer(),
     )
 
     private fun count(table: String): Int =

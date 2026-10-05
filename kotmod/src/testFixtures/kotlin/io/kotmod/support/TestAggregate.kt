@@ -1,25 +1,59 @@
 package io.kotmod.support
 
-import io.kotmod.CommandHandlers
+import io.kotmod.AggregateState
 import io.kotmod.DomainEvent
+import io.kotmod.InitialState
 import io.kotmod.Outcome
 import io.kotmod.accept
+import io.kotmod.reject
 import kotlinx.serialization.Serializable
 
-sealed interface Order
+sealed interface Order : AggregateState<Order, OrderCommand, OrderEvent, OrderRejection>
 
 data class PendingOrder(
     val name: String,
-) : Order
+) : Order {
+    override suspend fun handle(command: OrderCommand): OrderOutcome =
+        when (command) {
+            is PlaceOrder -> reject(OrderAlreadyExists)
+            ShipOrder -> ship()
+            is CancelOrder -> cancel(command.reason)
+            is DecideWith -> command.block(this)
+        }
+}
 
 data class ShippedOrder(
     val name: String,
-) : Order
+) : Order {
+    override suspend fun handle(command: OrderCommand): OrderOutcome =
+        when (command) {
+            is PlaceOrder -> reject(OrderAlreadyExists)
+            ShipOrder, is CancelOrder -> reject(OrderNotPending("ShippedOrder"))
+            is DecideWith -> command.block(this)
+        }
+}
 
 data class CancelledOrder(
     val name: String,
     val reason: String,
-) : Order
+) : Order {
+    override suspend fun handle(command: OrderCommand): OrderOutcome =
+        when (command) {
+            is PlaceOrder -> reject(OrderAlreadyExists)
+            ShipOrder, is CancelOrder -> reject(OrderNotPending("CancelledOrder"))
+            is DecideWith -> command.block(this)
+        }
+}
+
+/** The order before it exists: only placing it is accepted. */
+object NoOrder : InitialState<Order, OrderCommand, OrderEvent, OrderRejection> {
+    override suspend fun handle(command: OrderCommand): OrderOutcome =
+        when (command) {
+            is PlaceOrder -> placeOrder(command.name)
+            ShipOrder, is CancelOrder -> reject(OrderNotFound)
+            is DecideWith -> command.block(null)
+        }
+}
 
 sealed interface OrderCommand
 
@@ -59,20 +93,6 @@ fun placeOrder(name: String): OrderOutcome = accept(PendingOrder(name), OrderPla
 fun PendingOrder.ship(): OrderOutcome = accept(ShippedOrder(name), OrderShipped(name))
 
 fun PendingOrder.cancel(reason: String): OrderOutcome = accept(CancelledOrder(name, reason), OrderCancelled(name, reason))
-
-object OrderCommands : CommandHandlers<Order, OrderCommand, OrderEvent, OrderRejection>(
-    rejectionSerializer = OrderRejection.serializer(),
-) {
-    override fun OrderCommand.handler() =
-        when (this) {
-            is PlaceOrder -> creates(otherwise = { OrderAlreadyExists }) { placeOrder(name) }
-            ShipOrder -> on<PendingOrder>(otherwise = ::notPending) { it.ship() }
-            is CancelOrder -> on<PendingOrder>(otherwise = ::notPending) { it.cancel(reason) }
-            is DecideWith -> any(block)
-        }
-
-    private fun notPending(order: Order?): OrderRejection = if (order == null) OrderNotFound else OrderNotPending(order::class.simpleName!!)
-}
 
 sealed interface OrderEvent : DomainEvent
 

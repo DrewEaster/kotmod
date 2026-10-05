@@ -44,7 +44,8 @@ class SqlDelightJdbcContextIntegrationTest : JdbcContextContract() {
                     ) = Unit
                 },
             backend = PostgresDomainPersistenceBackend(jdbc, orderEventSerialization()),
-            commands = io.kotmod.support.OrderCommands,
+            initial = io.kotmod.support.NoOrder,
+            rejectionSerializer = io.kotmod.support.OrderRejection.serializer(),
         )
 
     @Test

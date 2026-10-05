@@ -3,6 +3,7 @@ package io.kotmod
 import io.kotmod.jdbc.KotmodTransaction
 import io.kotmod.jdbc.databaseWork
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.Json
 import kotlin.time.toKotlinInstant
 
@@ -12,8 +13,9 @@ import kotlin.time.toKotlinInstant
  * [handle] is the only way to change an aggregate. Each command runs in three phases:
  * 1. **Read:** if the command id has already been handled, return the recorded answer (the current state if
  *    it was accepted, the same rejection if it was rejected). Otherwise load the aggregate's version and state.
- * 2. **Decide:** [commands] routes the command to a pure function, which accepts it (new state and events) or
- *    rejects it with one of the aggregate's rejection types. No database work happens in this phase.
+ * 2. **Decide:** the aggregate's current state decides the command with [AggregateState.handle], or [initial] does
+ *    when the aggregate doesn't exist yet. It accepts the command (new state and events) or rejects it with one of
+ *    the aggregate's rejection types. No database work happens in this phase.
  * 3. **Write:** in one transaction, either advance the aggregate's version (optimistic concurrency), save the
  *    new state, append the events and record the command as accepted; or record the rejection.
  *
@@ -24,15 +26,18 @@ import kotlin.time.toKotlinInstant
  * [io.kotmod.contract.PublicEventContract].
  *
  * @param S the aggregate's state type.
- * @param E the aggregate's domain event type.
  * @param C the aggregate's command type.
+ * @param E the aggregate's domain event type.
  * @param R the aggregate's rejection type.
+ * @param initial decides commands for an aggregate that doesn't exist yet.
+ * @param rejectionSerializer serializes rejections, which are recorded so a repeated command id gets the same answer.
  */
-class AggregateManager<S : Any, E : DomainEvent, C : Any, R : Any>(
+class AggregateManager<S : AggregateState<S, C, E, R>, C : Any, E : DomainEvent, R : Any>(
     private val aggregateType: AggregateType,
     private val repository: Repository<S>,
     private val backend: DomainPersistenceBackend<E>,
-    private val commands: CommandHandlers<S, C, E, R>,
+    private val initial: InitialState<S, C, E, R>,
+    private val rejectionSerializer: KSerializer<R>,
     private val maxConflictRetries: Int = 5,
 ) {
     init {
@@ -115,7 +120,8 @@ class AggregateManager<S : Any, E : DomainEvent, C : Any, R : Any>(
         // Phase 2: Decide — pure, no database work
         val outcome =
             try {
-                commands.decide(command, undecided.state)
+                val state = undecided.state
+                if (state != null) state.handle(command) else initial.handle(command)
             } catch (e: DddException) {
                 throw DecisionFailed(e)
             }
@@ -148,7 +154,7 @@ class AggregateManager<S : Any, E : DomainEvent, C : Any, R : Any>(
                             commandId,
                             // rejection_type is VARCHAR(255) and only informational: truncate rather than fail the insert.
                             rejectionType = outcome.rejection::class.java.name.take(MAX_REJECTION_TYPE_LENGTH),
-                            payload = Json.encodeToString(commands.rejectionSerializer, outcome.rejection),
+                            payload = Json.encodeToString(rejectionSerializer, outcome.rejection),
                         )
                 }
             }
@@ -171,7 +177,7 @@ class AggregateManager<S : Any, E : DomainEvent, C : Any, R : Any>(
         handled: HandledCommand.Rejected,
     ): R =
         try {
-            Json.decodeFromString(commands.rejectionSerializer, handled.payload)
+            Json.decodeFromString(rejectionSerializer, handled.payload)
         } catch (e: IllegalArgumentException) {
             // kotlinx.serialization's SerializationException is an IllegalArgumentException.
             throw RejectionDeserializationException(aggregateType, id, commandId, handled.type, e)

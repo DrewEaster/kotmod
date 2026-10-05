@@ -6,7 +6,7 @@ import io.kotmod.support.DecideWith
 import io.kotmod.support.Order
 import io.kotmod.support.OrderAlreadyExists
 import io.kotmod.support.OrderCommand
-import io.kotmod.support.OrderCommands
+import io.kotmod.support.NoOrder
 import io.kotmod.support.OrderEvent
 import io.kotmod.support.OrderNotFound
 import io.kotmod.support.OrderNotPending
@@ -34,7 +34,7 @@ class AggregateManagerHandleTest {
     private val id = AggregateId("o-1")
     private lateinit var backend: StubPersistenceBackend<OrderEvent>
     private lateinit var repo: StubRepository<Order>
-    private lateinit var orders: AggregateManager<Order, OrderEvent, OrderCommand, OrderRejection>
+    private lateinit var orders: AggregateManager<Order, OrderCommand, OrderEvent, OrderRejection>
 
     @BeforeTest
     fun setUp() {
@@ -44,12 +44,12 @@ class AggregateManagerHandleTest {
     }
 
     private fun manager(maxConflictRetries: Int = 5) =
-        AggregateManager(type, repo, backend, OrderCommands, maxConflictRetries = maxConflictRetries)
+        AggregateManager(type, repo, backend, NoOrder, OrderRejection.serializer(), maxConflictRetries = maxConflictRetries)
 
     private fun version() = backend.metas[StubPersistenceBackend.Key(type, id)]?.version
 
     @Test
-    fun `an accepted create saves state, meta at version 1, events and the command`() =
+    fun `accepting from the initial state creates the aggregate with state, meta at version 1, events and the command`() =
         runTest {
             val result = orders.handle(id, PlaceOrder("book"), commandId = CommandId("c-1"))
 
@@ -113,7 +113,7 @@ class AggregateManagerHandleTest {
         }
 
     @Test
-    fun `a command on a missing aggregate is rejected through otherwise, and recorded`() =
+    fun `a command on a missing aggregate is rejected by the initial state, and recorded`() =
         runTest {
             val result = orders.handle(id, ShipOrder, commandId = CommandId("c-1"))
 
@@ -123,7 +123,7 @@ class AggregateManagerHandleTest {
         }
 
     @Test
-    fun `creating an existing aggregate is rejected through otherwise`() =
+    fun `creating an existing aggregate is rejected by its current state`() =
         runTest {
             orders.handle(id, PlaceOrder("book"))
 
