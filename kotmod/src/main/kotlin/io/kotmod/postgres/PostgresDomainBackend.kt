@@ -303,6 +303,20 @@ class PostgresDomainPollingBackend private constructor(
                 }
         }
 
+    /**
+     * Returns the event with [eventId], or `null` if there is none. A parked use-case mapping reads its event again with
+     * it. kotmod's own internal events are never returned, unless this is a process manager's own backend.
+     */
+    internal fun readEvent(eventId: EventId): PersistedEvent? =
+        jdbc.withConnection { conn ->
+            conn
+                .prepareStatement("SELECT $EVENT_COLUMNS FROM ddd_domain_event WHERE event_id = ? " + visible())
+                .use { ps ->
+                    ps.setString(1, eventId.value)
+                    ps.executeQuery().use { rs -> if (rs.next()) rs.toPublishedEvent() else null }
+                }
+        }
+
     override fun checkSequence(
         event: PersistedEvent,
         position: EventLogPosition,
