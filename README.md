@@ -432,6 +432,8 @@ Start it when your application starts, before it handles commands. To shut down,
 reactor: `scheduler.stop()`, then `reactor.stop()` (the reactor also handles its use cases' queues, so it stops
 after the scheduler that delivers their work). The quickstart passes `isLeader = { true }` because it runs on one
 node; see [Running in production](#running-in-production) for leader election and the full shutdown order.
+The reactor saves its position under its name, `reactor` by default, so a second reactor on the same database
+needs its own `name = "..."` (see **Reading events** in [Postgres setup](#postgres-setup)).
 
 ### 5. Run commands
 
@@ -823,10 +825,11 @@ A parked event is retried with capped backoff (1s, 2s, 4s… up to 10 minutes), 
 is never dropped while the use case still listens to its aggregate type. Each retry reads the event again and
 runs the use case's current code, so deploying a fix is enough. The event's triggers are then queued with the
 ids they would have had, and run. With ordering, the aggregate's later work in that use case waits behind the
-parked event; other aggregates and other use cases are unaffected. On db-scheduler the event's triggers then still run in order, before that later work, because
-ordered work runs in sequence order whenever it was queued. A queue that orders by publish time, such as Pub/Sub,
-runs them after the later work instead (see [Using another queue](#using-another-queue-eg-google-pubsub)). If
-the fixed code no longer listens to the event's aggregate type, the parked event is dropped with a warning.
+parked event; other aggregates and other use cases are unaffected. On db-scheduler the event's triggers then
+still run in order, before that later work, because ordered work runs in sequence order whenever it was queued.
+A queue that orders by publish time, such as Pub/Sub, runs them after the later work instead (see
+[Using another queue](#using-another-queue-eg-google-pubsub)). If the fixed code no longer listens to the
+event's aggregate type, the parked event is dropped with a warning.
 
 ### Running use cases on db-scheduler
 
