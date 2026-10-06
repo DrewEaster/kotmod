@@ -118,7 +118,12 @@ interface EventReactionTriggerSink<T : EventReactionTrigger> {
     /**
      * Queues reaction [id] with [trigger]. Publishing an id that is already queued must not queue it twice.
      * An ordering stamp is only passed to sinks that support ordering; such sinks must run reactions with the
-     * same key one at a time, in (sequence, ordinal) order. [notBefore], if not null, is the earliest time the
+     * same key one at a time, in (sequence, ordinal) order — the stamp's order, not the publish order: a reaction
+     * published later with a lower (sequence, ordinal) than reactions of its key already queued must run before
+     * them. kotmod relies on this when it parks a mapping that failed, whose reaction is published after the
+     * aggregate's later reactions but stamped ahead of them. A queue that can only deliver in publish order (such as
+     * Pub/Sub with ordering keys) can't honour this, so after a parked mapping an aggregate's reactions on it run out
+     * of order. [notBefore], if not null, is the earliest time the
      * reaction may run: a sink that can schedule should hold the reaction back until then, and every sink must
      * carry it to the source, which passes it back on delivery. A reaction never has both an ordering stamp and
      * a [notBefore].

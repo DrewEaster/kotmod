@@ -132,9 +132,9 @@ internal class UseCaseRuntime<T : Any>(
     }
 
     /**
-     * Rethrows [error] if it is a [CancellationException] and this coroutine was cancelled. The mapping blocks don't
-     * suspend, so a CancellationException thrown while the coroutine is still active came from the app's code: it is
-     * a mapping failure like any other.
+     * Rethrows [error] if it is a [CancellationException] and this coroutine was cancelled. A CancellationException
+     * thrown while the coroutine is still active came from the app's code (a mapping block or `handle`): it is a
+     * failure like any other.
      */
     private suspend fun rethrowIfCancelled(error: Throwable) {
         if (error is CancellationException && !currentCoroutineContext().isActive) throw error
@@ -253,10 +253,11 @@ internal class UseCaseRuntime<T : Any>(
                     try {
                         useCase.handle(trigger, ReactionContext(id.value, attempt))
                         null
-                    } catch (e: CancellationException) {
-                        // Not a failure: the attempt was interrupted (e.g. the scheduler is stopping); the queue redelivers it.
-                        throw e
                     } catch (e: Throwable) {
+                        // A timeout or a cancellation (e.g. the scheduler is stopping) is not a failure: it crosses the
+                        // boundary, and an interrupted attempt is redelivered by the queue. A CancellationException
+                        // thrown while the attempt is still running came from the app's code: a failure like any other.
+                        rethrowIfCancelled(e)
                         e
                     }
                 }

@@ -31,6 +31,8 @@ import kotlin.time.Instant
  *
  * Register every use case, then start the reactor before the queue's scheduler, and stop it after. A new reactor
  * starts at the head of the event log as of its first [start]: it sees events written from then on, not history.
+ * [register], [start] and [stop] are meant to be called from one thread, at startup and shutdown; they are not
+ * safe to call concurrently.
  *
  * @param name the consumer name its position is saved under.
  */

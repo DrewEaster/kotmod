@@ -117,7 +117,15 @@ abstract class Reactions<T : Any>(
     }
 }
 
+/**
+ * Marks kotmod's reaction DSL scopes, so a block nested in one (such as a lambda with its own [TriggerScope]) can't call
+ * the outer scope's [TriggerScope.trigger] by accident: name the outer receiver explicitly (`this@on.trigger(…)`).
+ */
+@DslMarker
+annotation class ReactionsDsl
+
 /** The receiver of a use case's `on(...)` block: [trigger] queues work for the event being read. */
+@ReactionsDsl
 class TriggerScope<T : Any> internal constructor() {
     internal val produced = mutableListOf<ProducedTrigger<T>>()
 

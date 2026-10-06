@@ -7,6 +7,10 @@ import io.kotmod.event.reaction.ReactionOrdering
 import io.kotmod.event.reaction.ReactionOutcome
 import io.kotmod.process.ManualQueues
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.SerializationException
@@ -215,13 +219,46 @@ class UseCaseRuntimeTest {
         }
 
     @Test
-    fun `a reaction cancelled by a shutdown goes back to the queue and is not reported as a failure`() =
-        runBlocking {
-            val useCase = RecordingUseCase().apply { work = { throw CancellationException("scheduler stopping") } }
+    fun `a CancellationException thrown by handle while the reaction is still running is a failure like any other`() =
+        runBlocking<Unit> {
+            val declined = java.util.concurrent.CancellationException("payment request cancelled by the provider")
+            val useCase =
+                RecordingUseCase().apply {
+                    failWith = { _, _ -> declined }
+                    decide = { _, attempt, _ -> if (attempt < 1) Retry(1.seconds) else GiveUp }
+                }
             runtime(useCase).send("r-1", Confirm("o-1"))
 
-            assertFailsWith<CancellationException> { queues.deliver("confirmations") }
+            val outcomes = queues.deliver("confirmations") + queues.deliver("confirmations")
+
+            assertEquals(listOf<ReactionOutcome>(ReactionOutcome.Retry(1.seconds), ReactionOutcome.Finished(gaveUp = true)), outcomes)
+            assertEquals(listOf(0, 1), useCase.failures.map { it.first })
+            assertSame(declined, useCase.failures.last().second)
+            assertEquals(listOf<Pair<Notice, ReactionResult>>(Confirm("o-1") to ReactionResult.GaveUp(declined)), useCase.completions)
+            assertTrue(queues.pending("confirmations").isEmpty())
+        }
+
+    @Test
+    fun `a reaction cancelled by a shutdown goes back to the queue and is not reported as a failure`() =
+        runBlocking<Unit> {
+            val started = CompletableDeferred<Unit>()
+            val useCase =
+                RecordingUseCase().apply {
+                    work = {
+                        started.complete(Unit)
+                        awaitCancellation()
+                    }
+                }
+            runtime(useCase).send("r-1", Confirm("o-1"))
+
+            val delivery = async { queues.deliver("confirmations") }
+            started.await()
+            delivery.cancelAndJoin()
+
+            assertTrue(delivery.isCancelled)
+            assertFailsWith<CancellationException> { delivery.await() }
             assertTrue(useCase.failures.isEmpty())
             assertTrue(useCase.completions.isEmpty())
+            assertEquals(1, queues.pending("confirmations").size)
         }
 }
