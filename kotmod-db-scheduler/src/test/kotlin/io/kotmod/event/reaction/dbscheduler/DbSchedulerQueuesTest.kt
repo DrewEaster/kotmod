@@ -9,7 +9,6 @@ import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
-import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.time.Duration
 
@@ -36,9 +35,9 @@ class DbSchedulerQueuesTest {
     }
 
     @Test
-    fun `an ordered queue supports ordering and an unordered one doesn't`() {
+    fun `every queue supports ordering, so ordered work left in a queue that is no longer ordered can still run`() {
         assertTrue(queues.channel("ordered", FakeTriggerSerializer, ordered = true).sink.supportsOrdering)
-        assertFalse(queues.channel("unordered", FakeTriggerSerializer, ordered = false).sink.supportsOrdering)
+        assertTrue(queues.channel("unordered", FakeTriggerSerializer, ordered = false).sink.supportsOrdering)
     }
 
     @Test

@@ -1,5 +1,6 @@
 package io.kotmod.event.reaction.dbscheduler
 
+import io.kotmod.EventId
 import io.kotmod.event.reaction.EventReactionId
 import io.kotmod.event.reaction.EventReactionTrigger
 import io.kotmod.event.reaction.EventReactionTriggerSerializer
@@ -97,6 +98,36 @@ internal class DbSchedulerEventReactions<T : EventReactionTrigger>(
         orderedQueries?.let { nudgeNext(client, taskName, it, key) }
     }
 
+    /** The parked mappings of use case [useCase] (this task): reactions with id `<useCase>/<eventId>/mapping`. */
+    fun parkedMappings(
+        client: SchedulerClient,
+        useCase: String,
+    ): List<ParkedMapping> =
+        client
+            .getScheduledExecutionsForTask(taskName, String::class.java)
+            .mapNotNull { execution ->
+                val data = ReactionTaskData.decode(execution.data)
+                val reactionId = data.ordering?.reactionId ?: execution.taskInstance.id
+                parkedEventId(useCase, reactionId)?.let { ParkedMapping(EventId(it), EventReactionId(reactionId), data.retryCount) }
+            }
+
+    /** Drops [useCase]'s parked mapping of [eventId] without retrying it, so its aggregate's next reaction can run. */
+    fun skipParked(
+        client: SchedulerClient,
+        useCase: String,
+        eventId: EventId,
+    ) {
+        val reactionId = parkedMappingId(useCase, eventId)
+        val execution =
+            client.getScheduledExecutionsForTask(taskName, String::class.java).singleOrNull { execution ->
+                val data = ReactionTaskData.decode(execution.data)
+                (data.ordering?.reactionId ?: execution.taskInstance.id) == reactionId
+            } ?: throw IllegalArgumentException("No parked mapping $reactionId for task $taskName")
+        val key = ReactionTaskData.decode(execution.data).ordering?.key
+        client.cancel(execution.taskInstance)
+        if (key != null) orderedQueries?.let { nudgeNext(client, taskName, it, key) }
+    }
+
     private fun blockedExecution(
         client: SchedulerClient,
         id: EventReactionId,
@@ -105,4 +136,20 @@ internal class DbSchedulerEventReactions<T : EventReactionTrigger>(
             val data = ReactionTaskData.decode(execution.data)
             data.blocked && data.ordering?.reactionId == id.value
         } ?: throw IllegalArgumentException("No blocked event reaction ${id.value} for task $taskName")
+}
+
+// A use case parks an event it couldn't map as reaction `<useCase>/<eventId>/mapping` (see io.kotmod.reaction.UseCaseRuntime).
+private fun parkedMappingId(
+    useCase: String,
+    eventId: EventId,
+) = "$useCase/${eventId.value}/mapping"
+
+private fun parkedEventId(
+    useCase: String,
+    reactionId: String,
+): String? {
+    val prefix = "$useCase/"
+    val suffix = "/mapping"
+    if (!reactionId.startsWith(prefix) || !reactionId.endsWith(suffix) || reactionId.length <= prefix.length + suffix.length) return null
+    return reactionId.substring(prefix.length, reactionId.length - suffix.length)
 }

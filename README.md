@@ -832,6 +832,12 @@ A queue that orders by publish time, such as Pub/Sub, runs them after the later 
 [Using another queue](#using-another-queue-eg-google-pubsub)). If the fixed code no longer listens to the
 event's aggregate type, the parked event is dropped with a warning.
 
+If an event will never map — say its payload is beyond repair — an operator can drop its parked mapping. On
+db-scheduler, `queues.parkedMappings(scheduler, useCase)` lists a use case's parked events (event id, reaction id
+and retry count), and `queues.skipParked(scheduler, useCase, eventId)` drops one without retrying it: that
+event's work in the use case never runs, and with ordering the aggregate's later work can then run. On another
+queue, delete the item with id `<useCase>/<eventId>/mapping` with that queue's own tools.
+
 ### Running use cases on db-scheduler
 
 This is kotmod's ready-made queue, in the optional `kotmod-db-scheduler` module. It needs nothing but your
@@ -1766,9 +1772,10 @@ failure in a specific spot to show up.
 - **Aggregate types containing `/` can share ordering keys.** The ordering key is
   `"<aggregate type>/<aggregate id>"`, so type `a/b` with id `c` and type `a` with id `b/c` share one key.
   Their work then waits unnecessarily; nothing runs out of order.
-- **Unreadable stored work affects the blocked-reaction helpers.** If any pending work of the use case has
-  stored data that can't be decoded, `blockedReactions`, `retryBlocked` and `skipBlocked` fail. Work whose
-  trigger can't be decoded holds back its aggregate's later work without being listed by `blockedReactions`.
+- **Unreadable stored work affects the operator helpers.** If any pending work of the use case has stored data
+  that can't be decoded, `blockedReactions`, `retryBlocked`, `skipBlocked`, `parkedMappings` and `skipParked`
+  fail. Work whose trigger can't be decoded holds back its aggregate's later work without being listed by
+  `blockedReactions`.
 - **Prompt hand-over needs immediate execution.** When ordered work finishes, the aggregate's next work is
   rescheduled to run now. It only starts straight away if the `Scheduler` uses `enableImmediateExecution()`;
   otherwise it starts on db-scheduler's next poll.
@@ -1902,7 +1909,23 @@ compiled; the [quickstart](#4-react-to-events) and the guides show compiled code
 9. **Positions.** The reactor saves its position under its `name` (`reactor` by default); your 0.2.0 outbox
    consumer names are no longer read. A new reactor starts at the head of the event log when it first starts, so
    events written before the upgrade that were not yet reacted to are not replayed (another reason to drain
-   first). You can delete the old rows from `ddd_consumer_offset`.
+   first). If you can't stop writing commands to drain, stop just the 0.2.0 outboxes instead and let the work
+   they already queued finish. Then, before the reactor's first start, give it the outboxes' position, so it
+   reacts to every event written since:
+
+   ```sql
+   -- Fails if the reactor already has a position: do this before its first start.
+   INSERT INTO ddd_consumer_offset (consumer_name, last_transaction_id, last_offset, updated_at)
+   SELECT 'reactor', last_transaction_id, last_offset, now()
+   FROM ddd_consumer_offset
+   WHERE consumer_name IN ('order-outbox', 'payment-outbox')  -- your 0.2.0 outbox consumer names
+   ORDER BY last_transaction_id, last_offset
+   LIMIT 1;
+   ```
+
+   With several outboxes this takes the one furthest behind, so use cases that came from the others may see some
+   events again (with new ids, so `handle` must be idempotent). Once the reactor is running, you can delete the
+   old rows from `ddd_consumer_offset`.
 10. **Deduplication only while queued.** A reaction's id is deduplicated only while it is still in the queue; once
     it has completed it is gone, so a redelivery after that can run it again. Use `context.reactionId` as the
     idempotency key of external calls.

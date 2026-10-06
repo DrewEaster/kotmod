@@ -1,6 +1,7 @@
 package io.kotmod.event.reaction.dbscheduler
 
 import com.github.kagkarlsson.scheduler.Scheduler
+import io.kotmod.EventId
 import io.kotmod.EventLogPosition
 import io.kotmod.event.reaction.EventReactionId
 import io.kotmod.event.reaction.OnGiveUp
@@ -121,11 +122,17 @@ class UseCaseFailuresIntegrationTest : IntegrationTest() {
                 })
             val emails = OrderWork("emails")
 
-            runningReactor(dataSource, jdbc, listOf(broken, emails)) { scheduler, _ ->
+            runningReactor(dataSource, jdbc, listOf(broken, emails)) { scheduler, queues ->
                 jdbc.appendOrderEvent("e-1", "o-1", 1)
                 eventually(15.seconds) { (scheduler.parkedMapping("broken", "e-1")?.get("retryCount")?.jsonPrimitive?.int ?: 0) >= 2 }
                 assertTrue(attempts.get() >= 3, "the reader's attempt and at least two retries of the parked mapping")
                 assertNotNull(scheduler.parkedMapping("broken", "e-1"), "still parked: never dropped")
+                assertEquals(
+                    listOf(EventId("e-1") to EventReactionId("broken/e-1/mapping")),
+                    queues.parkedMappings(scheduler, "broken").map { it.eventId to it.reactionId },
+                )
+                assertTrue(queues.parkedMappings(scheduler, "broken").single().retryCount >= 2)
+                assertTrue(queues.parkedMappings(scheduler, "emails").isEmpty())
                 assertEquals(1, emails.seen.handled.size)
             }
 
@@ -167,25 +174,34 @@ class UseCaseFailuresIntegrationTest : IntegrationTest() {
     @Test
     fun `a failing handle retries only that reaction, and with ordering only its aggregate waits, in its use case only`() =
         runBlocking<Unit> {
+            // o-1's first reaction keeps failing until o-2 has been handled and o-1's second is queued behind it, so
+            // the order the projection sees is deterministic.
+            val failing = AtomicBoolean(true)
             val projection =
-                OrderWork("projection", ordering = ReactionOrdering.PerAggregate(), work = { w, context ->
-                    if (w == Confirm("o-1", 1) && context.attempt < 2) error("projection down")
+                OrderWork("projection", ordering = ReactionOrdering.PerAggregate(), work = { w, _ ->
+                    if (w == Confirm("o-1", 1) && failing.get()) error("projection down")
                 })
             val emails = OrderWork("emails")
 
-            runningReactor(dataSource, jdbc, listOf(projection, emails)) { _, _ ->
+            runningReactor(dataSource, jdbc, listOf(projection, emails)) { scheduler, _ ->
                 jdbc.appendOrderEvent("e-1", "o-1", 1)
                 jdbc.appendOrderEvent("e-2", "o-1", 2, OrderShipped("book"))
                 jdbc.appendOrderEvent("e-3", "o-2", 1)
+                eventually { projection.seen.handled.contains(Confirm("o-2", 1)) && projection.seen.failures.isNotEmpty() }
+                eventually { scheduler.instanceIds("projection").any { it.endsWith("projection/e-2/0") } }
+                assertEquals(listOf<Work>(Confirm("o-2", 1)), projection.seen.handled.toList(), "o-1's second event waits behind the failing first")
+
+                failing.set(false)
                 eventually(15.seconds) { projection.seen.handled.size == 3 && emails.seen.handled.size == 3 }
                 delay(500)
             }
 
             assertEquals(Confirm("o-2", 1), projection.seen.handled.first())
             assertEquals(listOf<Work>(Confirm("o-1", 1), Confirm("o-1", 2)), projection.seen.forOrder("o-1"))
-            assertEquals(listOf(0, 1, 2), projection.seen.contexts.filter { it.reactionId == "projection/e-1/0" }.map { it.attempt })
+            val attempts = projection.seen.contexts.filter { it.reactionId == "projection/e-1/0" }.map { it.attempt }
+            assertEquals((0 until attempts.size).toList(), attempts, "each retry counted once")
+            assertEquals(attempts.size - 1, projection.seen.failures.size, "every attempt but the last failed")
             assertEquals(1, projection.seen.contexts.count { it.reactionId == "projection/e-2/0" }, "the later reaction ran once, not retried")
-            assertEquals(2, projection.seen.failures.size)
             assertEquals(listOf(0, 0, 0), emails.seen.contexts.map { it.attempt }, "the other use case never retried")
         }
 
@@ -291,5 +307,31 @@ class UseCaseFailuresIntegrationTest : IntegrationTest() {
 
             assertEquals(listOf<Work>(Confirm("o-1", 2)), projection.seen.handled.toList())
             assertEquals(1, projection.seen.contexts.count { it.reactionId == "projection/e-1/0" }, "the skipped reaction never ran again")
+        }
+
+    @Test
+    fun `an operator can skip a parked mapping that will never succeed, so its aggregate moves on`() =
+        runBlocking<Unit> {
+            val projection =
+                OrderWork("projection", ordering = ReactionOrdering.PerAggregate(), mapping = { _, m ->
+                    if (m.eventId.value == "e-1") error("this event can never be mapped")
+                    trigger(Confirm(m.aggregateId.value, m.sequence))
+                })
+
+            runningReactor(dataSource, jdbc, listOf(projection)) { scheduler, queues ->
+                jdbc.appendOrderEvent("e-1", "o-1", 1)
+                jdbc.appendOrderEvent("e-2", "o-1", 2, OrderShipped("book"))
+                eventually { scheduler.instanceIds("projection").any { it.endsWith("projection/e-2/0") } }
+                // Wait for the parked mapping's second retry, so the next one is 4s away and it isn't running when skipped.
+                eventually(15.seconds) { (queues.parkedMappings(scheduler, "projection").singleOrNull()?.retryCount ?: 0) >= 2 }
+                assertTrue(projection.seen.handled.isEmpty(), "o-1's second event waits behind the parked first")
+                assertEquals(EventReactionId("projection/e-1/mapping"), queues.parkedMappings(scheduler, "projection").single().reactionId)
+
+                queues.skipParked(scheduler, "projection", EventId("e-1"))
+                eventually(10.seconds) { projection.seen.handled.isNotEmpty() && scheduler.instanceIds("projection").isEmpty() }
+                delay(500)
+            }
+
+            assertEquals(listOf<Work>(Confirm("o-1", 2)), projection.seen.handled.toList())
         }
 }

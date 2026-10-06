@@ -3,7 +3,9 @@ package io.kotmod.event.reaction.dbscheduler
 import com.github.kagkarlsson.scheduler.Scheduler
 import com.github.kagkarlsson.scheduler.task.TaskInstance
 import com.github.kagkarlsson.scheduler.task.TaskInstanceId
+import io.kotmod.event.reaction.DispatchOrdering
 import io.kotmod.event.reaction.EventReactionId
+import io.kotmod.event.reaction.OnGiveUp
 import io.kotmod.event.reaction.ReactionOutcome
 import io.kotmod.postgres.support.IntegrationTest
 import io.kotmod.postgres.support.eventually
@@ -84,6 +86,7 @@ class DbSchedulerQueuesIntegrationTest : IntegrationTest() {
 
             assertEquals(listOf(0, 1, 2), consumer.attempts.map { it.retryCount })
             assertEquals(3, consumer.attempts.map { it.executionId }.toSet().size)
+            assertEquals(listOf(EventReactionId("r-1") to false), consumer.finished.toList())
         }
 
     @Test
@@ -144,6 +147,7 @@ class DbSchedulerQueuesIntegrationTest : IntegrationTest() {
             }
 
             assertTrue(consumer.attempts.isEmpty())
+            assertTrue(consumer.finished.isEmpty())
         }
 
     @Test
@@ -203,5 +207,27 @@ class DbSchedulerQueuesIntegrationTest : IntegrationTest() {
             assertEquals(listOf(TestTrigger("first")), consumer.attempts.map { it.trigger })
             assertEquals(0, consumer.attempts.single().retryCount)
             assertTrue(Clock.System.now() >= notBefore)
+        }
+
+    @Test
+    fun `ordered work left in a queue that is no longer ordered still runs`() =
+        runBlocking<Unit> {
+            // Deployed as an ordered use case: one ordered reaction is queued but hasn't run yet.
+            val before = queues()
+            val ordered = TestConsumer(before.channel("test-reactions", TestTriggerSerializer, ordered = true))
+            scheduler(before)
+            ordered.dispatch(EventReactionId("r-1"), TestTrigger("queued while ordered"), DispatchOrdering("Order/o-1", 1, 0, OnGiveUp.ContinueWithNext))
+
+            // Redeployed as an unordered use case.
+            val after = queues()
+            val consumer = TestConsumer(after.queue())
+            val scheduler = scheduler(after)
+
+            running(scheduler, consumer) {
+                eventually { consumer.finished.isNotEmpty() && scheduler.getScheduledExecutionsForTask("test-reactions", String::class.java).isEmpty() }
+            }
+
+            assertEquals(listOf(EventReactionId("r-1") to false), consumer.finished.toList())
+            assertEquals(listOf(TestTrigger("queued while ordered")), consumer.attempts.map { it.trigger })
         }
 }
