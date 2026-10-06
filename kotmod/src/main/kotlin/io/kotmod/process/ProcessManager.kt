@@ -171,14 +171,14 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
         contractExecutors += executor
     }
 
-    /** Starts the channels' executors and the poller. Does nothing if already started. */
+    /** Starts its channels and the poller. Does nothing if already started. */
     fun start() {
         if (started) return
         startExecutorsForTest()
         poller.start()
     }
 
-    /** Stops the poller, then the channels' executors. */
+    /** Stops the poller, then its channels. */
     suspend fun stop() {
         poller.stop()
         (listOf(inputs, internal, commands) + contractExecutors).forEach { it.stop() }

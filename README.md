@@ -25,6 +25,7 @@ in**, so those events reliably drive follow-up work in your own service and in o
   - [Process managers](#process-managers)
 - [Running in production](#running-in-production)
 - [Known limitations](#known-limitations)
+- [Upgrading from 0.2.0](#upgrading-from-020)
 - [Upgrading from 0.1.0](#upgrading-from-010)
 - [Status and contributing](#status-and-contributing)
 
@@ -58,9 +59,9 @@ plugins {
 }
 
 dependencies {
-    implementation("io.github.dreweaster:kotmod:0.2.0")
-    implementation("io.github.dreweaster:kotmod-db-scheduler:0.2.0") // optional: the ready-made reaction queue
-    // implementation("io.github.dreweaster:kotmod-sqldelight:0.2.0") // only if your app uses SQLDelight
+    implementation("io.github.dreweaster:kotmod:0.3.0")
+    implementation("io.github.dreweaster:kotmod-db-scheduler:0.3.0") // optional: the ready-made reaction queue
+    // implementation("io.github.dreweaster:kotmod-sqldelight:0.3.0") // only if your app uses SQLDelight
 
     // Used directly by the code in this README:
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
@@ -1775,6 +1776,125 @@ failure in a specific spot to show up.
   pays a full check whose cost grows with the aggregate's history. This only applies to aggregates written by
   an outer transaction that changed several aggregates in a racing order, and only matters for very long
   histories.
+
+## Upgrading from 0.2.0
+
+0.3.0 replaces event reactions built from an executor, an outbox and contract subscriptions with
+[use cases](#use-cases) run by an `EventReactor`. Code blocks below marked as before/after are sketches, not
+compiled; the [quickstart](#4-react-to-events) and the guides show compiled code. To upgrade:
+
+1. **Drain in-flight work first.** Queue names change: each use case's queue is named after the use case, and
+   process manager channels become `<process type>-<channel>`. Work queued under 0.2.0's task names would never
+   run. Before deploying 0.3.0, stop writing commands and let pending reactions and process manager work finish
+   (or cancel what you no longer need).
+2. **`AggregateKind` gains the event type and its serialization.** It is now
+   `AggregateKind<C, E, R>` (command, event, rejection), with an `eventSerialization` parameter between the
+   command and rejection serializers; use the same serialization you gave your `AggregateManager`.
+
+   <!-- not-compiled -->
+   ```kotlin
+   // 0.2.0
+   object Orders : AggregateKind<OrderCommand, OrderRejection>(
+       AggregateType("Order"), OrderCommand.serializer(), OrderRejection.serializer(),
+   )
+
+   // 0.3.0
+   object Orders : AggregateKind<OrderCommand, OrderEvent, OrderRejection>(
+       type = AggregateType("Order"),
+       commandSerializer = OrderCommand.serializer(),
+       eventSerialization = orderEventSerialization,
+       rejectionSerializer = OrderRejection.serializer(),
+   )
+   ```
+
+3. **An executor, an outbox and `eventToReactions` become a use case and the reactor.** Move `eventToReactions`
+   into the use case's `on(kind)` block (no more filtering by aggregate type, deserializing, or building reaction
+   ids: call `trigger(t)`), `execute` into `handle`, the retry handlers into `onFailure` (returning `Retry(delay)`
+   or `GiveUp`; a timeout arrives as a `ReactionTimeoutException`) and `onCompletion` into `onCompletion`.
+   Register every use case on one `EventReactor` per context. Its `name` (default `reactor`) names its saved
+   position, and `isLeader` replaces the outbox's `isLeader`.
+
+   <!-- not-compiled -->
+   ```kotlin
+   // 0.2.0
+   val executor = EventReactionExecutor(sink, source, createExecutionContext, execute, failureRetryHandler, timeoutRetryHandler, onCompletion)
+   val outbox = AggregateEventOutbox(backend, executor, eventToReactions, getPosition, savePosition, isLeader)
+
+   // 0.3.0
+   class OrderNotifications : Reactions<OrderNotification>("order-notifications", OrderNotification.serializer()) {
+       init {
+           on(Orders) { event, metadata ->
+               if (event is OrderPlaced) trigger(SendOrderConfirmation(metadata.aggregateId.value))
+           }
+       }
+
+       override suspend fun handle(trigger: OrderNotification, context: ReactionContext) { /* … */ }
+   }
+
+   val reactor = EventReactor(jdbc, queues, isLeader = { election.isLeader() })
+   reactor.register(OrderNotifications())
+   reactor.start()
+   ```
+
+4. **Triggers are plain data.** Drop `: EventReactionTrigger`, the `timeout` field (override the use case's
+   `timeout`, 60 seconds by default) and your `EventReactionTriggerSerializer` object (pass
+   `triggers = X.serializer()`). A trigger's `notBefore` moves to `trigger(t, notBefore = …)`. Ordering moves from
+   the outbox's `ordering` to the use case's `ordering` property (see [Ordered use cases](#ordered-use-cases)).
+5. **Contract subscriptions become `on(contract)`.** Replace `contract.subscribe(executor) { envelope -> … }` with
+   a use case whose `init` block calls `on(contract) { event, metadata -> … }`. The event is typed, and `metadata`
+   replaces the envelope's. The contract must read the same database as the reactor and must be started, and
+   the use case must be registered before the contract starts. See
+   [Consuming another context's events](#consuming-another-contexts-events).
+
+   <!-- not-compiled -->
+   ```kotlin
+   // 0.2.0
+   contract.subscribe(executor) { envelope -> listOf(UpdateStatus(envelope.event.orderId)) }
+
+   // 0.3.0
+   class StatusUpdates : Reactions<UpdateStatus>("status-updates", UpdateStatus.serializer()) {
+       init {
+           on(contract) { event, metadata -> trigger(UpdateStatus(event.orderId)) }
+       }
+       override suspend fun handle(trigger: UpdateStatus, context: ReactionContext) { /* … */ }
+   }
+   reactor.register(StatusUpdates())   // before contract.start()
+   ```
+
+6. **db-scheduler.** Replace every `DbSchedulerEventReactions` and `DbSchedulerProcessManagerQueues` with one
+   `DbSchedulerQueues(jdbc)`. Read `queues.tasks` only after registering every use case and building every process
+   manager, pass it to your `Scheduler`, and call `queues.bind(scheduler)` before starting the reactor or process
+   managers. The operator helpers are keyed by queue name:
+   `queues.blockedReactions(scheduler, "order-status-projection")`, `queues.retryBlocked(scheduler, name, id)` and
+   `queues.skipBlocked(scheduler, name, id)`.
+
+   <!-- not-compiled -->
+   ```kotlin
+   // 0.3.0
+   val queues = DbSchedulerQueues(jdbc)
+   val reactor = EventReactor(jdbc, queues, isLeader = { election.isLeader() })
+   reactor.register(OrderNotifications())
+   val scheduler = Scheduler.create(dataSource, *queues.tasks.toTypedArray()).enableImmediateExecution().build()
+   queues.bind(scheduler)
+   reactor.start()
+   scheduler.start()
+   ```
+
+7. **Process managers** take a `ReactionQueues` (`DbSchedulerQueues`). `ProcessManagerQueues` and `ProcessChannel`
+   are now `ReactionQueues` and `ReactionChannel`, in `io.kotmod.event.reaction`.
+8. **Your own queue.** Implement `ReactionQueues` (one `channel(name, triggerSerializer, ordered)` per queue)
+   instead of handing a sink and source to an executor. The sink and source interfaces are unchanged.
+9. **Positions.** The reactor saves its position under its `name` (`reactor` by default); your 0.2.0 outbox
+   consumer names are no longer read. A new reactor starts at the head of the event log when it first starts, so
+   events written before the upgrade that were not yet reacted to are not replayed (another reason to drain
+   first). You can delete the old rows from `ddd_consumer_offset`.
+10. **Deduplication only while queued.** A reaction's id is deduplicated only while it is still in the queue; once
+    it has completed it is gone, so a redelivery after that can run it again. Use `context.reactionId` as the
+    idempotency key of external calls.
+11. **Removed from the public API:** `EventReactionExecutor`, `AggregateEventOutbox`, `EventReaction`,
+    `PublicEventContract.subscribe`, `DbSchedulerEventReactions`, `DbSchedulerProcessManagerQueues`,
+    `EventReactionExecutionResult`, `EventReactionCompletionResult`, `RetrySignal` and `BackoffStrategy`. Use a use
+    case's `onFailure`, `onCompletion` and `backoff(attempt)` instead.
 
 ## Upgrading from 0.1.0
 
