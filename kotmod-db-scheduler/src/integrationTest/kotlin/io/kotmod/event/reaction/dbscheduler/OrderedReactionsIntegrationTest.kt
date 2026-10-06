@@ -1,36 +1,16 @@
 package io.kotmod.event.reaction.dbscheduler
 
-import io.kotmod.AggregateId
-import io.kotmod.AggregateType
-import io.kotmod.CommandId
-import io.kotmod.EventId
-import io.kotmod.EventLogPosition
-import io.kotmod.EventMetadata
-import io.kotmod.PendingEvent
-import io.kotmod.PublicDomainEvent
-import io.kotmod.contract.PublicEventContract
+import com.github.kagkarlsson.scheduler.Scheduler
 import io.kotmod.event.reaction.DispatchOrdering
-import io.kotmod.event.reaction.EventReaction
-import io.kotmod.event.reaction.EventReactionCompletionResult
-import io.kotmod.event.reaction.EventReactionExecutionResult
-import io.kotmod.event.reaction.EventReactionExecutor
 import io.kotmod.event.reaction.EventReactionId
 import io.kotmod.event.reaction.OnGiveUp
-import io.kotmod.event.reaction.ReactionOrdering
-import io.kotmod.event.reaction.RetrySignal
-import io.kotmod.postgres.PostgresDomainPersistenceBackend
-import io.kotmod.postgres.PostgresDomainPollingBackend
+import io.kotmod.event.reaction.ReactionOutcome
 import io.kotmod.postgres.support.IntegrationTest
 import io.kotmod.postgres.support.eventually
-import io.kotmod.postgres.support.orderEventSerialization
-import io.kotmod.support.OrderEvent
-import io.kotmod.support.OrderPlaced
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -38,8 +18,7 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 class OrderedReactionsIntegrationTest : IntegrationTest() {
-    private fun reactions(name: String = "ordered") =
-        DbSchedulerEventReactions(name, TestTriggerSerializer, jdbc = jdbc, orderedRecheckDelay = 200.milliseconds)
+    private val queues = DbSchedulerQueues(jdbc, orderedRecheckDelay = 200.milliseconds)
 
     private fun ordering(
         key: String,
@@ -51,34 +30,31 @@ class OrderedReactionsIntegrationTest : IntegrationTest() {
         val events = CopyOnWriteArrayList<String>() // "start:<name>" / "end:<name>"
     }
 
-    private fun executor(
-        reactions: DbSchedulerEventReactions<TestTrigger>,
-        scheduler: com.github.kagkarlsson.scheduler.Scheduler,
+    /** A consumer of ordered queue [name]: [succeeds] decides each attempt; a failure retries, or gives up with [giveUp]. */
+    private fun consumer(
         log: Log,
-        execute: suspend (TestTrigger, Int) -> EventReactionExecutionResult = { _, _ ->
-            delay(50)
-            EventReactionExecutionResult.EventReactionExecutionCompleted
-        },
+        name: String = "ordered",
         giveUp: Boolean = false,
-    ) = EventReactionExecutor<TestTrigger, Unit>(
-        sink = reactions.sink(scheduler),
-        source = reactions.source,
-        createExecutionContext = { _, _ -> },
-        execute = { _, _, trigger, retryCount, _ ->
-            log.events += "start:${trigger.name}"
+        succeeds: suspend (TestTrigger, Int) -> Boolean = { _, _ ->
+            delay(50)
+            true
+        },
+    ) = TestConsumer(queues.channel(name, TestTriggerSerializer, ordered = true)) { attempt ->
+        log.events += "start:${attempt.trigger.name}"
+        val ok =
             try {
-                execute(trigger, retryCount)
+                succeeds(attempt.trigger, attempt.retryCount)
             } finally {
-                log.events += "end:${trigger.name}"
+                log.events += "end:${attempt.trigger.name}"
             }
-        },
-        failureRetryHandler = { _, _, _, _, _, _ ->
-            if (giveUp) RetrySignal.DoNotRetry(EventReactionCompletionResult.EventReactionFailed("gave up", allowManualRetry = true))
-            else RetrySignal.Retry(100.milliseconds)
-        },
-        timeoutRetryHandler = { _, _, _, _, _ -> RetrySignal.Retry(100.milliseconds) },
-        onCompletion = { _, _, _, _, _, _ -> },
-    )
+        when {
+            ok -> ReactionOutcome.Finished(gaveUp = false)
+            giveUp -> ReactionOutcome.Finished(gaveUp = true)
+            else -> ReactionOutcome.Retry(100.milliseconds)
+        }
+    }
+
+    private fun scheduler(): Scheduler = testScheduler(dataSource, *queues.tasks.toTypedArray()).also { queues.bind(it) }
 
     private fun neverOverlap(log: Log): Boolean {
         var running = 0
@@ -92,13 +68,12 @@ class OrderedReactionsIntegrationTest : IntegrationTest() {
     @Test
     fun `reactions for one aggregate run one at a time in sequence order`() =
         runBlocking {
-            val reactions = reactions()
-            val scheduler = testScheduler(dataSource, *reactions.tasks.toTypedArray())
             val log = Log()
-            val executor = executor(reactions, scheduler, log)
-            (1..8L).forEach { executor.dispatch(EventReactionId("r-$it"), TestTrigger("A$it"), ordering("Order/a", it)) }
+            val consumer = consumer(log)
+            val scheduler = scheduler()
+            (1..8L).forEach { consumer.dispatch(EventReactionId("r-$it"), TestTrigger("A$it"), ordering("Order/a", it)) }
 
-            running(scheduler, executor) { eventually(20.seconds) { log.events.count { it.startsWith("end:") } == 8 } }
+            running(scheduler, consumer) { eventually(20.seconds) { log.events.count { it.startsWith("end:") } == 8 } }
 
             assertTrue(neverOverlap(log), log.events.toString())
             assertEquals((1..8).map { "A$it" }, log.events.filter { it.startsWith("start:") }.map { it.removePrefix("start:") })
@@ -107,17 +82,17 @@ class OrderedReactionsIntegrationTest : IntegrationTest() {
     @Test
     fun `different aggregates run in parallel`() =
         runBlocking {
-            val reactions = reactions()
-            val scheduler = testScheduler(dataSource, *reactions.tasks.toTypedArray())
             val log = Log()
-            val executor = executor(reactions, scheduler, log, execute = { _, _ ->
-                delay(500)
-                EventReactionExecutionResult.EventReactionExecutionCompleted
-            })
-            executor.dispatch(EventReactionId("r-a"), TestTrigger("A1"), ordering("Order/a", 1))
-            executor.dispatch(EventReactionId("r-b"), TestTrigger("B1"), ordering("Order/b", 1))
+            val consumer =
+                consumer(log) { _, _ ->
+                    delay(500)
+                    true
+                }
+            val scheduler = scheduler()
+            consumer.dispatch(EventReactionId("r-a"), TestTrigger("A1"), ordering("Order/a", 1))
+            consumer.dispatch(EventReactionId("r-b"), TestTrigger("B1"), ordering("Order/b", 1))
 
-            running(scheduler, executor) { eventually(10.seconds) { log.events.count { it.startsWith("end:") } == 2 } }
+            running(scheduler, consumer) { eventually(10.seconds) { log.events.count { it.startsWith("end:") } == 2 } }
 
             assertEquals(listOf("start", "start", "end", "end"), log.events.map { it.substringBefore(':') })
         }
@@ -125,59 +100,46 @@ class OrderedReactionsIntegrationTest : IntegrationTest() {
     @Test
     fun `a retrying head holds back later reactions`() =
         runBlocking {
-            val reactions = reactions()
-            val scheduler = testScheduler(dataSource, *reactions.tasks.toTypedArray())
             val log = Log()
-            val executor = executor(reactions, scheduler, log, execute = { trigger, retryCount ->
-                if (trigger.name == "A1" && retryCount < 2) EventReactionExecutionResult.EventReactionFailed(RuntimeException("flaky"))
-                else EventReactionExecutionResult.EventReactionExecutionCompleted
-            })
-            executor.dispatch(EventReactionId("r-1"), TestTrigger("A1"), ordering("Order/a", 1))
-            executor.dispatch(EventReactionId("r-2"), TestTrigger("A2"), ordering("Order/a", 2))
+            val consumer = consumer(log) { trigger, retryCount -> !(trigger.name == "A1" && retryCount < 2) }
+            val scheduler = scheduler()
+            consumer.dispatch(EventReactionId("r-1"), TestTrigger("A1"), ordering("Order/a", 1))
+            consumer.dispatch(EventReactionId("r-2"), TestTrigger("A2"), ordering("Order/a", 2))
 
-            running(scheduler, executor) { eventually(15.seconds) { log.events.contains("end:A2") } }
+            running(scheduler, consumer) { eventually(15.seconds) { log.events.contains("end:A2") } }
 
-            val starts = log.events.filter { it.startsWith("start:") }
-            assertEquals(listOf("start:A1", "start:A1", "start:A1", "start:A2"), starts)
+            assertEquals(listOf("start:A1", "start:A1", "start:A1", "start:A2"), log.events.filter { it.startsWith("start:") })
         }
 
     @Test
     fun `ContinueWithNext moves on after a give-up`() =
         runBlocking {
-            val reactions = reactions()
-            val scheduler = testScheduler(dataSource, *reactions.tasks.toTypedArray())
             val log = Log()
-            val executor = executor(reactions, scheduler, log, giveUp = true, execute = { trigger, _ ->
-                if (trigger.name == "A1") EventReactionExecutionResult.EventReactionFailed(RuntimeException("poison"))
-                else EventReactionExecutionResult.EventReactionExecutionCompleted
-            })
-            executor.dispatch(EventReactionId("r-1"), TestTrigger("A1"), ordering("Order/a", 1, OnGiveUp.ContinueWithNext))
-            executor.dispatch(EventReactionId("r-2"), TestTrigger("A2"), ordering("Order/a", 2, OnGiveUp.ContinueWithNext))
+            val consumer = consumer(log, giveUp = true) { trigger, _ -> trigger.name != "A1" }
+            val scheduler = scheduler()
+            consumer.dispatch(EventReactionId("r-1"), TestTrigger("A1"), ordering("Order/a", 1, OnGiveUp.ContinueWithNext))
+            consumer.dispatch(EventReactionId("r-2"), TestTrigger("A2"), ordering("Order/a", 2, OnGiveUp.ContinueWithNext))
 
-            running(scheduler, executor) { eventually(10.seconds) { log.events.contains("end:A2") } }
+            running(scheduler, consumer) { eventually(10.seconds) { log.events.contains("end:A2") } }
         }
 
     @Test
-    fun `BlockAggregate parks the aggregate until retried or skipped, and is never nudged`() =
+    fun `BlockAggregate parks the aggregate until retried, and is never nudged`() =
         runBlocking {
-            val reactions = reactions()
-            val scheduler = testScheduler(dataSource, *reactions.tasks.toTypedArray())
             val log = Log()
             val failures = AtomicInteger()
-            val executor = executor(reactions, scheduler, log, giveUp = true, execute = { trigger, _ ->
-                if (trigger.name == "A1" && failures.getAndIncrement() == 0) EventReactionExecutionResult.EventReactionFailed(RuntimeException("poison"))
-                else EventReactionExecutionResult.EventReactionExecutionCompleted
-            })
-            executor.dispatch(EventReactionId("r-1"), TestTrigger("A1"), ordering("Order/a", 1, OnGiveUp.BlockAggregate))
-            executor.dispatch(EventReactionId("r-2"), TestTrigger("A2"), ordering("Order/a", 2, OnGiveUp.BlockAggregate))
+            val consumer = consumer(log, giveUp = true) { trigger, _ -> !(trigger.name == "A1" && failures.getAndIncrement() == 0) }
+            val scheduler = scheduler()
+            consumer.dispatch(EventReactionId("r-1"), TestTrigger("A1"), ordering("Order/a", 1, OnGiveUp.BlockAggregate))
+            consumer.dispatch(EventReactionId("r-2"), TestTrigger("A2"), ordering("Order/a", 2, OnGiveUp.BlockAggregate))
 
-            running(scheduler, executor) {
-                eventually { reactions.blockedReactions(scheduler).isNotEmpty() }
+            running(scheduler, consumer) {
+                eventually { queues.blockedReactions(scheduler, "ordered").isNotEmpty() }
                 delay(1000)
                 assertTrue("start:A2" !in log.events, "A2 must wait behind the blocked A1")
-                assertEquals(listOf(EventReactionId("r-1")), reactions.blockedReactions(scheduler).map { it.reactionId })
+                assertEquals(listOf(EventReactionId("r-1")), queues.blockedReactions(scheduler, "ordered").map { it.reactionId })
 
-                reactions.retryBlocked(scheduler, EventReactionId("r-1"))
+                queues.retryBlocked(scheduler, "ordered", EventReactionId("r-1"))
                 eventually(10.seconds) { log.events.contains("end:A2") }
             }
             assertEquals(listOf("start:A1", "start:A1", "start:A2"), log.events.filter { it.startsWith("start:") })
@@ -186,35 +148,30 @@ class OrderedReactionsIntegrationTest : IntegrationTest() {
     @Test
     fun `skipBlocked releases the aggregate without running the blocked reaction again`() =
         runBlocking {
-            val reactions = reactions()
-            val scheduler = testScheduler(dataSource, *reactions.tasks.toTypedArray())
             val log = Log()
-            val executor = executor(reactions, scheduler, log, giveUp = true, execute = { trigger, _ ->
-                if (trigger.name == "A1") EventReactionExecutionResult.EventReactionFailed(RuntimeException("poison"))
-                else EventReactionExecutionResult.EventReactionExecutionCompleted
-            })
-            executor.dispatch(EventReactionId("r-1"), TestTrigger("A1"), ordering("Order/a", 1, OnGiveUp.BlockAggregate))
-            executor.dispatch(EventReactionId("r-2"), TestTrigger("A2"), ordering("Order/a", 2, OnGiveUp.BlockAggregate))
+            val consumer = consumer(log, giveUp = true) { trigger, _ -> trigger.name != "A1" }
+            val scheduler = scheduler()
+            consumer.dispatch(EventReactionId("r-1"), TestTrigger("A1"), ordering("Order/a", 1, OnGiveUp.BlockAggregate))
+            consumer.dispatch(EventReactionId("r-2"), TestTrigger("A2"), ordering("Order/a", 2, OnGiveUp.BlockAggregate))
 
-            running(scheduler, executor) {
-                eventually { reactions.blockedReactions(scheduler).isNotEmpty() }
-                reactions.skipBlocked(scheduler, EventReactionId("r-1"))
+            running(scheduler, consumer) {
+                eventually { queues.blockedReactions(scheduler, "ordered").isNotEmpty() }
+                queues.skipBlocked(scheduler, "ordered", EventReactionId("r-1"))
                 eventually(10.seconds) { log.events.contains("end:A2") }
             }
             assertEquals(1, log.events.count { it == "start:A1" })
         }
 
     @Test
-    fun `duplicate ordered dispatch is absorbed`() =
+    fun `a duplicate ordered publish is absorbed`() =
         runBlocking {
-            val reactions = reactions()
-            val scheduler = testScheduler(dataSource, *reactions.tasks.toTypedArray())
             val log = Log()
-            val executor = executor(reactions, scheduler, log)
-            executor.dispatch(EventReactionId("r-1"), TestTrigger("A1"), ordering("Order/a", 1))
-            executor.dispatch(EventReactionId("r-1"), TestTrigger("A1"), ordering("Order/a", 1))
+            val consumer = consumer(log)
+            val scheduler = scheduler()
+            consumer.dispatch(EventReactionId("r-1"), TestTrigger("A1"), ordering("Order/a", 1))
+            consumer.dispatch(EventReactionId("r-1"), TestTrigger("A1"), ordering("Order/a", 1))
 
-            running(scheduler, executor) {
+            running(scheduler, consumer) {
                 eventually { log.events.contains("end:A1") }
                 delay(500)
             }
@@ -224,118 +181,38 @@ class OrderedReactionsIntegrationTest : IntegrationTest() {
     @Test
     fun `aggregate ids with separators never share ordering`() =
         runBlocking {
-            val reactions = reactions()
-            val scheduler = testScheduler(dataSource, *reactions.tasks.toTypedArray())
             val log = Log()
-            val executor = executor(reactions, scheduler, log, execute = { _, _ ->
-                delay(400)
-                EventReactionExecutionResult.EventReactionExecutionCompleted
-            })
-            executor.dispatch(EventReactionId("r-a"), TestTrigger("X"), ordering("Order/a", 2))
-            executor.dispatch(EventReactionId("r-b"), TestTrigger("Y"), ordering("Order/a#0000000000000000001", 1))
+            val consumer =
+                consumer(log) { _, _ ->
+                    delay(400)
+                    true
+                }
+            val scheduler = scheduler()
+            consumer.dispatch(EventReactionId("r-a"), TestTrigger("X"), ordering("Order/a", 2))
+            consumer.dispatch(EventReactionId("r-b"), TestTrigger("Y"), ordering("Order/a#0000000000000000001", 1))
 
-            running(scheduler, executor) { eventually(10.seconds) { log.events.count { it.startsWith("end:") } == 2 } }
+            running(scheduler, consumer) { eventually(10.seconds) { log.events.count { it.startsWith("end:") } == 2 } }
 
             // Different aggregates: both start before either ends.
             assertEquals(listOf("start", "start", "end", "end"), log.events.map { it.substringBefore(':') })
         }
 
     @Test
-    fun `two executors handling the same aggregate do not wait on each other`() =
+    fun `two queues handling the same aggregate do not wait on each other`() =
         runBlocking {
-            val first = reactions("first")
-            val second = reactions("second")
-            val scheduler = testScheduler(dataSource, *(first.tasks + second.tasks).toTypedArray())
             val log = Log()
-            val slow: suspend (TestTrigger, Int) -> EventReactionExecutionResult = { _, _ ->
+            val slow: suspend (TestTrigger, Int) -> Boolean = { _, _ ->
                 delay(500)
-                EventReactionExecutionResult.EventReactionExecutionCompleted
+                true
             }
-            val e1 = executor(first, scheduler, log, execute = slow)
-            val e2 = executor(second, scheduler, log, execute = slow)
-            e1.dispatch(EventReactionId("r-1"), TestTrigger("first"), ordering("Order/a", 1))
-            e2.dispatch(EventReactionId("r-1"), TestTrigger("second"), ordering("Order/a", 1))
+            val first = consumer(log, name = "first", succeeds = slow)
+            val second = consumer(log, name = "second", succeeds = slow)
+            val scheduler = scheduler()
+            first.dispatch(EventReactionId("r-1"), TestTrigger("first"), ordering("Order/a", 1))
+            second.dispatch(EventReactionId("r-1"), TestTrigger("second"), ordering("Order/a", 1))
 
-            running(scheduler, e1, e2) { eventually(10.seconds) { log.events.count { it.startsWith("end:") } == 2 } }
+            running(scheduler, first, second) { eventually(10.seconds) { log.events.count { it.startsWith("end:") } == 2 } }
 
             assertEquals(listOf("start", "start", "end", "end"), log.events.map { it.substringBefore(':') })
         }
-
-    private data class PublicOrderPlaced(
-        val orderId: String,
-    ) : PublicDomainEvent
-
-    @Test
-    fun `ordered subscriptions of one contract sharing an executor run one at a time even when the later id sorts first`() =
-        runBlocking {
-            val persistence = PostgresDomainPersistenceBackend(jdbc, orderEventSerialization())
-            jdbc.inTransaction {
-                persistence.saveMeta(AggregateType("Order"), AggregateId("o-1"), expectedVersion = null, eventCount = 1)
-                persistence.appendEvents(
-                    listOf(
-                        PendingEvent(
-                            metadata =
-                                EventMetadata(
-                                    eventId = EventId("e-1"),
-                                    aggregateType = AggregateType("Order"),
-                                    aggregateId = AggregateId("o-1"),
-                                    causationId = CommandId("cmd-1"),
-                                    correlationId = null,
-                                    timestamp = kotlin.time.Instant.parse("2026-10-04T10:00:00Z"),
-                                    sequence = 1,
-                                ),
-                            event = OrderPlaced("widgets"),
-                        ),
-                    ),
-                )
-            }
-            val reactions = reactions()
-            val scheduler = testScheduler(dataSource, *reactions.tasks.toTypedArray())
-            val log = Log()
-            val executor = executor(reactions, scheduler, log, execute = { _, _ ->
-                delay(500)
-                EventReactionExecutionResult.EventReactionExecutionCompleted
-            })
-            val position = AtomicReference(EventLogPosition.START)
-            val contract =
-                PublicEventContract<OrderEvent, PublicOrderPlaced>(
-                    backend = PostgresDomainPollingBackend(jdbc),
-                    serialization = orderEventSerialization(),
-                    internalToPublic = { PublicOrderPlaced("o-1") },
-                    getPosition = { position.get() },
-                    savePosition = { position.set(it) },
-                    isLeader = { true },
-                    pollInterval = 50.milliseconds,
-                )
-            // The second subscription's reaction id sorts before the first's, and is only dispatched once the
-            // first is already running.
-            contract.subscribe(executor, ordering = ReactionOrdering.PerAggregate()) {
-                listOf(EventReaction(EventReactionId("zz-${it.metadata.eventId.value}"), TestTrigger("first")))
-            }
-            contract.subscribe(executor, ordering = ReactionOrdering.PerAggregate()) {
-                check(eventuallyBlocking { "start:first" in log.events }) { "first reaction never started" }
-                listOf(EventReaction(EventReactionId("aa-${it.metadata.eventId.value}"), TestTrigger("second")))
-            }
-
-            running(scheduler, executor) {
-                contract.start()
-                try {
-                    eventually(10.seconds) { log.events.count { it.startsWith("end:") } == 2 }
-                } finally {
-                    contract.stop()
-                }
-            }
-
-            assertTrue(neverOverlap(log), log.events.toString())
-            assertEquals(listOf("start:first", "end:first", "start:second", "end:second"), log.events.toList())
-        }
-
-    private fun eventuallyBlocking(condition: () -> Boolean): Boolean {
-        val deadline = System.nanoTime() + 5_000_000_000L
-        while (System.nanoTime() < deadline) {
-            if (condition()) return true
-            Thread.sleep(10)
-        }
-        return false
-    }
 }
