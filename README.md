@@ -419,7 +419,8 @@ val scheduler =
 queues.bind(scheduler)
 ```
 
-Register every use case before reading `queues.tasks`. Then start the reactor, then the scheduler:
+Register every use case before reading `queues.tasks`, and call `queues.bind(scheduler)` before starting the
+reactor: queueing work needs it. Then start the reactor, then the scheduler:
 
 ```kotlin
 reactor.start()
@@ -428,8 +429,9 @@ scheduler.start()
 
 A new reactor starts at the head of the event log: it sees events written after it first starts, not history.
 Start it when your application starts, before it handles commands. To shut down, stop the scheduler, then the
-reactor: `scheduler.stop()`, then `reactor.stop()`. The quickstart passes `isLeader = { true }` because it runs
-on one node; see [Running in production](#running-in-production) for leader election across several.
+reactor: `scheduler.stop()`, then `reactor.stop()` (the reactor also handles its use cases' queues, so it stops
+after the scheduler that delivers their work). The quickstart passes `isLeader = { true }` because it runs on one
+node; see [Running in production](#running-in-production) for leader election and the full shutdown order.
 
 ### 5. Run commands
 
@@ -717,15 +719,17 @@ runs in a transaction opened by its backend's `JdbcContext`; `jdbc.inTransaction
 
 **Reading events.** `PostgresDomainPollingBackend` reads the event log for the reactor, public contracts and
 process managers. `PostgresOffsetManager` stores how far each has read. The reactor saves its position under its
-`name` (`reactor` by default); give every other poller its own consumer name.
+`name` (`reactor` by default); give every other poller its own consumer name. Two reactors on the same database
+must have different names: with the same name they would share one saved position and skip each other's events.
 
-**Starting positions.** A consumer with no saved position starts from the head of the event log as of its first
-read of its position (its first poll as leader), not when it is constructed, so deploying a new reactor,
-contract or process manager does not replay history. It may also see a few events committed just before, while
-an older transaction was still open, but never history from before that. Pass `startFrom = StartFrom.Beginning`
-to `getPosition` for a contract or process manager that must see history. An existing consumer keeps its saved
-position; to reset one deliberately, save a position yourself with `savePosition`. The reactor reads its position
-when it starts, so a new one sees every event committed after `start()` returns.
+**Starting positions.** A consumer with no saved position starts from the head of the event log, so deploying a
+new reactor, contract or process manager does not replay history. The reactor fixes its starting position when
+it starts, so a new one sees every event committed after `start()` returns. A contract or process manager fixes
+it on its first read of its position (its first poll as leader), not when it is constructed. Either may also see
+a few events committed just before, while an older transaction was still open, but never history from before
+that. Pass `startFrom = StartFrom.Beginning` to `getPosition` for a contract or process manager that must see
+history. An existing consumer keeps its saved position; to reset one deliberately, save a position yourself with
+`savePosition`.
 
 #### Using SQLDelight
 
@@ -766,7 +770,9 @@ It owns the whole reaction, like `OrderNotifications` in [the quickstart](#4-rea
 - **Completion.** `onCompletion(trigger, result)` hears `ReactionResult.Completed` or
   `ReactionResult.GaveUp(error)`; it does nothing by default. If it throws, the work is retried after a backoff,
   so `handle` may run again.
-- **Name.** `name` names the use case's queue, so keep it stable across releases, and unique in the context.
+- **Name.** `name` names the use case's queue, so keep it stable across releases. With db-scheduler it is the
+  task name, so it must be unique across everything that shares the `scheduled_tasks` table, including other
+  contexts' use cases and process manager channels.
 
 Each use case has its own queue, so its ordering, timeout and failure policy are its own, and a slow or failing
 use case never holds up another. Delivery is at least once: make `handle` idempotent.
@@ -814,11 +820,13 @@ event in that use case's own queue, as an item with id `<useCase>/<eventId>/mapp
 on. Other use cases still get their triggers for the event.
 
 A parked event is retried with capped backoff (1s, 2s, 4s… up to 10 minutes), forever, logging each failure; it
-is never dropped. Each retry reads the event again and runs the use case's current code, so deploying a fix is
-enough. The event's triggers are then queued with the ids they would have had, and run. With ordering, the
-aggregate's later work in that use case waits behind the parked event, so it still runs in order; other
-aggregates and other use cases are unaffected. If the fixed code no longer listens to the event's aggregate
-type, the parked event is dropped with a warning.
+is never dropped while the use case still listens to its aggregate type. Each retry reads the event again and
+runs the use case's current code, so deploying a fix is enough. The event's triggers are then queued with the
+ids they would have had, and run. With ordering, the aggregate's later work in that use case waits behind the
+parked event; other aggregates and other use cases are unaffected. On db-scheduler the event's triggers then still run in order, before that later work, because
+ordered work runs in sequence order whenever it was queued. A queue that orders by publish time, such as Pub/Sub,
+runs them after the later work instead (see [Using another queue](#using-another-queue-eg-google-pubsub)). If
+the fixed code no longer listens to the event's aggregate type, the parked event is dropped with a warning.
 
 ### Running use cases on db-scheduler
 
@@ -1028,8 +1036,10 @@ db-scheduler is a convenient default, not a requirement. The reactor and process
 kotmod asks for one queue per use case (named after it) and one per process manager channel
 (`<process type>-<channel>`). It stores its own items in them — your triggers, wrapped with what kotmod needs to
 run them, and [parked mappings](#when-a-mapping-fails) — so your queue only moves them between publish and
-delivery. Everything else — timeouts, `onFailure`, `onCompletion`, parked mappings — works the same whichever
-queue you use. Leave out the `kotmod-db-scheduler` dependency if you don't use it.
+delivery. Timeouts, `onFailure`, `onCompletion` and parked mappings work the same whichever queue you use, with
+one difference for ordered use cases: on a queue that orders by publish time, a parked mapping's triggers run
+after its aggregate's later work (see the Pub/Sub notes below). Leave out the `kotmod-db-scheduler` dependency if
+you don't use it.
 
 Here is a sketch for Google Pub/Sub, using the official Java client (`com.google.cloud:google-cloud-pubsub`).
 It is not part of kotmod and is not compiled or tested here; a ready-made Pub/Sub module is planned.
@@ -1126,8 +1136,9 @@ Pass a `PubSubQueues` to `EventReactor` (and to your process managers) where the
 
 How Pub/Sub differs from db-scheduler:
 
-- **One subscription per use case.** Each use case's queue maps to one subscription: a topic per use case, or, as
-  in the sketch, one topic with a `queue` attribute and a filtered subscription per use case.
+- **One subscription per queue.** Each use case's queue, and each process manager channel, maps to one
+  subscription: a topic per queue, or, as in the sketch, one topic with a `queue` attribute and a filtered
+  subscription per queue.
 - **Retry delays are approximate.** Pub/Sub can't redeliver a message after a chosen delay; a `nack()` is
   redelivered according to the subscription's retry policy. Set its minimum and maximum backoff to suit your
   use cases, or treat `onFailure`'s delays only as a guide.
@@ -1139,9 +1150,14 @@ How Pub/Sub differs from db-scheduler:
   failed deliveries.
 - **Ordering uses ordering keys.** `DispatchOrdering.key` is `<aggregateType>/<aggregateId>`, so publishing with
   `setOrderingKey(ordering.key)` makes Pub/Sub deliver each aggregate's work in order, one at a time, and a
-  `nack()` holds back that aggregate's later messages until it is redelivered. That is exactly what a parked
-  mapping needs: it is a message with its event's ordering key, so it blocks that aggregate only. If a publish
-  fails, the client pauses that ordering key until you call `publisher.resumePublish(key)`.
+  `nack()` holds back that aggregate's later messages until it is redelivered. If a publish fails, the client
+  pauses that ordering key until you call `publisher.resumePublish(key)`.
+- **A parked mapping breaks order for its aggregate.** A parked mapping is a message with its event's ordering
+  key, so while it fails it holds back that aggregate's later work, and only that aggregate's. But Pub/Sub
+  orders by publish time: when it finally succeeds, the event's triggers are published behind the later work
+  that was already queued, so they run after it. In an ordered use case on Pub/Sub, treat a parked mapping as
+  breaking order for that aggregate, and keep `on(...)` blocks from throwing. db-scheduler doesn't have this
+  problem: it runs ordered work in sequence order.
 - **Parked mappings read your database.** A parked mapping reads its event again from the event log, so the
   subscriber must run in your application, with access to its database.
 - **`OnGiveUp.BlockAggregate` has no direct equivalent.** In this sketch, work that gives up is acknowledged and
@@ -1275,6 +1291,9 @@ fun startBilling(
 }
 ```
 
+- `startBilling` builds the billing context's own reactor, named `billing-reactor`. Every reactor on the same
+  database needs its own name, because the name is where it saves its position; two reactors sharing `reactor`
+  would share one position and skip events.
 - Registering the use case subscribes it to the contract's own reader, which queues its triggers in the use
   case's queue. Register it before the publishing context starts the contract.
 - Reaction ids and ordering work as for local sources: ids are `<useCase>/<eventId>/<n>` with the original
@@ -1620,9 +1639,17 @@ the same order. A queue forgets an id once its work has run, so moving the react
 work again.
 
 **Start and stop in order.** Register every use case and build every process manager, then read
-`queues.tasks` and build the `Scheduler`. Start the reactor and process managers, then the `Scheduler`, then the
-leader election, then any public contracts; stop in the reverse order. Getting it wrong doesn't lose anything —
-work that arrives before its use case is running is rescheduled with a warning — but it adds noise and delay.
+`queues.tasks`, build the `Scheduler` and call `queues.bind(scheduler)`. Start the reactor and process managers,
+then the `Scheduler`, then the leader election, then any public contracts. To stop:
+
+1. Stop the public contracts.
+2. Stop the `Scheduler`, so no more work runs on this node.
+3. Stop the reactor and process managers. They stop reading, then stop handling their queues; anything they
+   queued in between waits in `scheduled_tasks` for the next node.
+4. Stop the leader election, which hands the lock to another node.
+
+Getting it wrong doesn't lose anything — work that arrives before its use case is running is rescheduled with a
+warning — but it adds noise and delay.
 
 **Run one active poller per consumer.** The reactor, public contracts and process managers only poll while
 `isLeader()` returns `true`. Run your application on as many nodes as you like, but make sure only one of them
@@ -1668,8 +1695,8 @@ fun reactorWithLeaderElection(
   poll, so two nodes may poll for up to about two `checkInterval`s plus one poll batch. That can queue the same
   work twice; deterministic reaction ids absorb it while the work is still pending, and an idempotent `handle`
   covers the rest.
-- **Shutdown.** Stop the reactor, contracts and process managers first, then `election.stop()`, which releases
-  the lock so another node takes over straight away.
+- **Shutdown.** Stop the contracts, then the `Scheduler`, then the reactor and process managers, as described
+  above, and call `election.stop()` last. It releases the lock, so another node takes over straight away.
 
 **Know what happens when things fail:**
 
@@ -1682,6 +1709,7 @@ fun reactorWithLeaderElection(
 | A node crashes mid-work | db-scheduler notices the missing heartbeat and runs it again |
 | The database or queue is down while the reactor queues work | The reactor stops the batch and resumes from its last saved position on the next poll |
 | A contract can't read or map an event | The contract stops at that event and retries it every poll, for everyone listening to it |
+| A use case fed by a contract can't queue its work (the queue is down, or `DbSchedulerQueues` isn't bound yet) | The contract's reader stops at that event and retries it every poll, for everyone listening to the contract |
 | A command loses a concurrent update | `handle` reads and decides again, up to `maxConflictRetries` times (5 by default). `OptimisticConcurrencyException` only surfaces when those run out: reduce contention on that aggregate or raise `maxConflictRetries`. Inside an outer `jdbc.transaction { }` there are no retries: retry the whole transaction (see [Several aggregates in one transaction](#several-aggregates-in-one-transaction)) |
 
 **Tune throughput.** The reactor, contracts and process managers poll every 500ms (`pollInterval`) and read up
@@ -1724,8 +1752,11 @@ failure in a specific spot to show up.
   order.
 - **A new use case doesn't see history.** It shares the reactor's position, so it sees events from when it is
   first deployed. Backfilling one use case is not supported.
-- **Removing a use case leaves its queued work behind.** Its db-scheduler task is no longer registered, so its
-  rows stay in `scheduled_tasks`. Let its work finish, or cancel its rows, before removing it.
+- **Removing a use case abandons its queued work.** Its db-scheduler task is no longer registered, so its rows in
+  `scheduled_tasks` never run. db-scheduler logs a warning when it finds them due, and once they have been due
+  for longer than the `Scheduler`'s `deleteUnresolvedAfter` (14 days by default in db-scheduler 16.12.0) it
+  deletes every row of that task: pending work and parked mappings alike. Let its work finish before removing
+  it, or cancel its rows deliberately.
 - **At most 9,999 triggers per event in an ordered use case.** Beyond that, they sort in the wrong order. This
   is not checked.
 - **Aggregate types containing `/` can share ordering keys.** The ordering key is
