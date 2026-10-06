@@ -11,6 +11,7 @@ import io.kotmod.support.OrderShipped
 import io.kotmod.support.testOrderKind
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -41,14 +42,24 @@ class UseCaseReactionsIntegrationTest : IntegrationTest() {
     @Test
     fun `replaying the log while work is pending adds no duplicate work, and handle sees one stable reaction id`() =
         runBlocking {
-            val emails = OrderWork("emails", work = { _, context -> if (context.attempt == 0) error("first attempt fails") }, decide = { _, _, _ -> Retry(3.seconds) })
+            val mapped = AtomicInteger()
+            val emails =
+                OrderWork(
+                    "emails",
+                    mapping = { _, m ->
+                        mapped.incrementAndGet()
+                        trigger(Confirm(m.aggregateId.value, m.sequence))
+                    },
+                    work = { _, context -> if (context.attempt == 0) error("first attempt fails") },
+                    decide = { _, _, _ -> Retry(3.seconds) },
+                )
             val offsets = PostgresOffsetManager(jdbc)
 
             runningReactor(dataSource, jdbc, listOf(emails)) { _, _ ->
                 jdbc.appendOrderEvent("e-1", "o-1", 1)
                 eventually { emails.seen.contexts.size == 1 && offsets.getPosition("reactor").globalOffset == 1L }
                 offsets.savePosition("reactor", EventLogPosition.START) // replay, while the reaction waits for its retry
-                eventually { offsets.getPosition("reactor").globalOffset == 1L }
+                eventually { mapped.get() >= 2 && offsets.getPosition("reactor").globalOffset == 1L } // the log really was replayed
                 eventually(10.seconds) { emails.seen.handled.size == 1 }
                 delay(500)
             }
@@ -81,12 +92,13 @@ class UseCaseReactionsIntegrationTest : IntegrationTest() {
                     .apply { listenTo(payments) { event, _ -> trigger(Flag(event.customerId)) } }
 
             runningReactor(dataSource, jdbc, listOf(fraud), contract = payments) { _, _ ->
-                jdbc.appendPaymentEvent("p-1", "c-1")
-                jdbc.appendOrderEvent("e-1", "o-1", 1)
-                eventually { fraud.seen.handled.contains(Confirm("o-1", 1)) && fraud.seen.failures.size >= 2 }
+                // The same aggregate id in both contexts: a key that dropped the aggregate type would queue Confirm behind the failing Flag.
+                jdbc.appendPaymentEvent("p-1", "x")
+                jdbc.appendOrderEvent("e-1", "x", 1)
+                eventually { fraud.seen.handled.contains(Confirm("x", 1)) && fraud.seen.failures.size >= 2 }
             }
 
-            assertEquals(listOf<Work>(Confirm("o-1", 1)), fraud.seen.handled.toList())
+            assertEquals(listOf<Work>(Confirm("x", 1)), fraud.seen.handled.toList())
             assertEquals(setOf("fraud/e-1/0", "fraud/p-1/0"), fraud.seen.contexts.map { it.reactionId }.toSet())
         }
 
@@ -110,15 +122,23 @@ class UseCaseReactionsIntegrationTest : IntegrationTest() {
     fun `a delayed trigger from a parked mapping that succeeds later waits until notBefore, then runs`() =
         runBlocking {
             val brokenFor = AtomicInteger(1)
+            val mappingCalls = AtomicInteger()
+            val mappingFailed = AtomicBoolean(false)
             val reminders =
                 OrderWork("reminders", mapping = { _, m ->
-                    if (brokenFor.getAndDecrement() > 0) error("fix not deployed yet")
+                    mappingCalls.incrementAndGet()
+                    if (brokenFor.getAndDecrement() > 0) {
+                        mappingFailed.set(true)
+                        error("fix not deployed yet")
+                    }
                     trigger(Remind(m.aggregateId.value), notBefore = Clock.System.now() + 2.seconds)
                 })
 
             runningReactor(dataSource, jdbc, listOf(reminders)) { scheduler, _ ->
                 jdbc.appendOrderEvent("e-1", "o-1", 1)
+                eventually { mappingFailed.get() } // the mapping really failed first, so it was parked
                 eventually { scheduler.getScheduledExecutionsForTask("reminders", String::class.java).any { it.taskInstance.id == "reminders/e-1/0" } }
+                assertTrue(mappingCalls.get() >= 2, "the parked mapping was retried")
                 assertTrue(reminders.seen.contexts.isEmpty(), "ran before notBefore")
                 eventually(10.seconds) { reminders.seen.handled.isNotEmpty() }
             }
@@ -132,7 +152,7 @@ class UseCaseReactionsIntegrationTest : IntegrationTest() {
             val emails = OrderWork("emails")
             runningReactor(dataSource, jdbc, listOf(emails)) { _, _ ->
                 jdbc.appendOrderEvent("e-1", "o-1", 1)
-                eventually { emails.seen.handled.size == 1 }
+                eventually { emails.seen.handled.size == 1 && PostgresOffsetManager(jdbc).getPosition("reactor").globalOffset == 1L }
             }
 
             val newcomer = OrderWork("newcomer")
