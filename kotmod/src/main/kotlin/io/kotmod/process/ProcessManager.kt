@@ -17,8 +17,8 @@ import io.kotmod.contract.PublicEventContract
 import io.kotmod.event.reaction.EventReaction
 import io.kotmod.event.reaction.EventReactionExecutor
 import io.kotmod.event.reaction.EventReactionId
-import io.kotmod.event.reaction.ReactionQueues
 import io.kotmod.event.reaction.ReactionOrdering
+import io.kotmod.event.reaction.ReactionQueues
 import io.kotmod.event.reaction.stampFor
 import io.kotmod.jdbc.JdbcContext
 import io.kotmod.outbox.DomainEventPoller

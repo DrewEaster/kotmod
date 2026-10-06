@@ -22,7 +22,9 @@ import kotlin.time.Instant
  * it is redelivered after finishing. Unlike a real queue: a [ReactionOutcome.Wait] or retry delay is ignored (the
  * reaction just stays pending for the next [deliver]); ordering stamps are enforced only with [enforceOrdering] (a
  * stamped reaction is then skipped while an earlier one of its key is pending in its channel); and [deliver] works on a
- * snapshot, so reactions published while it runs wait for the next call.
+ * snapshot, so reactions published while it runs wait for the next call. A reaction that gives up under
+ * OnGiveUp.BlockAggregate is removed rather than parked, so it does not hold back its key; test BlockAggregate against
+ * db-scheduler.
  */
 class ManualQueues(
     private val supportsOrdering: Boolean = true,
