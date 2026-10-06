@@ -44,7 +44,7 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
     getPosition: () -> EventLogPosition,
     savePosition: (EventLogPosition) -> Unit,
     isLeader: () -> Boolean,
-    private val aggregateTypes: Set<AggregateType>? = null,
+    internal val aggregateTypes: Set<AggregateType>? = null,
     pollInterval: Duration = 500.milliseconds,
     batchSize: Int = 100,
 ) {
@@ -122,13 +122,22 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
     /** Runs a single poll. For tests only. */
     internal suspend fun tickForTest() = poller.tickForTest()
 
-    private suspend fun handleEvent(envelope: PersistedEvent) {
+    /**
+     * Converts [event] to the public event this contract publishes for it, or `null` if it publishes none (kotmod's
+     * internal events, aggregate types outside [aggregateTypes], and events [internalToPublic] keeps private). Throws if
+     * [serialization] or [internalToPublic] does.
+     */
+    internal fun toPublic(event: PersistedEvent): PublicEventEnvelope<E>? {
         // A process manager's internal envelopes are only for that process manager; no app serialization can read them.
-        if (ProcessEventSerialization.isEnvelope(envelope.serialized.type)) return
-        if (aggregateTypes != null && envelope.metadata.aggregateType !in aggregateTypes) return
-        val internal: I = serialization.deserialize(envelope.serialized)
-        val public: E = internalToPublic(internal) ?: return
-        val publicEnvelope = PublicEventEnvelope(envelope.metadata, public)
+        if (ProcessEventSerialization.isEnvelope(event.serialized.type)) return null
+        if (aggregateTypes != null && event.metadata.aggregateType !in aggregateTypes) return null
+        val internal: I = serialization.deserialize(event.serialized)
+        val public: E = internalToPublic(internal) ?: return null
+        return PublicEventEnvelope(event.metadata, public)
+    }
+
+    private suspend fun handleEvent(envelope: PersistedEvent) {
+        val publicEnvelope = toPublic(envelope) ?: return
         // One ordinal counter across all subscriptions: ordered subscriptions sharing an executor share ordering
         // for an aggregate, so anything dispatched later for this event must sort later.
         var ordinal = 0
