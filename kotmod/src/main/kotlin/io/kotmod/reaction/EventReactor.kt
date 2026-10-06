@@ -96,7 +96,9 @@ class EventReactor internal constructor(
         check(!started) { "Use case ${useCase.name} was registered after reactor $name started: register every use case before start()" }
         require(runtimes.none { it.useCase.name == useCase.name }) { "Reactor $name already has a use case named ${useCase.name}" }
         check(!useCase.registered) { "Use case ${useCase.name} is already registered with a reactor" }
-        runtimes += UseCaseRuntime(useCase, queues, readEvent, clock)
+        val runtime = UseCaseRuntime(useCase, queues, readEvent, clock)
+        useCase.sources.forEach { if (it is ContractSource<T, *>) it.feed(runtime) }
+        runtimes += runtime
         useCase.registered = true
     }
 

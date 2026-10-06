@@ -77,6 +77,16 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
     private val log = LoggerFactory.getLogger(PublicEventContract::class.java)
     private val subscriptions = mutableListOf<Subscription<*, E>>()
     private var started = false
+    private val listeners = mutableListOf<suspend (PublicEventEnvelope<E>) -> Unit>()
+
+    /**
+     * Feeds each public event to [listener] (a use case listening to this contract with `on(contract)`), after the
+     * subscriptions. Must be called before [start].
+     */
+    internal fun listen(listener: suspend (PublicEventEnvelope<E>) -> Unit) {
+        check(!started) { "A use case must be registered before the contract it listens to starts" }
+        listeners += listener
+    }
 
     /**
      * Registers a subscriber: [block] maps each public event to reactions dispatched to [executor].
@@ -144,5 +154,6 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
         for (subscription in subscriptions) {
             ordinal = subscription.fanOut(publicEnvelope, envelope.position, ordinal, log)
         }
+        for (listener in listeners) listener(publicEnvelope)
     }
 }

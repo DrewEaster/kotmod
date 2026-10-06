@@ -55,6 +55,11 @@ internal class ContractSource<T : Any, P : PublicDomainEvent>(
 
     override fun map(event: PersistedEvent): List<ProducedTrigger<T>> = contract.toPublic(event)?.let(::mapPublic) ?: emptyList()
 
+    /** Has the contract's reader map each of its public events with this source and queue the result on [runtime]. */
+    fun feed(runtime: UseCaseRuntime<T>) {
+        contract.listen { envelope -> runtime.mapAndPublish(envelope.metadata, this) { mapPublic(envelope) } }
+    }
+
     fun mapPublic(envelope: PublicEventEnvelope<P>): List<ProducedTrigger<T>> {
         val scope = TriggerScope<T>()
         scope.block(envelope.event, envelope.metadata)
