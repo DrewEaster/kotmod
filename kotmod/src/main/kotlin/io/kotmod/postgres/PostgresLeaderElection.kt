@@ -18,7 +18,7 @@ import kotlin.time.Duration.Companion.seconds
 
 /**
  * Leader election on a Postgres session advisory lock, for the `isLeader` parameter of
- * [io.kotmod.outbox.AggregateEventOutbox] and [io.kotmod.contract.PublicEventContract].
+ * [io.kotmod.reaction.EventReactor] and [io.kotmod.contract.PublicEventContract].
  *
  * Elections with the same [name] compete for one lock; the winner is leader for as long as its connection lives.
  * Every `checkInterval` a follower tries to take the lock and the leader confirms its connection still answers.

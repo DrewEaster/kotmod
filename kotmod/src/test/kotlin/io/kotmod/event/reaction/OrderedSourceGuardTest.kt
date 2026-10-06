@@ -7,7 +7,6 @@ import io.kotmod.EventLogPosition
 import io.kotmod.PublicDomainEvent
 import io.kotmod.SerializedEvent
 import io.kotmod.contract.PublicEventContract
-import io.kotmod.outbox.AggregateEventOutbox
 import io.mockk.mockk
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
@@ -50,19 +49,6 @@ class OrderedSourceGuardTest {
             onCompletion = { _, _, _, _, _, _ -> },
         )
 
-    private fun outbox(
-        executor: EventReactionExecutor<FakeTrigger, Unit>,
-        ordering: ReactionOrdering = ReactionOrdering.PerAggregate(),
-    ) = AggregateEventOutbox(
-        backend = backend,
-        executor = executor,
-        eventToReactions = { emptyList() },
-        getPosition = { EventLogPosition.START },
-        savePosition = {},
-        isLeader = { true },
-        ordering = ordering,
-    )
-
     private fun contract() =
         PublicEventContract<Internal, Public>(
             backend = backend,
@@ -79,17 +65,9 @@ class OrderedSourceGuardTest {
         )
 
     @Test
-    fun `a second ordered outbox on the same executor fails at construction`() {
+    fun `a second contract feeding ordered reactions to the same executor is refused`() {
         val executor = orderedExecutor()
-        outbox(executor)
-
-        assertFailsWith<IllegalArgumentException> { outbox(executor) }
-    }
-
-    @Test
-    fun `an ordered outbox and an ordered contract cannot share an executor`() {
-        val executor = orderedExecutor()
-        outbox(executor)
+        contract().subscribe(executor, ordering = ReactionOrdering.PerAggregate()) { emptyList() }
 
         assertFailsWith<IllegalArgumentException> {
             contract().subscribe(executor, ordering = ReactionOrdering.PerAggregate()) { emptyList() }
@@ -106,11 +84,10 @@ class OrderedSourceGuardTest {
     }
 
     @Test
-    fun `unordered sources do not claim the executor`() {
+    fun `unordered subscriptions do not claim the executor`() {
         val executor = orderedExecutor()
-        outbox(executor, ordering = ReactionOrdering.Unordered)
         contract().subscribe(executor) { emptyList() }
 
-        outbox(executor)
+        contract().subscribe(executor, ordering = ReactionOrdering.PerAggregate()) { emptyList() }
     }
 }

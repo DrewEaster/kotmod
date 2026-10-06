@@ -18,7 +18,7 @@ import org.slf4j.LoggerFactory
 import kotlin.time.Duration
 
 /**
- * The polling loop shared by [AggregateEventOutbox] and [io.kotmod.contract.PublicEventContract]:
+ * The polling loop shared by [io.kotmod.reaction.EventReactor], [io.kotmod.contract.PublicEventContract] and [io.kotmod.process.ProcessManager]:
  * reads events after the saved position, hands each one to [handleEvent], and saves the position after each
  * event. It delivers each aggregate's events in sequence order (pulling an earlier event forward when the log
  * has it later, and skipping it when reached). An exception stops the current batch; the next poll resumes from the last saved position.

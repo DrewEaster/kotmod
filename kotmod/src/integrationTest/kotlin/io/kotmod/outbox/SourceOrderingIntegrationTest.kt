@@ -3,16 +3,12 @@ package io.kotmod.outbox
 import io.kotmod.AggregateId
 import io.kotmod.AggregateType
 import io.kotmod.EventLogPosition
-import io.kotmod.event.reaction.EventReaction
-import io.kotmod.event.reaction.EventReactionId
-import io.kotmod.event.reaction.EventReactionTrigger
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.PostgresDomainPollingBackend
 import io.kotmod.postgres.support.ConnectionJdbcContext
 import io.kotmod.postgres.support.IntegrationTest
 import io.kotmod.postgres.support.eventually
 import io.kotmod.postgres.support.orderEventSerialization
-import io.kotmod.postgres.support.recordingExecutor
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import java.sql.Connection
@@ -20,15 +16,9 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 
 class SourceOrderingIntegrationTest : IntegrationTest() {
-    private data class Seen(
-        val label: String,
-        override val timeout: Duration? = null,
-    ) : EventReactionTrigger
-
     private fun open(): Connection = dataSource.connection.apply { autoCommit = false }
 
     private fun assignTransactionId(conn: Connection) {
@@ -68,19 +58,17 @@ class SourceOrderingIntegrationTest : IntegrationTest() {
                 }
         }
 
-    private fun outbox(dispatched: MutableList<String>): AggregateEventOutbox<Seen> {
+    private fun poller(dispatched: MutableList<String>): DomainEventPoller {
         val position = AtomicReference(EventLogPosition.START)
-        return AggregateEventOutbox(
+        return DomainEventPoller(
             backend = PostgresDomainPollingBackend(jdbc),
-            executor = recordingExecutor<Seen> { _, trigger -> dispatched += trigger.label },
-            eventToReactions = { event ->
-                val label = "${event.metadata.aggregateId.value}#${event.metadata.sequence}"
-                listOf(EventReaction(EventReactionId("r-$label"), Seen(label)))
-            },
             getPosition = { position.get() },
             savePosition = { position.set(it) },
             isLeader = { true },
             pollInterval = 50.milliseconds,
+            batchSize = 100,
+            loggerName = "SourceOrderingIntegrationTest",
+            handleEvent = { event -> dispatched += "${event.metadata.aggregateId.value}#${event.metadata.sequence}" },
         )
     }
 
@@ -100,13 +88,13 @@ class SourceOrderingIntegrationTest : IntegrationTest() {
             assertEquals(true, flagged("A"), "the inverted write flags the aggregate")
 
             val dispatched = CopyOnWriteArrayList<String>()
-            val outbox = outbox(dispatched)
-            outbox.start()
+            val poller = poller(dispatched)
+            poller.start()
             try {
                 eventually { dispatched.size >= 4 }
                 delay(300)
             } finally {
-                outbox.stop()
+                poller.stop()
             }
 
             val forA = dispatched.filter { it.startsWith("A#") }
@@ -130,8 +118,8 @@ class SourceOrderingIntegrationTest : IntegrationTest() {
             t1.close()
 
             val dispatched = CopyOnWriteArrayList<String>()
-            val outbox = outbox(dispatched)
-            outbox.start()
+            val poller = poller(dispatched)
+            poller.start()
             try {
                 delay(500)
                 assertEquals(false, dispatched.contains("A#2"), "A#2 must wait for A#1, which is held back")
@@ -139,7 +127,7 @@ class SourceOrderingIntegrationTest : IntegrationTest() {
                 blocker.close()
                 eventually { dispatched.size >= 3 }
             } finally {
-                outbox.stop()
+                poller.stop()
             }
 
             assertEquals(listOf("A#1", "A#2"), dispatched.filter { it.startsWith("A#") })
@@ -167,13 +155,13 @@ class SourceOrderingIntegrationTest : IntegrationTest() {
             tb.close()
 
             val dispatched = CopyOnWriteArrayList<String>()
-            val outbox = outbox(dispatched)
-            outbox.start()
+            val poller = poller(dispatched)
+            poller.start()
             try {
                 eventually { dispatched.size >= 6 }
                 delay(300)
             } finally {
-                outbox.stop()
+                poller.stop()
             }
 
             assertEquals(listOf("A#1", "A#2", "A#3"), dispatched.filter { it.startsWith("A#") })

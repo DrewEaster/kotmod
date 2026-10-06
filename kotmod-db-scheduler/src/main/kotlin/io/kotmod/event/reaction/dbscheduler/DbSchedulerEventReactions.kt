@@ -15,31 +15,16 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 
 /**
- * Durable event reactions stored and scheduled by db-scheduler. Create one per
- * [io.kotmod.event.reaction.EventReactionExecutor]: it becomes one db-scheduler task named
- * [taskName], and each reaction is an instance of that task identified by its
- * [io.kotmod.event.reaction.EventReactionId].
+ * One db-scheduler task, as one of [DbSchedulerQueues]' queues: each reaction is an instance of task [taskName],
+ * identified by its reaction id.
  *
- * The app owns the db-scheduler `Scheduler` and its `scheduled_tasks` table:
- * ```
- * val reactions = DbSchedulerEventReactions("billing-reactions", BillingTriggerSerializer)
- * val scheduler = Scheduler.create(dataSource, reactions.task).threads(10).build()
- * val executor = EventReactionExecutor(sink = reactions.sink(scheduler), source = reactions.source, ...)
- *
- * executor.start()   // executors start before the scheduler...
- * scheduler.start()
- * ...
- * scheduler.stop()
- * executor.stop()    // ...and stop after it
- * ```
- * Retries requested by the executor reschedule the reaction with an incremented retry count. If the
- * scheduler runs a reaction while no executor is subscribed, it is rescheduled
- * [unsubscribedRetryDelay] later without using up a retry. If a reaction's stored data cannot be read,
- * db-scheduler retries it with backoff from 10 seconds up to 1 hour. Interrupted executions are retried
- * later with the same retry count.
+ * Retries requested by the runtime subscribed to the queue reschedule the reaction with an incremented retry count.
+ * If the scheduler runs a reaction while no runtime is subscribed, it is rescheduled [unsubscribedRetryDelay] later
+ * without using up a retry. If a reaction's stored data cannot be read, db-scheduler retries it with backoff from
+ * 10 seconds up to 1 hour. Interrupted executions are retried later with the same retry count.
  *
  * Delivery is at-least-once: reaction ids must be deterministic per (event, reaction kind) so duplicate
- * dispatches are ignored while pending, and the executor's handlers must be idempotent.
+ * dispatches are ignored while pending, and the subscribed runtime's handling must be idempotent.
  *
  * Ordered reactions ([io.kotmod.event.reaction.ReactionOrdering.PerAggregate]) need [jdbc], used to query db-scheduler's
  * [tableName] table. Each is stored under an instance id that sorts by aggregate, sequence and ordinal; when picked it
@@ -49,7 +34,7 @@ import kotlin.time.Duration.Companion.seconds
  * that gives up with [OnGiveUp.BlockAggregate] is parked, holding back its aggregate, until [retryBlocked] or
  * [skipBlocked] is called (see [blockedReactions]).
  */
-class DbSchedulerEventReactions<T : EventReactionTrigger>(
+internal class DbSchedulerEventReactions<T : EventReactionTrigger>(
     private val taskName: String,
     private val triggerSerializer: EventReactionTriggerSerializer<T>,
     unsubscribedRetryDelay: Duration = 5.seconds,
@@ -70,10 +55,10 @@ class DbSchedulerEventReactions<T : EventReactionTrigger>(
     /** The tasks to register with the app's `Scheduler`. */
     val tasks: List<Task<*>> get() = listOf(task)
 
-    /** The source to pass to this reaction type's executor. */
+    /** The source the runtime subscribes to. */
     val source: EventReactionTriggerSource<T> get() = triggerSource
 
-    /** Returns the sink to pass to this reaction type's executor, scheduling through [client] (usually the app's `Scheduler`). */
+    /** Returns the sink the runtime publishes to, scheduling through [client] (usually the app's `Scheduler`). */
     fun sink(client: SchedulerClient): EventReactionTriggerSink<T> =
         DbSchedulerTriggerSink(taskName, triggerSerializer, client, supportsOrdering = supportsOrdering)
 

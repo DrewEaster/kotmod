@@ -22,7 +22,7 @@ import kotlin.time.Instant
  * `@JvmInline value class` — at the JVM level it erases to [String], which trips up
  * MockK argument capture. A plain sink lambda sidesteps that entirely.
  */
-fun <T : EventReactionTrigger> recordingExecutor(onDispatch: suspend (EventReactionId, T) -> Unit): EventReactionExecutor<T, Unit> {
+internal fun <T : EventReactionTrigger> recordingExecutor(onDispatch: suspend (EventReactionId, T) -> Unit): EventReactionExecutor<T, Unit> {
     val sink =
         object : EventReactionTriggerSink<T> {
             override suspend fun publish(

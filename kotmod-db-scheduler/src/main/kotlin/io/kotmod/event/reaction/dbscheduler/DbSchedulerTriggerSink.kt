@@ -34,7 +34,7 @@ internal class DbSchedulerTriggerSink<T : EventReactionTrigger>(
         notBefore: kotlin.time.Instant?,
     ) {
         require(ordering == null || supportsOrdering) {
-            "Ordered reactions need DbSchedulerEventReactions to be created with a JdbcContext"
+            "Ordered reactions need a queue created with a JdbcContext"
         }
         val stamp = ordering?.let { OrderingStamp(it.key, it.sequence, it.ordinal, it.onGiveUp.name, id.value) }
         val instanceId = stamp?.let { orderedInstanceId(it.key, it.sequence, it.ordinal, id.value) } ?: id.value

@@ -68,7 +68,7 @@ internal class ProcessEventSerialization<E : DomainEvent>(
 
         /**
          * Whether [type] is one of kotmod's envelope types. Only the process manager that wrote an envelope reads it;
-         * outboxes, contracts and other process managers skip it.
+         * the reactor, contracts and other process managers skip it.
          */
         fun isEnvelope(type: String): Boolean = type in ENVELOPE_TYPES
     }

@@ -17,10 +17,11 @@ import kotlin.time.Instant
 typealias RetryCount = Int
 
 /**
- * The input to an event reaction: what the reaction should do, as data. Implementations are app-defined
- * and must be serializable with an [EventReactionTriggerSerializer].
+ * One item in a reaction queue, as an [EventReactionTriggerSink] stores it. kotmod's own items implement it (a use
+ * case's trigger with what kotmod needs to run it, a parked mapping, a process manager's input or command); a queue
+ * only moves them between publish and delivery, converting them with an [EventReactionTriggerSerializer].
  *
- * @property timeout how long one execution may run; `null` uses the executor's default.
+ * @property timeout how long one attempt may run; `null` uses the runtime's default.
  */
 interface EventReactionTrigger {
     val timeout: Duration?
@@ -34,13 +35,16 @@ interface EventReactionTrigger {
  *
  * [notBefore], if set, delays the reaction: it doesn't run before that time. Delayed reactions can't be ordered.
  */
-data class EventReaction<T : EventReactionTrigger>(
+internal data class EventReaction<T : EventReactionTrigger>(
     val id: EventReactionId,
     val trigger: T,
     val notBefore: Instant? = null,
 )
 
-/** Identifies one event reaction across all of its retries. */
+/**
+ * Identifies one reaction across all of its retries. kotmod derives it deterministically (for a use case,
+ * `<useCase>/<eventId>/<n>`), so queuing the same work again is recognised as a duplicate while it is pending.
+ */
 @JvmInline
 value class EventReactionId(
     val value: String,
@@ -62,7 +66,7 @@ interface EventReactionTriggerSerializer<T : EventReactionTrigger> {
 }
 
 /** What the app's `execute` function reports after one attempt at a reaction. */
-sealed interface EventReactionExecutionResult {
+internal sealed interface EventReactionExecutionResult {
     /** The reaction did its work. */
     data object EventReactionExecutionCompleted : EventReactionExecutionResult
 
@@ -79,7 +83,7 @@ sealed interface EventReactionExecutionResult {
 }
 
 /** How an event reaction finally ended, passed to the executor's `onCompletion` handler. */
-sealed interface EventReactionCompletionResult {
+internal sealed interface EventReactionCompletionResult {
     /** The reaction succeeded. */
     data object EventReactionCompleted : EventReactionCompletionResult
 
@@ -94,7 +98,7 @@ sealed interface EventReactionCompletionResult {
 }
 
 /** A retry handler's decision after a failed or timed-out attempt. */
-sealed interface RetrySignal {
+internal sealed interface RetrySignal {
     /** Run the reaction again after [delay], with the retry count incremented. */
     data class Retry(
         val delay: Duration,
@@ -106,7 +110,7 @@ sealed interface RetrySignal {
     ) : RetrySignal
 }
 
-/** Accepts dispatched reactions for later execution, e.g. by storing them in a durable queue. */
+/** Accepts queued reactions for later execution, e.g. by storing them in a durable queue. */
 interface EventReactionTriggerSink<T : EventReactionTrigger> {
     /** Whether this sink can run reactions in order; only such sinks are passed an [ordering] stamp. */
     val supportsOrdering: Boolean get() = false
@@ -133,7 +137,7 @@ interface Cancellable {
     fun cancel()
 }
 
-/** Delivers queued reactions to the [EventReactionExecutor] that subscribed to it. */
+/** Delivers queued reactions to the kotmod runtime subscribed to it (a use case's, or a process manager channel's). */
 interface EventReactionTriggerSource<T : EventReactionTrigger> {
     /**
      * Starts delivering reactions to [block], which runs one attempt and returns a [ReactionOutcome]:
@@ -145,7 +149,7 @@ interface EventReactionTriggerSource<T : EventReactionTrigger> {
 }
 
 /** Exponential backoff for retries the executor schedules itself: 1s, 2s, 4s… capped at [maximumDuration]. */
-class BackoffStrategy(
+internal class BackoffStrategy(
     private val maximumDuration: Duration = 600.seconds,
 ) {
     /** Returns the delay before retry number [retryCount] + 1. */
@@ -176,7 +180,7 @@ class BackoffStrategy(
  *
  * @param ExecutionContext app-defined per-attempt context, created by [createExecutionContext].
  */
-class EventReactionExecutor<T : EventReactionTrigger, ExecutionContext>(
+internal class EventReactionExecutor<T : EventReactionTrigger, ExecutionContext>(
     private val sink: EventReactionTriggerSink<T>,
     private val source: EventReactionTriggerSource<T>,
     private val createExecutionContext: suspend (EventReactionId, T) -> ExecutionContext,
@@ -198,7 +202,7 @@ class EventReactionExecutor<T : EventReactionTrigger, ExecutionContext>(
     private val orderedSource = AtomicReference<Any?>(null)
 
     /**
-     * Records [source] (an outbox or contract) as the one that feeds this executor ordered reactions. Ordering
+     * Records [source] (a contract) as the one that feeds this executor ordered reactions. Ordering
      * only holds for reactions dispatched by one poller, so a second, different source is rejected; the same
      * source claiming again (a contract with several ordered subscriptions) is fine.
      */
@@ -206,7 +210,7 @@ class EventReactionExecutor<T : EventReactionTrigger, ExecutionContext>(
         val claimed = orderedSource.compareAndExchange(null, source)
         require(claimed == null || claimed === source) {
             "This executor already receives ordered reactions from $claimed; an ordered executor can be fed by " +
-                "only one outbox or contract. Give each ordered outbox or contract its own executor."
+                "only one contract. Give each ordered contract subscription its own executor."
         }
     }
 

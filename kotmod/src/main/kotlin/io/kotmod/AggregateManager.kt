@@ -21,7 +21,7 @@ import kotlin.time.toKotlinInstant
  * If the write loses a race with another writer, [handle] starts again from the read, up to
  * [maxConflictRetries] times, except inside an outer transaction, where the conflict propagates.
  *
- * Events appended here are later picked up by [io.kotmod.outbox.AggregateEventOutbox] and
+ * Events appended here are later picked up by [io.kotmod.reaction.EventReactor] and
  * [io.kotmod.contract.PublicEventContract].
  *
  * @param S the aggregate's state type.

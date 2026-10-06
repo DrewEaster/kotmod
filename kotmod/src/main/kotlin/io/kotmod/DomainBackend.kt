@@ -98,7 +98,7 @@ data class PersistedEvent(
     val attributes: Map<String, String> = emptyMap(),
 )
 
-/** Reads the event log in order, for consumers such as [io.kotmod.outbox.AggregateEventOutbox] and [io.kotmod.contract.PublicEventContract]. */
+/** Reads the event log in order, for consumers such as [io.kotmod.reaction.EventReactor] and [io.kotmod.contract.PublicEventContract]. */
 interface DomainEventPollingBackend {
     /**
      * Returns up to [limit] events after [position], in log order, from transactions that have finished.

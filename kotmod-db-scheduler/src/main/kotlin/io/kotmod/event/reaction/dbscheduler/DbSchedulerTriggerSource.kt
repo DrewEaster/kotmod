@@ -10,7 +10,7 @@ import io.kotmod.event.reaction.ReactionOutcome
 
 internal typealias ReactionHandler<T> = suspend (EventReactionId, EventReactionExecutionId, T, RetryCount, kotlin.time.Instant?) -> ReactionOutcome
 
-/** Holds the handler of the one executor subscribed to a db-scheduler task; the task reads it on every execution. */
+/** Holds the handler of the one runtime subscribed to a db-scheduler task; the task reads it on every execution. */
 internal class DbSchedulerTriggerSource<T : EventReactionTrigger> : EventReactionTriggerSource<T> {
     @Volatile
     var handler: ReactionHandler<T>? = null
@@ -18,7 +18,7 @@ internal class DbSchedulerTriggerSource<T : EventReactionTrigger> : EventReactio
 
     override fun subscribe(block: ReactionHandler<T>): Cancellable {
         synchronized(this) {
-            check(handler == null) { "An event reaction executor is already subscribed to this source" }
+            check(handler == null) { "Something is already subscribed to this queue" }
             handler = block
         }
         return object : Cancellable {

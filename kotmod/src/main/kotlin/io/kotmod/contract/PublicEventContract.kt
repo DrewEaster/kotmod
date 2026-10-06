@@ -24,9 +24,9 @@ import kotlin.time.Duration.Companion.milliseconds
  * Publishes a bounded context's internal domain events to other contexts as public events.
  *
  * While running, it polls the event log, deserializes each event with [serialization], maps it with
- * [internalToPublic] (returning `null` keeps an event private) and passes the public event to every
- * subscriber. Each subscriber turns it into event reactions for its own executor. Positions, leadership and
- * redelivery work as in [io.kotmod.outbox.AggregateEventOutbox].
+ * [internalToPublic] (returning `null` keeps an event private) and hands the public event to the use cases listening
+ * to it (`on(contract)`) and to process managers subscribed with `subscribeTo`. Register those before [start].
+ * Positions, leadership and redelivery work as for the reactor.
  *
  * The event log holds every aggregate's events, process managers' facts included. kotmod's own internal events are
  * always skipped, but without [aggregateTypes] [serialization] must be able to read every other event type in the log.
@@ -92,13 +92,13 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
     }
 
     /**
-     * Registers a subscriber: [block] maps each public event to reactions dispatched to [executor].
+     * Registers a process manager's subscriber: [block] maps each public event to reactions dispatched to [executor].
      * Reactions are stamped per [ordering]; ordered subscriptions need an executor whose sink supports
      * ordering. Ordered subscriptions of this contract may share an executor and then share ordering for an
-     * aggregate, but that executor may not be fed ordered reactions by any other outbox or contract. Must be
+     * aggregate, but that executor may not be fed ordered reactions by any other contract. Must be
      * called before [start].
      */
-    fun <T : EventReactionTrigger> subscribe(
+    internal fun <T : EventReactionTrigger> subscribe(
         executor: EventReactionExecutor<T, *>,
         ordering: ReactionOrdering = ReactionOrdering.Unordered,
         block: (PublicEventEnvelope<E>) -> List<EventReaction<T>>,

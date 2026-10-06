@@ -8,7 +8,6 @@ import io.kotmod.PersistedEvent
 import io.kotmod.PublicDomainEvent
 import io.kotmod.SerializedEvent
 import io.kotmod.contract.PublicEventContract
-import io.kotmod.outbox.AggregateEventOutbox
 import io.kotmod.support.persistedEvent
 import kotlinx.coroutines.runBlocking
 import java.util.concurrent.atomic.AtomicInteger
@@ -129,42 +128,6 @@ class DelayedReactionsTest {
                 deliver(EventReactionId("r-1"), EventReactionExecutionId("x-1"), FakeTrigger(), 0, now),
             )
             assertEquals(1, executions.get())
-        }
-
-    @Test
-    fun `an outbox passes a reaction's notBefore to dispatch`() =
-        runBlocking {
-            val outbox =
-                AggregateEventOutbox(
-                    backend = OneEventBackend(persistedEvent(globalOffset = 1)),
-                    executor = executor(),
-                    eventToReactions = { listOf(EventReaction(EventReactionId("remind"), FakeTrigger(), notBefore = now + 7.seconds)) },
-                    getPosition = { EventLogPosition.START },
-                    savePosition = {},
-                    isLeader = { true },
-                )
-
-            outbox.tickForTest()
-
-            assertEquals(listOf(Published(EventReactionId("remind"), null, now + 7.seconds)), published)
-        }
-
-    @Test
-    fun `an ordered outbox fails loudly on a delayed reaction`() =
-        runBlocking {
-            val outbox =
-                AggregateEventOutbox(
-                    backend = OneEventBackend(persistedEvent(globalOffset = 1)),
-                    executor = executor(supportsOrdering = true),
-                    eventToReactions = { listOf(EventReaction(EventReactionId("remind"), FakeTrigger(), notBefore = now + 7.seconds)) },
-                    getPosition = { EventLogPosition.START },
-                    savePosition = {},
-                    isLeader = { true },
-                    ordering = ReactionOrdering.PerAggregate(),
-                )
-
-            assertFailsWith<IllegalArgumentException> { outbox.tickForTest() }
-            assertEquals(emptyList(), published)
         }
 
     private data class Internal(

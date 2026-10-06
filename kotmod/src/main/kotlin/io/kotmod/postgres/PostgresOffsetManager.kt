@@ -23,8 +23,8 @@ enum class StartFrom {
  * by default; pass [StartFrom.Beginning] for one that needs history, such as a new projection or a process manager
  * that should cover work already in flight:
  * ```
- * getPosition = { offsets.getPosition("orders-outbox") },
- * savePosition = { offsets.savePosition("orders-outbox", it) },
+ * getPosition = { offsets.getPosition("order-emails") },
+ * savePosition = { offsets.savePosition("order-emails", it) },
  *
  * getPosition = { offsets.getPosition("order-report", startFrom = StartFrom.Beginning) },
  * ```

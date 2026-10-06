@@ -20,7 +20,8 @@ import kotlin.time.Duration.Companion.seconds
 private val log = LoggerFactory.getLogger("io.kotmod.event.reaction.dbscheduler.ReactionTask")
 
 /**
- * Builds the db-scheduler task that decodes each stored reaction and runs it through the subscribed executor.
+ * Builds the db-scheduler task that decodes each stored reaction and runs it through the subscribed runtime (a use
+ * case's, or a process manager channel's).
  *
  * An ordered reaction runs only once no earlier reaction of its aggregate is pending for this task; until then it
  * is rechecked after [orderedRecheckDelay], doubling per wait up to a minute, without using up a retry. A blocked reaction stays parked.
@@ -41,8 +42,8 @@ internal fun <T : EventReactionTrigger> reactionTask(
             val outcome =
                 if (handler == null) {
                     log.warn(
-                        "No event reaction executor subscribed to task {}; rescheduling {} in {}. " +
-                            "Start executors before the db-scheduler Scheduler and stop them after it.",
+                        "Nothing is subscribed to task {}; rescheduling {} in {}. " +
+                            "Start the reactor and process managers before the db-scheduler Scheduler and stop them after it.",
                         taskName,
                         instance.id,
                         unsubscribedRetryDelay,

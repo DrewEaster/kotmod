@@ -62,7 +62,7 @@ internal fun outcomeAfterExecution(
         }
     }
 
-/** Reschedules the row after [delay] with its data unchanged, for executions that arrive before an executor has subscribed. */
+/** Reschedules the row after [delay] with its data unchanged, for executions that arrive before anything has subscribed. */
 internal fun outcomeWhenUnsubscribed(
     rawTaskData: String,
     now: Instant,

@@ -1,45 +1,34 @@
 package io.kotmod.outbox
 
-import io.kotmod.EventLogPosition
 import io.kotmod.AggregateId
 import io.kotmod.AggregateType
 import io.kotmod.CommandId
-import io.kotmod.CorrelationId
 import io.kotmod.EventId
+import io.kotmod.EventLogPosition
 import io.kotmod.EventMetadata
 import io.kotmod.PendingEvent
-import io.kotmod.event.reaction.EventReaction
-import io.kotmod.event.reaction.EventReactionId
-import io.kotmod.event.reaction.EventReactionTrigger
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.PostgresDomainPollingBackend
 import io.kotmod.postgres.PostgresOffsetManager
 import io.kotmod.postgres.StartFrom
 import io.kotmod.postgres.support.IntegrationTest
+import io.kotmod.postgres.support.eventually
 import io.kotmod.postgres.support.orderEventSerialization
-import io.kotmod.postgres.support.recordingExecutor
 import io.kotmod.support.OrderEvent
 import io.kotmod.support.OrderPlaced
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.jupiter.api.BeforeEach
+import java.sql.Connection
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
-import io.kotmod.postgres.support.eventually
-import java.util.concurrent.atomic.AtomicReference
-import java.sql.Connection
 
-class AggregateEventOutboxIntegrationTest : IntegrationTest() {
-    private data class FakeTrigger(
-        val eventId: String,
-        override val timeout: Duration? = null,
-    ) : EventReactionTrigger
-
+class DomainEventPollerIntegrationTest : IntegrationTest() {
     private lateinit var backend: PostgresDomainPersistenceBackend<OrderEvent>
     private lateinit var offsets: PostgresOffsetManager
 
@@ -52,7 +41,6 @@ class AggregateEventOutboxIntegrationTest : IntegrationTest() {
     private fun seed(
         eventId: String,
         aggregateId: String,
-        correlationId: CorrelationId? = null,
     ) {
         val type = AggregateType("Order")
         backend.saveMeta(type, AggregateId(aggregateId), expectedVersion = null, eventCount = 1)
@@ -65,7 +53,7 @@ class AggregateEventOutboxIntegrationTest : IntegrationTest() {
                             aggregateType = type,
                             aggregateId = AggregateId(aggregateId),
                             causationId = CommandId("cmd-$eventId"),
-                            correlationId = correlationId,
+                            correlationId = null,
                             timestamp = kotlin.time.Instant.parse("2026-04-18T10:00:00Z"),
                             sequence = 1,
                         ),
@@ -75,100 +63,85 @@ class AggregateEventOutboxIntegrationTest : IntegrationTest() {
         )
     }
 
-    private fun newOutbox(
-        onDispatch: suspend (EventReactionId, FakeTrigger) -> Unit,
+    /** A poller that records each event's id and saves its position as consumer [CONSUMER]. */
+    private fun newPoller(
+        handled: MutableList<String>,
         isLeader: () -> Boolean = { true },
-    ) = AggregateEventOutbox(
+    ) = DomainEventPoller(
         backend = PostgresDomainPollingBackend(jdbc),
-        executor = recordingExecutor(onDispatch),
-        eventToReactions = { event ->
-            listOf(
-                EventReaction(
-                    id = EventReactionId("reaction-${event.metadata.eventId.value}"),
-                    trigger = FakeTrigger(eventId = event.metadata.eventId.value),
-                ),
-            )
-        },
         getPosition = { offsets.getPosition(CONSUMER, StartFrom.Beginning) },
         savePosition = { offsets.savePosition(CONSUMER, it) },
         isLeader = isLeader,
         pollInterval = 50.milliseconds,
         batchSize = 10,
+        loggerName = "DomainEventPollerIntegrationTest",
+        handleEvent = { event -> handled += event.metadata.eventId.value },
     )
 
+    private suspend fun waitForPosition(offset: Long) {
+        withTimeout(5.seconds) {
+            while (offsets.getPosition(CONSUMER, StartFrom.Beginning).globalOffset < offset) delay(50)
+        }
+    }
+
     @Test
-    fun `outbox dispatches every event in offset order and persists the offset`() =
+    fun `the poller hands over every event in log order and saves its position`() =
         runBlocking {
             seed("e-1", "o-1")
-            seed("e-2", "o-2", CorrelationId("corr-2"))
+            seed("e-2", "o-2")
+            val handled = CopyOnWriteArrayList<String>()
+            val poller = newPoller(handled)
 
-            // CopyOnWriteArrayList gives cross-thread visibility without explicit synchronisation.
-            val captured = CopyOnWriteArrayList<Pair<EventReactionId, FakeTrigger>>()
-            val outbox = newOutbox(onDispatch = { id, trigger -> captured += id to trigger })
-
-            outbox.start()
+            poller.start()
             try {
-                withTimeout(5.seconds) {
-                    while (offsets.getPosition(CONSUMER, StartFrom.Beginning).globalOffset < 2) delay(50)
-                }
+                waitForPosition(2)
             } finally {
-                outbox.stop()
+                poller.stop()
             }
 
-            assertEquals(
-                listOf(
-                    EventReactionId("reaction-e-1") to FakeTrigger("e-1"),
-                    EventReactionId("reaction-e-2") to FakeTrigger("e-2"),
-                ),
-                captured.toList(),
-            )
+            assertEquals(listOf("e-1", "e-2"), handled.toList())
             assertEquals(2L, offsets.getPosition(CONSUMER, StartFrom.Beginning).globalOffset)
         }
 
     @Test
-    fun `outbox resumes from the persisted position`() =
+    fun `the poller resumes from the saved position`() =
         runBlocking {
             seed("e-1", "o-1")
             seed("e-2", "o-2")
             offsets.savePosition(CONSUMER, PostgresDomainPollingBackend(jdbc).readEventsAfter(EventLogPosition.START, 1).single().position)
+            val handled = CopyOnWriteArrayList<String>()
+            val poller = newPoller(handled)
 
-            val captured = CopyOnWriteArrayList<EventReactionId>()
-            val outbox = newOutbox(onDispatch = { id, _ -> captured += id })
-
-            outbox.start()
+            poller.start()
             try {
-                withTimeout(5.seconds) {
-                    while (offsets.getPosition(CONSUMER, StartFrom.Beginning).globalOffset < 2) delay(50)
-                }
+                waitForPosition(2)
             } finally {
-                outbox.stop()
+                poller.stop()
             }
 
-            assertEquals(listOf(EventReactionId("reaction-e-2")), captured.toList())
+            assertEquals(listOf("e-2"), handled.toList())
         }
 
     @Test
-    fun `outbox skips ticks when isLeader returns false`() =
+    fun `the poller skips ticks when isLeader returns false`() =
         runBlocking {
             seed("e-1", "o-1")
+            val handled = CopyOnWriteArrayList<String>()
+            val poller = newPoller(handled, isLeader = { false })
 
-            val dispatched = CopyOnWriteArrayList<EventReactionId>()
-            val outbox = newOutbox(onDispatch = { id, _ -> dispatched += id }, isLeader = { false })
-
-            outbox.start()
+            poller.start()
             try {
                 delay(300)
             } finally {
-                outbox.stop()
+                poller.stop()
             }
 
-            assertEquals(emptyList(), dispatched.toList())
+            assertEquals(emptyList(), handled.toList())
             assertEquals(EventLogPosition.START, offsets.getPosition(CONSUMER, StartFrom.Beginning))
         }
 
-
     @Test
-    fun `outbox delivers an event committed after a later one`() =
+    fun `the poller delivers an event committed after a later one`() =
         runBlocking {
             fun insert(
                 conn: Connection,
@@ -184,39 +157,38 @@ class AggregateEventOutboxIntegrationTest : IntegrationTest() {
                     ps.executeUpdate()
                 }
 
-            val dispatched = CopyOnWriteArrayList<EventReactionId>()
+            val handled = CopyOnWriteArrayList<String>()
             val position = AtomicReference(EventLogPosition.START)
-            val outbox =
-                AggregateEventOutbox(
+            val poller =
+                DomainEventPoller(
                     backend = PostgresDomainPollingBackend(jdbc),
-                    executor = recordingExecutor<FakeTrigger> { id, _ -> dispatched += id },
-                    eventToReactions = { event ->
-                        listOf(EventReaction(EventReactionId("reaction-${event.metadata.eventId.value}"), FakeTrigger(event.metadata.eventId.value)))
-                    },
                     getPosition = { position.get() },
                     savePosition = { position.set(it) },
                     isLeader = { true },
                     pollInterval = 50.milliseconds,
+                    batchSize = 100,
+                    loggerName = "DomainEventPollerIntegrationTest",
+                    handleEvent = { event -> handled += event.metadata.eventId.value },
                 )
 
             val a = dataSource.connection.apply { autoCommit = false }
             try {
                 insert(a, "e-1") // in flight
                 dataSource.connection.use { b -> insert(b, "e-2") } // auto-commit
-                outbox.start()
+                poller.start()
                 delay(300)
-                assertEquals(emptyList(), dispatched.toList()) // e-2 is held back behind e-1's transaction
+                assertEquals(emptyList(), handled.toList()) // e-2 is held back behind e-1's transaction
                 a.commit()
-                eventually { dispatched.size == 2 }
+                eventually { handled.size == 2 }
             } finally {
-                outbox.stop()
+                poller.stop()
                 a.close()
             }
 
-            assertEquals(listOf(EventReactionId("reaction-e-1"), EventReactionId("reaction-e-2")), dispatched.toList())
+            assertEquals(listOf("e-1", "e-2"), handled.toList())
         }
 
     private companion object {
-        const val CONSUMER = "orders-outbox"
+        const val CONSUMER = "poller"
     }
 }
