@@ -13,6 +13,7 @@ import io.kotmod.event.reaction.EventReactionTrigger
 import io.kotmod.event.reaction.EventReactionTriggerSerializer
 import io.kotmod.event.reaction.EventReactionTriggerSink
 import io.kotmod.event.reaction.EventReactionTriggerSource
+import io.kotmod.event.reaction.ReactionChannel
 import io.kotmod.event.reaction.RetrySignal
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
@@ -21,26 +22,6 @@ import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import kotlin.time.Duration
 import kotlin.time.Instant
-
-/**
- * Provides the queues a [ProcessManager]'s channels run on. A process manager asks for a channel per name; names are
- * stable across restarts. `kotmod-db-scheduler` provides `DbSchedulerProcessManagerQueues`; any queue that implements
- * an event reaction sink and source works.
- */
-interface ProcessManagerQueues {
-    /** Returns the queue for channel [name]. An [ordered] channel's sink must support ordering. */
-    fun <T : EventReactionTrigger> channel(
-        name: String,
-        triggerSerializer: EventReactionTriggerSerializer<T>,
-        ordered: Boolean,
-    ): ProcessChannel<T>
-}
-
-/** One queue for a process manager channel: where reactions are published, and where they are delivered from. */
-class ProcessChannel<T : EventReactionTrigger>(
-    val sink: EventReactionTriggerSink<T>,
-    val source: EventReactionTriggerSource<T>,
-)
 
 /** Delivers [input] (JSON) to process [processId], recognised by [inputId] if delivered again. */
 @Serializable
@@ -101,7 +82,7 @@ private val log = LoggerFactory.getLogger("io.kotmod.process.ProcessManager")
  * dropped.
  */
 internal fun <T : EventReactionTrigger> processExecutor(
-    channel: ProcessChannel<T>,
+    channel: ReactionChannel<T>,
     clock: () -> Instant,
     run: suspend (T) -> Unit,
 ): EventReactionExecutor<T, Unit> {

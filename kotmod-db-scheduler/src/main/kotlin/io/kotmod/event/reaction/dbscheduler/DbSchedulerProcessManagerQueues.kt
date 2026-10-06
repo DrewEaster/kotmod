@@ -8,8 +8,8 @@ import io.kotmod.event.reaction.EventReactionTrigger
 import io.kotmod.event.reaction.EventReactionTriggerSerializer
 import io.kotmod.event.reaction.EventReactionTriggerSink
 import io.kotmod.jdbc.JdbcContext
-import io.kotmod.process.ProcessChannel
-import io.kotmod.process.ProcessManagerQueues
+import io.kotmod.event.reaction.ReactionChannel
+import io.kotmod.event.reaction.ReactionQueues
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
@@ -32,7 +32,7 @@ class DbSchedulerProcessManagerQueues(
     private val name: String,
     private val jdbc: JdbcContext? = null,
     private val unsubscribedRetryDelay: Duration = 5.seconds,
-) : ProcessManagerQueues {
+) : ReactionQueues {
     private val reactions = mutableListOf<DbSchedulerEventReactions<*>>()
     private val channelNames = mutableSetOf<String>()
     private var tasksRead = false
@@ -59,7 +59,7 @@ class DbSchedulerProcessManagerQueues(
         name: String,
         triggerSerializer: EventReactionTriggerSerializer<T>,
         ordered: Boolean,
-    ): ProcessChannel<T> {
+    ): ReactionChannel<T> {
         check(!tasksRead) {
             "Channel $name was asked for after DbSchedulerProcessManagerQueues(${this.name}).tasks was read, so its task " +
                 "would never be registered: register tasks after building the process manager and all its subscribeTo calls"
@@ -86,6 +86,6 @@ class DbSchedulerProcessManagerQueues(
                     channelReactions.sink(bound).publish(id, trigger, ordering, notBefore)
                 }
             }
-        return ProcessChannel(sink, channelReactions.source)
+        return ReactionChannel(sink, channelReactions.source)
     }
 }

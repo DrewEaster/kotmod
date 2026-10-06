@@ -17,6 +17,7 @@ import io.kotmod.contract.PublicEventContract
 import io.kotmod.event.reaction.EventReaction
 import io.kotmod.event.reaction.EventReactionExecutor
 import io.kotmod.event.reaction.EventReactionId
+import io.kotmod.event.reaction.ReactionQueues
 import io.kotmod.event.reaction.ReactionOrdering
 import io.kotmod.event.reaction.stampFor
 import io.kotmod.jdbc.JdbcContext
@@ -62,7 +63,7 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
     eventSerialization: DataSerializationContext<E>,
     private val translate: (PersistedEvent) -> Pair<AggregateId, I>?,
     targets: List<ProcessTarget<I>>,
-    private val queues: ProcessManagerQueues,
+    private val queues: ReactionQueues,
     private val inputOrdering: ReactionOrdering = ReactionOrdering.Unordered,
     getPosition: () -> EventLogPosition,
     savePosition: (EventLogPosition) -> Unit,
@@ -80,7 +81,7 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
         eventSerialization: DataSerializationContext<E>,
         translate: (PersistedEvent) -> Pair<AggregateId, I>?,
         targets: List<ProcessTarget<I>>,
-        queues: ProcessManagerQueues,
+        queues: ReactionQueues,
         inputOrdering: ReactionOrdering = ReactionOrdering.Unordered,
         getPosition: () -> EventLogPosition,
         savePosition: (EventLogPosition) -> Unit,
