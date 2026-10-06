@@ -94,11 +94,11 @@ class UseCaseReactionsIntegrationTest : IntegrationTest() {
             runningReactor(dataSource, jdbc, listOf(fraud), contract = payments) { _, _ ->
                 // The same aggregate id in both contexts: a key that dropped the aggregate type would queue Confirm behind the failing Flag.
                 jdbc.appendPaymentEvent("p-1", "x")
-                jdbc.appendOrderEvent("e-1", "x", 1)
-                eventually { fraud.seen.handled.contains(Confirm("x", 1)) && fraud.seen.failures.size >= 2 }
+                jdbc.appendOrderEvent("e-1", "x", 2)
+                eventually { fraud.seen.handled.contains(Confirm("x", 2)) && fraud.seen.failures.size >= 2 }
             }
 
-            assertEquals(listOf<Work>(Confirm("x", 1)), fraud.seen.handled.toList())
+            assertEquals(listOf<Work>(Confirm("x", 2)), fraud.seen.handled.toList())
             assertEquals(setOf("fraud/e-1/0", "fraud/p-1/0"), fraud.seen.contexts.map { it.reactionId }.toSet())
         }
 
