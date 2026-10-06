@@ -113,7 +113,7 @@ class UseCaseRuntimeTest {
 
     @Test
     fun `running past the timeout is a failure passed to onFailure as ReactionTimeoutException`() =
-        runBlocking {
+        runBlocking<Unit> {
             val useCase =
                 RecordingUseCase(timeout = 50.milliseconds).apply {
                     work = { delay(5.seconds) }

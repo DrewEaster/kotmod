@@ -107,7 +107,7 @@ class EventReactor internal constructor(
      */
     fun start() {
         if (running) return
-        startUseCasesForTest()
+        startUseCases()
         getPosition()
         poller.start()
         running = true
@@ -120,7 +120,9 @@ class EventReactor internal constructor(
         running = false
     }
 
-    internal fun startUseCasesForTest() {
+    internal fun startUseCasesForTest() = startUseCases()
+
+    private fun startUseCases() {
         started = true
         runtimes.forEach { it.start() }
     }

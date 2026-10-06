@@ -64,11 +64,15 @@ class EventReactorTest {
         ordering: ReactionOrdering = ReactionOrdering.Unordered,
     ) = RecordingUseCase(name = name, ordering = ordering, mapping = { _, m -> trigger(Confirm("${m.aggregateId.value}#${m.sequence}")) })
 
-    /** A queue factory whose sinks fail once when [failNext] is set, as a queue that is down would. */
+    /**
+     * A queue factory whose sinks fail once when [failNext] is set (or, with [failNextOn], only the named channel's sink),
+     * as a queue that is down would.
+     */
     private class FlakyQueues(
         private val delegate: ManualQueues,
     ) : ReactionQueues {
         var failNext = false
+        var failNextOn: String? = null
 
         override fun <T : EventReactionTrigger> channel(
             name: String,
@@ -89,6 +93,10 @@ class EventReactorTest {
                         if (failNext) {
                             failNext = false
                             error("queue unavailable")
+                        }
+                        if (failNextOn == name) {
+                            failNextOn = null
+                            error("queue $name unavailable")
                         }
                         channel.sink.publish(id, trigger, ordering, notBefore)
                     }
@@ -264,6 +272,24 @@ class EventReactorTest {
             assertEquals(EventLogPosition.START, position)
             reactor.tickForTest()
             assertEquals(listOf("confirmations/e-1/0"), queues.pending("confirmations").map { it.id.value })
+        }
+
+    @Test
+    fun `when one use case's queue fails, the event is read again and the other use case's trigger is queued again under the same id`() =
+        runBlocking {
+            val flaky = FlakyQueues(queues)
+            val reactor = reactor(RecordingUseCase(name = "a"), RecordingUseCase(name = "b"), queues = flaky)
+            log.add(orderEvent(OrderPlaced("book")))
+            flaky.failNextOn = "b"
+
+            assertFailsWith<IllegalStateException> { reactor.tickForTest() }
+            assertEquals(listOf("a/e-1/0"), queues.published.map { it.id.value })
+            assertEquals(EventLogPosition.START, position)
+            reactor.tickForTest()
+
+            assertEquals(listOf("a/e-1/0", "a/e-1/0", "b/e-1/0"), queues.published.map { it.id.value })
+            assertEquals(listOf("a/e-1/0"), queues.pending("a").map { it.id.value })
+            assertEquals(log.events.single().position, position)
         }
 
     @Test

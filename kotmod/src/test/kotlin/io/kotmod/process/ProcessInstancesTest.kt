@@ -46,7 +46,7 @@ class ProcessInstancesTest {
 
     @Test
     fun `an ignored input for a process that doesn't exist creates nothing but is recorded`() =
-        runBlocking {
+        runBlocking<Unit> {
             instances().deliver(id, Elapsed, "in-e-1")
 
             assertNull(repository.store[id])

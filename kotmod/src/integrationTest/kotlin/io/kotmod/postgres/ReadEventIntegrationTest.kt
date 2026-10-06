@@ -4,6 +4,7 @@ import io.kotmod.AggregateId
 import io.kotmod.AggregateType
 import io.kotmod.CommandId
 import io.kotmod.EventId
+import io.kotmod.EventLogPosition
 import io.kotmod.EventMetadata
 import io.kotmod.PendingEvent
 import io.kotmod.SerializedEvent
@@ -46,8 +47,10 @@ class ReadEventIntegrationTest : IntegrationTest() {
     fun `an event is read back by its id`() {
         appendOrderPlaced("e-1")
 
-        val event = checkNotNull(PostgresDomainPollingBackend(jdbc).readEvent(EventId("e-1")))
+        val backend = PostgresDomainPollingBackend(jdbc)
+        val event = checkNotNull(backend.readEvent(EventId("e-1")))
 
+        assertEquals(backend.readEventsAfter(EventLogPosition.START, 10).single(), event)
         assertEquals(AggregateId("o-1"), event.metadata.aggregateId)
         assertEquals(OrderPlaced("book"), orderEventSerialization().deserialize(event.serialized))
     }
