@@ -1786,7 +1786,8 @@ compiled; the [quickstart](#4-react-to-events) and the guides show compiled code
 1. **Drain in-flight work first.** Queue names change: each use case's queue is named after the use case, and
    process manager channels become `<process type>-<channel>`. Work queued under 0.2.0's task names would never
    run. Before deploying 0.3.0, stop writing commands and let pending reactions and process manager work finish
-   (or cancel what you no longer need).
+   (or cancel what you no longer need). Any rows left under the old task names are never run, and can be deleted
+   from `scheduled_tasks`.
 2. **`AggregateKind` gains the event type and its serialization.** It is now
    `AggregateKind<C, E, R>` (command, event, rejection), with an `eventSerialization` parameter between the
    command and rejection serializers; use the same serialization you gave your `AggregateManager`.
@@ -1818,6 +1819,13 @@ compiled; the [quickstart](#4-react-to-events) and the guides show compiled code
    ```kotlin
    // 0.2.0
    val executor = EventReactionExecutor(sink, source, createExecutionContext, execute, failureRetryHandler, timeoutRetryHandler, onCompletion)
+   val eventToReactions = { event: PersistedEvent ->
+       if (event.metadata.aggregateType == Orders.type) {
+           listOf(EventReaction(EventReactionId("confirm-${event.metadata.eventId.value}"), SendOrderConfirmation(event.metadata.aggregateId.value)))
+       } else {
+           emptyList()
+       }
+   }
    val outbox = AggregateEventOutbox(backend, executor, eventToReactions, getPosition, savePosition, isLeader)
 
    // 0.3.0
@@ -1836,9 +1844,14 @@ compiled; the [quickstart](#4-react-to-events) and the guides show compiled code
    reactor.start()
    ```
 
-4. **Triggers are plain data.** Drop `: EventReactionTrigger`, the `timeout` field (override the use case's
+   `execute` could return `EventReactionCancelled` to finish without doing anything. A use case's `handle` does
+   that by returning normally; `onCompletion` then sees `ReactionResult.Completed`, not a cancellation.
+
+4. **Triggers are plain data.** In use cases, drop `: EventReactionTrigger`, the `timeout` field (override the use case's
    `timeout`, 60 seconds by default) and your `EventReactionTriggerSerializer` object (pass
-   `triggers = X.serializer()`). A trigger's `notBefore` moves to `trigger(t, notBefore = …)`. Ordering moves from
+   `triggers = X.serializer()`). A custom queue still uses `EventReactionTrigger` and
+   `EventReactionTriggerSerializer`, as part of its sink and source interfaces. A trigger's `notBefore` moves to
+   `trigger(t, notBefore = …)`. Ordering moves from
    the outbox's `ordering` to the use case's `ordering` property (see [Ordered use cases](#ordered-use-cases)).
 5. **Contract subscriptions become `on(contract)`.** Replace `contract.subscribe(executor) { envelope -> … }` with
    a use case whose `init` block calls `on(contract) { event, metadata -> … }`. The event is typed, and `metadata`
@@ -1849,7 +1862,9 @@ compiled; the [quickstart](#4-react-to-events) and the guides show compiled code
    <!-- not-compiled -->
    ```kotlin
    // 0.2.0
-   contract.subscribe(executor) { envelope -> listOf(UpdateStatus(envelope.event.orderId)) }
+   contract.subscribe(executor) { envelope ->
+       listOf(EventReaction(EventReactionId("status-${envelope.metadata.eventId.value}"), UpdateStatus(envelope.event.orderId)))
+   }
 
    // 0.3.0
    class StatusUpdates : Reactions<UpdateStatus>("status-updates", UpdateStatus.serializer()) {
