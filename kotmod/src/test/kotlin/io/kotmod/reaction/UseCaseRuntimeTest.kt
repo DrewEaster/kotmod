@@ -239,6 +239,22 @@ class UseCaseRuntimeTest {
         }
 
     @Test
+    fun `onFailure or onCompletion throwing a CancellationException while running retries the reaction after a backoff`() =
+        runBlocking<Unit> {
+            val rethrowing =
+                RecordingUseCase().apply {
+                    failWith = { _, _ -> java.util.concurrent.CancellationException("declined") }
+                    decide = { _, _, error -> throw error }
+                }
+            runtime(rethrowing).send("r-1", Confirm("o-1"))
+            assertEquals(listOf<ReactionOutcome>(ReactionOutcome.Retry(1.seconds)), queues.deliver("confirmations"))
+
+            val completing = RecordingUseCase(name = "audits").apply { onCompleted = { throw java.util.concurrent.CancellationException("audit") } }
+            runtime(completing).send("r-2", Confirm("o-2"))
+            assertEquals(listOf<ReactionOutcome>(ReactionOutcome.Retry(1.seconds)), queues.deliver("audits"))
+        }
+
+    @Test
     fun `a reaction cancelled by a shutdown goes back to the queue and is not reported as a failure`() =
         runBlocking<Unit> {
             val started = CompletableDeferred<Unit>()

@@ -269,9 +269,8 @@ internal class UseCaseRuntime<T : Any>(
         val decision =
             try {
                 useCase.onFailure(trigger, attempt, error)
-            } catch (e: CancellationException) {
-                throw e
             } catch (e: Throwable) {
+                rethrowIfCancelled(e)
                 log.error("onFailure of use case {} threw for reaction {}; retrying the reaction", useCase.name, id.value, e)
                 return ReactionOutcome.Retry(backoff.calculateBackoff(attempt))
             }
@@ -293,9 +292,8 @@ internal class UseCaseRuntime<T : Any>(
         try {
             useCase.onCompletion(trigger, result)
             ReactionOutcome.Finished(gaveUp = result is ReactionResult.GaveUp)
-        } catch (e: CancellationException) {
-            throw e
         } catch (e: Throwable) {
+            rethrowIfCancelled(e)
             log.error("onCompletion of use case {} threw for reaction {}; retrying the reaction", useCase.name, id.value, e)
             ReactionOutcome.Retry(backoff.calculateBackoff(attempt))
         }
