@@ -29,10 +29,10 @@ import kotlin.time.toKotlinInstant
  * @param E the aggregate's domain event type.
  * @param R the aggregate's rejection type.
  * @param initial decides commands for an aggregate that doesn't exist yet.
- * @param kind names the aggregate type and how its commands and rejections are serialized.
+ * @param kind names the aggregate type and how its commands, events and rejections are serialized.
  */
 class AggregateManager<S : AggregateState<S, C, E, R>, C : Any, E : DomainEvent, R : Any>(
-    internal val kind: AggregateKind<C, R>,
+    internal val kind: AggregateKind<C, E, R>,
     private val repository: Repository<S>,
     private val backend: DomainPersistenceBackend<E>,
     private val initial: InitialState<S, C, E, R>,

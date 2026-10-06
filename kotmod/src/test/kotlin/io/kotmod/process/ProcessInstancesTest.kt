@@ -30,7 +30,7 @@ class ProcessInstancesTest {
     private val repository = StubRepository<Window>()
 
     private fun instances(targetTypes: Set<AggregateType> = setOf(AggregateType("Order"))) =
-        ProcessInstances(type, repository, backend, NoWindow, WindowInput.serializer(), targetTypes)
+        ProcessInstances(type, repository, backend, ProcessEventSerialization(windowEventSerialization()), NoWindow, WindowInput.serializer(), targetTypes)
 
     @Test
     fun `the first input starts the process and records its scheduled input`() =

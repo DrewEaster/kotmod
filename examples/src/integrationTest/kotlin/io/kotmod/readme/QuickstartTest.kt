@@ -22,8 +22,6 @@ import io.kotmod.postgres.PostgresOffsetManager
 import io.kotmod.postgres.StartFrom
 import io.kotmod.postgres.support.IntegrationTest
 import io.kotmod.postgres.support.eventually
-import io.kotmod.serialization.jsonDataSerializationContext
-import io.kotmod.serialization.toEventSerializer
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.BeforeEach
@@ -54,18 +52,11 @@ class QuickstartTest : IntegrationTest() {
 
             val jdbc = DataSourceJdbcContext(dataSource)
 
-            val serialization =
-                jsonDataSerializationContext<OrderEvent> {
-                    +OrderPlaced.serializer().toEventSerializer()
-                    +OrderShipped.serializer().toEventSerializer()
-                    +OrderCancelled.serializer().toEventSerializer()
-                }
-
             val orders =
                 AggregateManager(
                     kind = Orders,
                     repository = OrderRepository(jdbc),
-                    backend = PostgresDomainPersistenceBackend(jdbc, serialization),
+                    backend = PostgresDomainPersistenceBackend(jdbc, Orders.eventSerialization),
                     initial = NoOrder,
                 )
 
@@ -127,7 +118,7 @@ class QuickstartTest : IntegrationTest() {
                             // The event log holds every aggregate type's events; only order events can be read here.
                             emptyList()
                         } else {
-                            when (serialization.deserialize(event.serialized)) {
+                            when (Orders.eventSerialization.deserialize(event.serialized)) {
                                 is OrderPlaced ->
                                     listOf(
                                         EventReaction(

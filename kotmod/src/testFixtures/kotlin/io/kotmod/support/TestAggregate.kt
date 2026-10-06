@@ -7,6 +7,7 @@ import io.kotmod.DomainEvent
 import io.kotmod.InitialState
 import io.kotmod.Outcome
 import io.kotmod.accept
+import io.kotmod.postgres.support.orderEventSerialization
 import io.kotmod.reject
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
@@ -147,8 +148,8 @@ object TestOrderCommandSerializer : KSerializer<OrderCommand> {
     }
 }
 
-fun testOrderKind(type: String = "Order"): AggregateKind<OrderCommand, OrderRejection> =
-    AggregateKind(AggregateType(type), TestOrderCommandSerializer, OrderRejection.serializer())
+fun testOrderKind(type: String = "Order"): AggregateKind<OrderCommand, OrderEvent, OrderRejection> =
+    AggregateKind(AggregateType(type), TestOrderCommandSerializer, orderEventSerialization(), OrderRejection.serializer())
 
 /** The test order kind, shared so requested commands compare equal. */
-val testOrders: AggregateKind<OrderCommand, OrderRejection> = testOrderKind()
+val testOrders: AggregateKind<OrderCommand, OrderEvent, OrderRejection> = testOrderKind()

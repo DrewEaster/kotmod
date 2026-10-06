@@ -133,6 +133,7 @@ internal class ProcessInstances<S : ProcessState<S, I, E>, I : Any, E : DomainEv
     type: AggregateType,
     repository: Repository<S>,
     backend: DomainPersistenceBackend<DomainEvent>,
+    eventSerialization: DataSerializationContext<DomainEvent>,
     initial: ProcessInitialState<S, I, E>,
     inputSerializer: KSerializer<I>,
     targetTypes: Set<AggregateType>,
@@ -140,7 +141,7 @@ internal class ProcessInstances<S : ProcessState<S, I, E>, I : Any, E : DomainEv
     private val decider = ProcessDecider<S, I, E>(inputSerializer, targetTypes)
     private val manager =
         AggregateManager(
-            AggregateKind(type, inputSerializer, Ignored.serializer()),
+            AggregateKind(type, inputSerializer, eventSerialization, Ignored.serializer()),
             HeldRepository(repository, decider),
             backend,
             HeldInitial(initial, decider),

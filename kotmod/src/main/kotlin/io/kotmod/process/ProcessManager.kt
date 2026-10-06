@@ -113,8 +113,8 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
             require(byType.size == targets.size) { "A process manager can have only one target per aggregate type" }
         }
 
-    private val instances = ProcessInstances(type, repository, persistence, initial, inputSerializer, targetsByType.keys)
     private val streamSerialization = ProcessEventSerialization(eventSerialization)
+    private val instances = ProcessInstances(type, repository, persistence, streamSerialization, initial, inputSerializer, targetsByType.keys)
     private val inputTriggers = JsonTriggerSerializer(InputTrigger.serializer())
     private val ordered = inputOrdering != ReactionOrdering.Unordered
 

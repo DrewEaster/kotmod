@@ -14,6 +14,8 @@ import io.kotmod.accept
 import io.kotmod.event.reaction.EventReactionTrigger
 import io.kotmod.jdbc.JdbcContext
 import io.kotmod.reject
+import io.kotmod.serialization.jsonDataSerializationContext
+import io.kotmod.serialization.toEventSerializer
 import io.kotmod.event.reaction.EventReactionTriggerSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -72,9 +74,15 @@ data object OrderAlreadyCancelled : OrderRejection
 @Serializable
 data object CancellationReasonMissing : OrderRejection
 
-object Orders : AggregateKind<OrderCommand, OrderRejection>(
+object Orders : AggregateKind<OrderCommand, OrderEvent, OrderRejection>(
     type = AggregateType("Order"),
     commandSerializer = OrderCommand.serializer(),
+    eventSerialization =
+        jsonDataSerializationContext<OrderEvent> {
+            +OrderPlaced.serializer().toEventSerializer()
+            +OrderShipped.serializer().toEventSerializer()
+            +OrderCancelled.serializer().toEventSerializer()
+        },
     rejectionSerializer = OrderRejection.serializer(),
 )
 

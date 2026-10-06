@@ -243,36 +243,35 @@ data class CancelledOrder(
 
 ### 3. Wire up persistence
 
-First name the aggregate. An `AggregateKind` names the aggregate type and says how its commands and
+First name the aggregate. An `AggregateKind` names the aggregate type and says how its commands, events and
 rejections are serialized:
 
 ```kotlin
-object Orders : AggregateKind<OrderCommand, OrderRejection>(
+object Orders : AggregateKind<OrderCommand, OrderEvent, OrderRejection>(
     type = AggregateType("Order"),
     commandSerializer = OrderCommand.serializer(),
+    eventSerialization =
+        jsonDataSerializationContext<OrderEvent> {
+            +OrderPlaced.serializer().toEventSerializer()
+            +OrderShipped.serializer().toEventSerializer()
+            +OrderCancelled.serializer().toEventSerializer()
+        },
     rejectionSerializer = OrderRejection.serializer(),
 )
 ```
 
 Then, given a `javax.sql.DataSource` for your database (for example from HikariCP), create a `JdbcContext` —
-how kotmod reaches the database and runs transactions — tell kotmod how to serialize your events, and create an
-`AggregateManager` for orders from the kind:
+how kotmod reaches the database and runs transactions — and an `AggregateManager` for orders from the kind. Its
+backend writes events with the kind's serialization:
 
 ```kotlin
 val jdbc = DataSourceJdbcContext(dataSource)
-
-val serialization =
-    jsonDataSerializationContext<OrderEvent> {
-        +OrderPlaced.serializer().toEventSerializer()
-        +OrderShipped.serializer().toEventSerializer()
-        +OrderCancelled.serializer().toEventSerializer()
-    }
 
 val orders =
     AggregateManager(
         kind = Orders,
         repository = OrderRepository(jdbc),
-        backend = PostgresDomainPersistenceBackend(jdbc, serialization),
+        backend = PostgresDomainPersistenceBackend(jdbc, Orders.eventSerialization),
         initial = NoOrder,
     )
 ```
@@ -450,7 +449,7 @@ val outbox =
                 // The event log holds every aggregate type's events; only order events can be read here.
                 emptyList()
             } else {
-                when (serialization.deserialize(event.serialized)) {
+                when (Orders.eventSerialization.deserialize(event.serialized)) {
                     is OrderPlaced ->
                         listOf(
                             EventReaction(
