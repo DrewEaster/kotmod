@@ -4,6 +4,9 @@ import io.kotmod.EventLogPosition
 import io.kotmod.EventMetadata
 import io.kotmod.event.reaction.ReactionOrdering
 import io.kotmod.process.ManualQueues
+import io.kotmod.process.ProcessEventSerialization
+import io.kotmod.support.persistedEvent
+import kotlin.test.assertFails
 import io.kotmod.support.OrderPlaced
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
@@ -101,6 +104,10 @@ class ContractSourceTest {
             assertEquals(listOf("fraud-checks/p-1/mapping", "fraud-checks/p-2/0"), queues.pending("fraud-checks").map { it.id.value })
             repeat(4) { queues.deliver("fraud-checks") }
             assertEquals(listOf<Notice>(Flag("c-2"), Flag("c-1")), fraud.handled.map { it.first })
+            // The re-run publishes what the inline path would have: same id and ordering key.
+            val rerun = queues.published.single { it.id.value == "fraud-checks/p-1/0" }
+            assertEquals("Payment/c-1", rerun.ordering?.key)
+            assertEquals(Flag("c-1"), rerun.notice())
         }
 
     @Test
@@ -112,5 +119,52 @@ class ContractSourceTest {
             } finally {
                 payments.stop()
             }
+        }
+
+    @Test
+    fun `a refused registration changes nothing, so an earlier contract gets no listener and no queue is created`() =
+        runBlocking<Unit> {
+            val other = paymentContract(log, setOf(io.kotmod.AggregateType("Refund")))
+            val twoContracts = RecordingUseCase(name = "two", kind = null).apply {
+                listenTo(payments) { event, _ -> trigger(Flag(event.customerId)) }
+                listenTo(other) { event, _ -> trigger(Flag(event.customerId)) }
+            }
+            other.start()
+            try {
+                val reactor =
+                    EventReactor(queues, log, log::readEvent, { position }, { position = it }, { true }, "reactor", 50.milliseconds, 100) {
+                        Instant.parse("2026-10-06T10:00:00Z")
+                    }
+                assertFailsWith<IllegalStateException> { reactor.register(twoContracts) }
+                log.add(paymentEvent("c-1", eventId = "p-1"))
+                payments.tickForTest()
+                assertTrue(queues.published.isEmpty())
+                assertTrue(queues.channels.isEmpty())
+            } finally {
+                other.stop()
+            }
+        }
+
+    @Test
+    fun `a conversion failure inside the contract stops its reader and parks nothing in the use case`() =
+        runBlocking<Unit> {
+            reactor(fraudChecks())
+            log.add(paymentEvent("c-1", eventId = "p-1").let { it.copy(serialized = it.serialized.copy(payload = "garbage")) })
+
+            assertFails { payments.tickForTest() }
+
+            assertTrue(queues.published.isEmpty())
+        }
+
+    @Test
+    fun `a process manager envelope never reaches a contract block`() =
+        runBlocking<Unit> {
+            var called = false
+            reactor(fraudChecks { _, _ -> called = true })
+            log.add(persistedEvent(globalOffset = 1, aggregateType = "Payment", eventType = ProcessEventSerialization.COMMAND_REQUESTED))
+
+            payments.tickForTest()
+
+            assertTrue(!called && queues.published.isEmpty())
         }
 }

@@ -77,6 +77,9 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
     private val log = LoggerFactory.getLogger(PublicEventContract::class.java)
     private val subscriptions = mutableListOf<Subscription<*, E>>()
     private var started = false
+    /** Throws if this contract has started, so a use case can check every contract before attaching to any. */
+    internal fun ensureCanListen() = check(!started) { "A use case must be registered before the contract it listens to starts" }
+
     private val listeners = mutableListOf<suspend (PublicEventEnvelope<E>) -> Unit>()
 
     /**
@@ -84,7 +87,7 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
      * subscriptions. Must be called before [start].
      */
     internal fun listen(listener: suspend (PublicEventEnvelope<E>) -> Unit) {
-        check(!started) { "A use case must be registered before the contract it listens to starts" }
+        ensureCanListen()
         listeners += listener
     }
 
@@ -154,6 +157,7 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
         for (subscription in subscriptions) {
             ordinal = subscription.fanOut(publicEnvelope, envelope.position, ordinal, log)
         }
+        // A listener's publish failure makes the poller read the whole event again; safe, as trigger ids are deterministic.
         for (listener in listeners) listener(publicEnvelope)
     }
 }

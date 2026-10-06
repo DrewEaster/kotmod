@@ -91,13 +91,18 @@ class EventReactor internal constructor(
     /**
      * Registers [useCase]: it gets its own queue, named after it, and its `on(contract)` sources start listening to their
      * contracts. Must be called before [start], before reading the queues' tasks, and before those contracts start.
+     * Each such contract must read the same event log (database) as this reactor, because a parked mapping re-reads its
+     * event through the reactor, and a contract that is never started delivers nothing to its use cases.
      */
     fun <T : Any> register(useCase: Reactions<T>) {
         check(!started) { "Use case ${useCase.name} was registered after reactor $name started: register every use case before start()" }
         require(runtimes.none { it.useCase.name == useCase.name }) { "Reactor $name already has a use case named ${useCase.name}" }
         check(!useCase.registered) { "Use case ${useCase.name} is already registered with a reactor" }
+        // Check every contract first, so a refused registration attaches nothing and creates no queue.
+        val contractSources = useCase.sources.filterIsInstance<ContractSource<T, *>>()
+        contractSources.forEach { it.ensureCanFeed() }
         val runtime = UseCaseRuntime(useCase, queues, readEvent, clock)
-        useCase.sources.forEach { if (it is ContractSource<T, *>) it.feed(runtime) }
+        contractSources.forEach { it.feed(runtime) }
         runtimes += runtime
         useCase.registered = true
     }

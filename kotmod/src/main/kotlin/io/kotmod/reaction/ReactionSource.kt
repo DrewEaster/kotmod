@@ -55,6 +55,9 @@ internal class ContractSource<T : Any, P : PublicDomainEvent>(
 
     override fun map(event: PersistedEvent): List<ProducedTrigger<T>> = contract.toPublic(event)?.let(::mapPublic) ?: emptyList()
 
+    /** Throws if the contract has already started, so it can no longer feed a use case. */
+    fun ensureCanFeed() = contract.ensureCanListen()
+
     /** Has the contract's reader map each of its public events with this source and queue the result on [runtime]. */
     fun feed(runtime: UseCaseRuntime<T>) {
         contract.listen { envelope -> runtime.mapAndPublish(envelope.metadata, this) { mapPublic(envelope) } }

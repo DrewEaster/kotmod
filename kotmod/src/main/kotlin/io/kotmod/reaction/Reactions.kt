@@ -64,7 +64,13 @@ abstract class Reactions<T : Any>(
         declare(KindSource(kind, block))
     }
 
-    /** Reacts to another context's public events, published by [contract]. Call it from `init`. */
+    /**
+     * Reacts to another context's public events, published by [contract]. Call it from `init`.
+     *
+     * The contract's own reader feeds this use case, so the contract must be started (after the use case is registered)
+     * or nothing is delivered. It must read the same event log (database) as the reactor: a parked mapping re-reads its
+     * event through the reactor, and an event missing there would be retried forever.
+     */
     protected fun <P : PublicDomainEvent> on(
         contract: PublicEventContract<*, P>,
         block: TriggerScope<T>.(event: P, metadata: EventMetadata) -> Unit,
