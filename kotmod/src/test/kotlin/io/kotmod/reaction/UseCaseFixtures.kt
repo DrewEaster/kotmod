@@ -14,11 +14,13 @@ import io.kotmod.SerializedEvent
 import io.kotmod.contract.PublicEventContract
 import io.kotmod.event.reaction.ReactionOrdering
 import io.kotmod.postgres.support.orderEventSerialization
+import io.kotmod.process.ManualQueues
 import io.kotmod.support.OrderEvent
 import io.kotmod.support.OrderPlaced
 import io.kotmod.support.persistedEvent
 import io.kotmod.support.testOrders
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 
@@ -183,3 +185,6 @@ internal class RecordingUseCase(
         onCompleted(result)
     }
 }
+
+/** The trigger a queued item carries, read back as a [Notice]. */
+internal fun ManualQueues.Published.notice(): Notice = Json.decodeFromString(Notice.serializer(), (trigger as TriggerItem).trigger)
