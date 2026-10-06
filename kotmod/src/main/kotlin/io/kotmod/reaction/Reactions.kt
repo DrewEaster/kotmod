@@ -50,7 +50,10 @@ abstract class Reactions<T : Any>(
     /** Whether an aggregate's work runs one at a time in event order ([ReactionOrdering.PerAggregate]); unordered by default. */
     open val ordering: ReactionOrdering = ReactionOrdering.Unordered
 
-    /** How long one attempt at [handle] may run; longer is a failure. */
+    /**
+     * How long one attempt at [handle] may run; longer is a failure, reported to [onFailure] as a [ReactionTimeoutException].
+     * A `TimeoutCancellationException` escaping [handle] from the app's own inner `withTimeout` is reported the same way.
+     */
     open val timeout: Duration = 60.seconds
 
     /** Reacts to [kind]'s events, typed with its event serialization. Call it from `init`. */

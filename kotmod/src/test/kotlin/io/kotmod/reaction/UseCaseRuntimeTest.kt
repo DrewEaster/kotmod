@@ -14,6 +14,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.milliseconds
@@ -105,12 +106,8 @@ class UseCaseRuntimeTest {
             val outcomes = queues.deliver("confirmations") + queues.deliver("confirmations")
 
             assertEquals(listOf<ReactionOutcome>(ReactionOutcome.Retry(1.seconds), ReactionOutcome.Finished(gaveUp = true)), outcomes)
-            // kotlinx.coroutines stack-trace recovery (on under -ea) may hand back a copy of the exception, so compare by type and message.
-            val (notice, result) = useCase.completions.single()
-            assertEquals(Confirm("o-1"), notice)
-            val error = assertIs<ReactionResult.GaveUp>(result).error
-            assertIs<RuntimeException>(error)
-            assertEquals(boom.message, error.message)
+            assertEquals(listOf<Pair<Notice, ReactionResult>>(Confirm("o-1") to ReactionResult.GaveUp(boom)), useCase.completions)
+            assertSame(boom, useCase.failures.first().second)
             assertTrue(queues.pending("confirmations").isEmpty())
         }
 

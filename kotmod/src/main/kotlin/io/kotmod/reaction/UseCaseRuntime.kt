@@ -96,17 +96,23 @@ internal class UseCaseRuntime<T : Any>(
         trigger: T,
         attempt: Int,
     ): ReactionOutcome {
+        // handle's exception is caught inside withTimeout and carried out as a value, so only a genuine timeout or
+        // cancellation crosses the timeout boundary (which keeps the app's exception from being copied by stack-trace recovery).
         val error: Throwable? =
             try {
-                withTimeout(useCase.timeout) { useCase.handle(trigger, ReactionContext(id.value, attempt)) }
-                null
+                withTimeout(useCase.timeout) {
+                    try {
+                        useCase.handle(trigger, ReactionContext(id.value, attempt))
+                        null
+                    } catch (e: CancellationException) {
+                        // Not a failure: the attempt was interrupted (e.g. the scheduler is stopping); the queue redelivers it.
+                        throw e
+                    } catch (e: Throwable) {
+                        e
+                    }
+                }
             } catch (e: TimeoutCancellationException) {
                 ReactionTimeoutException(useCase.timeout)
-            } catch (e: CancellationException) {
-                // Not a failure: the attempt was interrupted (e.g. the scheduler is stopping); the queue redelivers it.
-                throw e
-            } catch (e: Throwable) {
-                e
             }
         if (error == null) return finish(id, trigger, ReactionResult.Completed, attempt)
         log.error("Reaction {} of use case {} failed [attempt={}]", id.value, useCase.name, attempt, error)
