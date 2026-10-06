@@ -16,11 +16,12 @@ in**, so those events reliably drive follow-up work in your own service and in o
   - [Event-only aggregates](#event-only-aggregates)
   - [Event serialization and schema migrations](#event-serialization-and-schema-migrations)
   - [Postgres setup](#postgres-setup)
-  - [The outbox and event reactions](#the-outbox-and-event-reactions)
-  - [Durable reactions with db-scheduler](#durable-reactions-with-db-scheduler)
-  - [Ordered reactions](#ordered-reactions)
+  - [Use cases](#use-cases)
+  - [Running use cases on db-scheduler](#running-use-cases-on-db-scheduler)
+  - [Ordered use cases](#ordered-use-cases)
   - [Using another queue (e.g. Google Pub/Sub)](#using-another-queue-eg-google-pubsub)
   - [Publishing events to other contexts](#publishing-events-to-other-contexts)
+  - [Consuming another context's events](#consuming-another-contexts-events)
   - [Process managers](#process-managers)
 - [Running in production](#running-in-production)
 - [Known limitations](#known-limitations)
@@ -36,13 +37,13 @@ atomically: if the message fails after the commit (or the commit fails after the
 disagree. This is the *dual-write problem*.
 
 kotmod writes an aggregate's new state, its events and the command that caused them in **one database
-transaction**. An outbox then reads those events in order and turns them into *event reactions* — durable,
-retried units of work — or publishes them to other bounded contexts.
+transaction**. A reactor then reads those events in order and runs your *use cases* on them — durable, retried
+follow-up work, written as plain application code — and contracts publish them to other bounded contexts.
 
-Reactions run on whatever queue you choose. kotmod ships one built on
+Use cases run on whatever queue you choose. kotmod ships one built on
 [db-scheduler](https://github.com/kagkarlsson/db-scheduler), which needs nothing but the Postgres database
-you already have, and you can plug in another, such as Google Pub/Sub, by implementing two small
-interfaces (see [Using another queue](#using-another-queue-eg-google-pubsub)).
+you already have, and you can plug in another, such as Google Pub/Sub, by implementing one small factory and
+two small interfaces (see [Using another queue](#using-another-queue-eg-google-pubsub)).
 
 kotmod is not an event store, not a message broker and not a framework: it is a library you wire into
 your own application, on the Postgres database you already have.
@@ -76,26 +77,24 @@ Requirements:
 
 kotmod is split into modules:
 
-- `kotmod` — aggregates, events, the outbox and Postgres support, on plain JDBC with no other database
-  library. This is the only module you need.
-- `kotmod-db-scheduler` — optional. A ready-made queue for event reactions on
+- `kotmod` — aggregates, events, use cases, process managers and Postgres support, on plain JDBC with no other
+  database library. This is the only module you need.
+- `kotmod-db-scheduler` — optional. A ready-made queue for use cases and process managers on
   [db-scheduler](https://github.com/kagkarlsson/db-scheduler) 16.12.0, which it brings in. Leave it out if
-  you run reactions on another queue, such as Google Pub/Sub
+  you run them on another queue, such as Google Pub/Sub
   (see [Using another queue](#using-another-queue-eg-google-pubsub)).
 - `kotmod-sqldelight` — optional. Shares kotmod's transactions with SQLDelight.
 
 ## Quickstart
 
 This walks through a tiny orders domain: you place an order, ship it, and send a confirmation email
-whenever an order is placed. It uses kotmod's Postgres backends and runs event reactions on
-db-scheduler, kotmod's ready-made queue; you could swap in another queue without changing the rest.
+whenever an order is placed. It uses kotmod's Postgres backends and runs follow-up work on db-scheduler,
+kotmod's ready-made queue; you could swap in another queue without changing the rest.
 
 Snippets leave out imports. The complete, compiled code is in
 [`Quickstart.kt`](examples/src/integrationTest/kotlin/io/kotmod/readme/Quickstart.kt) and
-[`QuickstartTest.kt`](examples/src/integrationTest/kotlin/io/kotmod/readme/QuickstartTest.kt). Two names to
-watch: `Duration` is `kotlin.time.Duration`, and `EventReactionFailed` and `EventReactionCancelled` exist
-in both `EventReactionExecutionResult` and `EventReactionCompletionResult`, so use the qualified forms
-shown.
+[`QuickstartTest.kt`](examples/src/integrationTest/kotlin/io/kotmod/readme/QuickstartTest.kt). `Retry` and
+`GiveUp` come from `io.kotmod.reaction`.
 
 ### 1. Create the tables
 
@@ -112,7 +111,7 @@ CREATE TABLE IF NOT EXISTS orders (
 
 kotmod needs its own tables too. Copy the statements in `DddSchema.ddl` (in `io.kotmod.postgres`) into
 your migrations; they create the event log, aggregate bookkeeping, handled-command history and consumer
-offsets. Event reactions run on db-scheduler, which needs its `scheduled_tasks` table: create it from
+offsets. Use cases run on db-scheduler, which needs its `scheduled_tasks` table: create it from
 db-scheduler's
 [`postgresql_tables.sql`](https://github.com/kagkarlsson/db-scheduler/blob/v16.12.0/db-scheduler/src/test/resources/postgresql_tables.sql).
 
@@ -329,7 +328,110 @@ class OrderRepository(
 }
 ```
 
-### 4. Run commands
+### 4. React to events
+
+Follow-up work, such as sending an email when an order is placed, is a **use case**. It says which events it
+reacts to, what work they trigger, and how that work is done. A **trigger** is stored until its work runs, so it
+must be serializable:
+
+```kotlin
+@Serializable
+sealed interface OrderNotification
+
+@Serializable
+data class SendOrderConfirmation(
+    val orderId: String,
+) : OrderNotification
+
+@Serializable
+data class SendReviewReminder(
+    val orderId: String,
+) : OrderNotification
+
+class OrderNotifications(
+    private val confirm: (orderId: String) -> Unit,
+) : Reactions<OrderNotification>(
+        name = "order-notifications",
+        triggers = OrderNotification.serializer(),
+    ) {
+    init {
+        on(Orders) { event, metadata ->
+            when (event) {
+                is OrderPlaced -> trigger(SendOrderConfirmation(metadata.aggregateId.value))
+                is OrderShipped, is OrderCancelled -> Unit
+            }
+        }
+    }
+
+    override suspend fun handle(
+        trigger: OrderNotification,
+        context: ReactionContext,
+    ) = when (trigger) {
+        is SendOrderConfirmation -> confirm(trigger.orderId)
+        is SendReviewReminder -> println("Asking for a review of order ${trigger.orderId}")
+    }
+
+    override fun onFailure(
+        trigger: OrderNotification,
+        attempt: Int,
+        error: Throwable,
+    ): FailureDecision = if (attempt < 5) Retry(backoff(attempt)) else GiveUp
+
+    override suspend fun onCompletion(
+        trigger: OrderNotification,
+        result: ReactionResult,
+    ) {
+        println("$trigger finished: $result")
+    }
+}
+
+fun sendConfirmation(orderId: String) {
+    println("Sending confirmation for order $orderId")
+}
+```
+
+- `on(Orders) { event, metadata -> … }` reacts to order events, typed: `Orders` carries their serialization. The
+  event log holds every aggregate type's events; this use case only sees orders.
+- `trigger(...)` queues work. kotmod builds its id from the use case, the event and the trigger's position, so
+  if the same event is read again while its work is pending, it is recognised as the same work.
+- `handle` does the work. Returning means done. Throwing, or running past the use case's `timeout` (60 seconds
+  by default), is a failure, and `onFailure` decides: `Retry(delay)` or `GiveUp`. By default it retries with
+  `backoff(attempt)` (1s, 2s, 4s… up to 10 minutes) and never gives up.
+- `onCompletion` is told how the work ended: `ReactionResult.Completed` or `ReactionResult.GaveUp(error)`.
+
+The **reactor** runs a context's use cases. It reads the event log once, hands each event to every use case
+that listens to it, and queues their triggers. They run on db-scheduler: `DbSchedulerQueues` gives each use case
+its own db-scheduler task, which you register with your `Scheduler`. db-scheduler polls for due work every 10
+seconds by default; `enableImmediateExecution()` runs new work straight away:
+
+```kotlin
+val queues = DbSchedulerQueues(jdbc)
+
+val reactor = EventReactor(jdbc, queues, isLeader = { true })
+reactor.register(OrderNotifications(::sendConfirmation))
+
+val scheduler =
+    Scheduler
+        .create(dataSource, *queues.tasks.toTypedArray())
+        .threads(4)
+        .enableImmediateExecution()
+        .build()
+queues.bind(scheduler)
+```
+
+Register every use case before reading `queues.tasks`. Then start the reactor, then the scheduler:
+
+```kotlin
+reactor.start()
+scheduler.start()
+```
+
+A new reactor starts at the head of the event log: it sees events written after it first starts, not history.
+Start it when your application starts, before it handles commands. To shut down, stop the scheduler, then the
+reactor: `scheduler.stop()`, then `reactor.stop()`. The quickstart passes `isLeader = { true }` because it runs
+on one node; see [Running in production](#running-in-production) for leader election across several.
+
+### 5. Run commands
 
 Send the commands from step 2 through the aggregate manager. `handle` is a `suspend` function, and it
 returns either `CommandResult.Accepted` with the new state or `CommandResult.Rejected` with one of your
@@ -346,139 +448,8 @@ val result = orders.handle(orderId, ShipOrder)
 An accepted command saves the order's state, appends its events to the event log and records the command,
 all in one transaction. A rejected command changes nothing, but its rejection is recorded too.
 
-### 5. React to events
-
-An **event reaction** is follow-up work triggered by an event, such as sending an email. Its input is a
-**trigger**, which is stored until the reaction runs, so it must be serializable too:
-
-```kotlin
-@Serializable
-sealed interface OrderNotification : EventReactionTrigger
-
-@Serializable
-data class SendOrderConfirmation(
-    val orderId: String,
-    override val timeout: Duration? = null,
-) : OrderNotification
-
-@Serializable
-data class SendReviewReminder(
-    val orderId: String,
-    override val timeout: Duration? = null,
-) : OrderNotification
-
-object OrderNotificationSerializer : EventReactionTriggerSerializer<OrderNotification> {
-    override suspend fun serialize(trigger: OrderNotification): String = Json.encodeToString(OrderNotification.serializer(), trigger)
-
-    override suspend fun deserialize(serializedTrigger: String): OrderNotification =
-        Json.decodeFromString(OrderNotification.serializer(), serializedTrigger)
-}
-
-fun sendConfirmation(orderId: String) {
-    println("Sending confirmation for order $orderId")
-}
-```
-
-Reactions are stored and scheduled by db-scheduler. Create a `DbSchedulerEventReactions` for this kind of
-reaction and register its task with your db-scheduler `Scheduler`. db-scheduler polls for due work every
-10 seconds by default; `enableImmediateExecution()` runs newly dispatched reactions straight away:
-
-```kotlin
-val notifications = DbSchedulerEventReactions("order-notifications", OrderNotificationSerializer)
-
-val scheduler =
-    Scheduler
-        .create(dataSource, notifications.task)
-        .threads(4)
-        .enableImmediateExecution()
-        .build()
-```
-
-An `EventReactionExecutor` runs each reaction and decides what happens when it fails, times out or
-completes:
-
-```kotlin
-val executor =
-    EventReactionExecutor<OrderNotification, Unit>(
-        sink = notifications.sink(scheduler),
-        source = notifications.source,
-        createExecutionContext = { _, _ -> },
-        execute = { _, _, trigger, _, _ ->
-            when (trigger) {
-                is SendOrderConfirmation -> sendConfirmation(trigger.orderId)
-                is SendReviewReminder -> println("Asking for a review of order ${trigger.orderId}")
-            }
-            EventReactionExecutionResult.EventReactionExecutionCompleted
-        },
-        failureRetryHandler = { _, _, _, retryCount, _, ex ->
-            if (retryCount < 5) {
-                RetrySignal.Retry(BackoffStrategy().calculateBackoff(retryCount))
-            } else {
-                RetrySignal.DoNotRetry(
-                    EventReactionCompletionResult.EventReactionFailed(ex.message ?: "failed", allowManualRetry = true),
-                )
-            }
-        },
-        timeoutRetryHandler = { _, _, _, retryCount, _ ->
-            RetrySignal.Retry(BackoffStrategy().calculateBackoff(retryCount))
-        },
-        onCompletion = { id, _, _, _, _, result ->
-            println("Reaction ${id.value} finished: $result")
-        },
-    )
-```
-
-Finally, the `AggregateEventOutbox` reads the event log and turns each `OrderPlaced` into a confirmation
-reaction. The event log holds the events of *every* aggregate type, so the outbox skips anything that
-isn't an order before deserializing — an event it can't deserialize would stop it in its tracks. The
-reaction id is built from the event id, so if the same event is dispatched again while its reaction is
-still pending, it is recognised as the same reaction. `PostgresOffsetManager` remembers how far the
-outbox has read. A new consumer starts at the end of the log and only sees events written after it first
-reads its position; the quickstart asks for `StartFrom.Beginning` so its outbox also handles the order
-placed in step 4:
-
-```kotlin
-val offsets = PostgresOffsetManager(jdbc)
-
-val outbox =
-    AggregateEventOutbox<OrderNotification>(
-        backend = PostgresDomainPollingBackend(jdbc),
-        executor = executor,
-        eventToReactions = { event ->
-            if (event.metadata.aggregateType != Orders.type) {
-                // The event log holds every aggregate type's events; only order events can be read here.
-                emptyList()
-            } else {
-                when (Orders.eventSerialization.deserialize(event.serialized)) {
-                    is OrderPlaced ->
-                        listOf(
-                            EventReaction(
-                                id = EventReactionId("confirmation-${event.metadata.eventId.value}"),
-                                trigger = SendOrderConfirmation(orderId = event.metadata.aggregateId.value),
-                            ),
-                        )
-                    else -> emptyList()
-                }
-            }
-        },
-        getPosition = { offsets.getPosition("order-notifications", startFrom = StartFrom.Beginning) },
-        savePosition = { offsets.savePosition("order-notifications", it) },
-        isLeader = { true },
-    )
-```
-
-Start the executor before the scheduler, then the outbox:
-
-```kotlin
-executor.start()
-scheduler.start()
-outbox.start()
-```
-
-Within a moment you'll see `Sending confirmation for order order-1`. Only the `OrderPlaced` event
-produced a reaction; `OrderShipped` was read and skipped. To shut down, stop in the reverse order:
-`outbox.stop()`, then `scheduler.stop()`, then `executor.stop()`. The quickstart passes `isLeader = { true }` because it runs on one node; see
-[Running in production](#running-in-production) for leader election across several.
+Within a moment you'll see `Sending confirmation for order order-1`. Only `OrderPlaced` triggered work;
+`OrderShipped` was read and ignored.
 
 ## Core concepts
 
@@ -487,11 +458,11 @@ flowchart LR
     C[Command] --> AM[AggregateManager]
     AM -->|one transaction| S[(State in your tables)]
     AM -->|one transaction| E[(Events in ddd_domain_event)]
-    E --> O[AggregateEventOutbox]
-    O --> X[EventReactionExecutor]
-    X <--> D[(Your queue: db-scheduler, Pub/Sub, …)]
+    E --> R[EventReactor]
+    R --> U[Use cases]
+    U <--> D[(Your queue: db-scheduler, Pub/Sub, …)]
     E --> P[PublicEventContract]
-    P --> SUB[Subscribers in other contexts]
+    P --> UO[Use cases in other contexts]
 ```
 
 - **Aggregate** — a cluster of domain state changed only through commands, identified by an
@@ -501,11 +472,13 @@ flowchart LR
 - **Rejection** — why an aggregate refused a command, as one of your own types. Rejections are recorded,
   so a repeated command id gets the same answer.
 - **Domain event** — a fact recorded in the event log in the same transaction as the state change.
-- **Event reaction** — durable, retried follow-up work triggered by a domain event.
-- **Trigger** — the stored input of an event reaction.
-- **Sink and source** — the two interfaces a queue implements so an `EventReactionExecutor` can use it:
-  the sink accepts dispatched reactions and the source delivers them back for execution. kotmod ships
-  an implementation on db-scheduler; any other queue works too.
+- **Use case** — follow-up work written as application code: which events it reacts to, the triggers they
+  produce, and how each trigger is handled, with its own retries, timeout and ordering.
+- **Trigger** — the stored input of one piece of a use case's work, as serializable data.
+- **Reactor** — reads a context's event log once and queues every use case's triggers, each use case on its
+  own queue.
+- **Queue** — where triggers wait until they run. kotmod ships one on db-scheduler; anything that implements
+  `ReactionQueues` works.
 - **Public event** — a stable event published to other bounded contexts, mapped from internal domain
   events.
 - **Process manager** — a long-running workflow that reacts to events, keeps its own state, and asks for
@@ -525,7 +498,7 @@ Every command runs in three phases:
    else happens. Otherwise the aggregate's version and state are loaded.
 2. **Decide** — the aggregate's current state (or the initial state, if the aggregate doesn't exist yet)
    decides the command. kotmod does no database work while it runs, so keep side effects out of it; put
-   them in event reactions instead.
+   them in a [use case](#use-cases) instead.
 3. **Write** — in one transaction, the aggregate's version is advanced, your repository saves the new
    state, the events are appended and the command is recorded as handled. A rejected command writes only
    the rejection record.
@@ -559,12 +532,12 @@ suspend fun cancelOrder(
     }
 ```
 
-**Why commands are data.** Every caller, whether an HTTP handler, an event reaction or, later, a process
+**Why commands are data.** Every caller, whether an HTTP handler, a use case or, later, a process
 manager, runs a command the same way: through `AggregateManager.handle`. The rules for which state accepts a
 command and how it is refused live in the states themselves, not in each caller.
 
 **Event sequence numbers.** Every event carries `event.metadata.sequence`: its number within its
-aggregate, counting 1, 2, 3… with no gaps. Reactions and public contracts can use it to tell which of an
+aggregate, counting 1, 2, 3… with no gaps. Use cases and public contracts can use it to tell which of an
 aggregate's events came first.
 
 **Idempotency.** Pass a `CommandId` you control — a request id, a message id. A repeated id returns the
@@ -588,7 +561,7 @@ state independently of the events.
 **This is permitted, but not recommended.** In domain-driven design an aggregate is the boundary of
 consistency: each command changes one aggregate in its own transaction. When a change to one aggregate
 should lead to a change in another, the usual design is to react to the first aggregate's event and run
-the second command asynchronously, with an [event reaction](#the-outbox-and-event-reactions). That keeps
+the second command asynchronously, with a [use case](#use-cases). That keeps
 aggregates independent, keeps transactions short and small, and lets each aggregate be changed without
 locking the others.
 
@@ -688,8 +661,8 @@ suspend fun recordView(
 
 `emit` creates the aggregate's bookkeeping the first time it is called for an id. Command ids and
 optimistic concurrency work exactly as they do for `AggregateManager`. Its events go into the same event
-log as everything else, so an outbox that deserializes with your order serialization must skip them by
-aggregate type, as the quickstart's outbox does.
+log as everything else; a use case only receives the aggregate types it listens to with `on(...)`, so they
+never reach one that doesn't ask for them.
 
 ### Event serialization and schema migrations
 
@@ -733,7 +706,7 @@ kotmod's Postgres classes use plain JDBC through a `JdbcContext`. For a plain `D
 | `ddd_aggregate_root` | Each aggregate's version, sequence counter and timestamps, and whether it has events out of order in the log |
 | `ddd_domain_event` | The event log, ordered by `(transaction_id, global_offset)`, with each event's `aggregate_sequence` |
 | `ddd_command_history` | Which commands each aggregate has handled |
-| `ddd_consumer_offset` | How far each outbox or contract has read (a transaction id and offset) |
+| `ddd_consumer_offset` | How far the reactor, each contract and each process manager has read (a transaction id and offset) |
 
 db-scheduler's `scheduled_tasks` table belongs to your application; create it from db-scheduler's
 [`postgresql_tables.sql`](https://github.com/kagkarlsson/db-scheduler/blob/v16.12.0/db-scheduler/src/test/resources/postgresql_tables.sql).
@@ -742,16 +715,17 @@ db-scheduler's `scheduled_tasks` table belongs to your application; create it fr
 runs in a transaction opened by its backend's `JdbcContext`; `jdbc.inTransaction { }` and
 `jdbc.withConnection { }` let your own code join it, and `jdbc.transaction { }` spans several commands.
 
-**Reading events.** `PostgresDomainPollingBackend` reads the event log for the outbox and public
-contracts. `PostgresOffsetManager` stores how far each of them has read; give every poller its own
-consumer name.
+**Reading events.** `PostgresDomainPollingBackend` reads the event log for the reactor, public contracts and
+process managers. `PostgresOffsetManager` stores how far each has read. The reactor saves its position under its
+`name` (`reactor` by default); give every other poller its own consumer name.
 
 **Starting positions.** A consumer with no saved position starts from the head of the event log as of its first
-read of its position (its first poll as leader), not when it is constructed, so deploying a new outbox,
+read of its position (its first poll as leader), not when it is constructed, so deploying a new reactor,
 contract or process manager does not replay history. It may also see a few events committed just before, while
 an older transaction was still open, but never history from before that. Pass `startFrom = StartFrom.Beginning`
-to `getPosition` for a consumer that must see history, such as a new projection. An existing consumer keeps its
-saved position; to reset one deliberately, save a position yourself with `savePosition`.
+to `getPosition` for a contract or process manager that must see history. An existing consumer keeps its saved
+position; to reset one deliberately, save a position yourself with `savePosition`. The reactor reads its position
+when it starts, so a new one sees every event committed after `start()` returns.
 
 #### Using SQLDelight
 
@@ -768,289 +742,324 @@ kotmod's writes share one transaction whichever side opens it:
 
 Repositories implemented with SQLDelight queries need no changes: they already run inside the transaction.
 
-### The outbox and event reactions
+### Use cases
 
-`AggregateEventOutbox` is the outbox: while running it reads events after its saved position, maps each
-one to event reactions with `eventToReactions`, dispatches them to an `EventReactionExecutor`, and saves
-the position after each event. If dispatching fails, the batch stops and the next poll starts again from
-the last saved position, so no event is skipped — including events committed late by slower, concurrent
-transactions.
+A use case is a class that extends `Reactions<T>`, where `T` is its trigger type (plain `@Serializable` data).
+It owns the whole reaction, like `OrderNotifications` in [the quickstart](#4-react-to-events):
 
-`EventReactionExecutor` runs each reaction:
+- **Sources.** In its `init` block, `on(kind) { event, metadata -> … }` reacts to one of this context's
+  aggregate kinds, with the events typed (`AggregateKind` carries their serialization).
+  `on(contract) { event, metadata -> … }` reacts to another context's public events (see
+  [Consuming another context's events](#consuming-another-contexts-events)). One source is the common case;
+  several are allowed, as long as each aggregate type reaches the use case through only one of them. A use case
+  never sees events of types it doesn't listen to.
+- **Triggers.** Inside the block, `trigger(t)` queues work and `trigger(t, notBefore = instant)` delays it. The
+  block only decides what to do. Keep it free of I/O and deterministic: the same event must always produce the
+  same triggers, in the same order, because their ids are numbered by position.
+- **Handling.** `handle(trigger, context)` does the work. `context.reactionId` is the same on every retry and
+  redelivery (`<useCase>/<eventId>/<n>`), so pass it as the idempotency key of external calls; `context.attempt`
+  counts retries from 0.
+- **Failures.** `onFailure(trigger, attempt, error)` returns `Retry(delay)` or `GiveUp`. By default it retries
+  with `backoff(attempt)` (1s, 2s, 4s… up to 10 minutes) and never gives up. Running past `timeout` (60 seconds
+  by default) is a failure too, passed as a `ReactionTimeoutException`. If `onFailure` throws, the work is
+  retried after a backoff.
+- **Completion.** `onCompletion(trigger, result)` hears `ReactionResult.Completed` or
+  `ReactionResult.GaveUp(error)`; it does nothing by default. If it throws, the work is retried after a backoff,
+  so `handle` may run again.
+- **Name.** `name` names the use case's queue, so keep it stable across releases, and unique in the context.
 
-- `execute` does the work and reports an `EventReactionExecutionResult`.
-- `failureRetryHandler` and `timeoutRetryHandler` decide what happens after a failure or a timeout.
-- `onCompletion` is told how the reaction finally ended.
-- `createExecutionContext` builds per-attempt context for your handlers (use `Unit` if you need none).
-- `defaultTimeout` (60 seconds) applies when a trigger has no `timeout` of its own.
-- `defaultBackoffStrategy` sets the delay when one of your handlers throws.
+Each use case has its own queue, so its ordering, timeout and failure policy are its own, and a slow or failing
+use case never holds up another. Delivery is at least once: make `handle` idempotent.
 
-| `execute` reports | What happens next | `onCompletion` receives |
-|---|---|---|
-| `EventReactionExecutionCompleted` | Done | `EventReactionCompleted` |
-| `EventReactionCancelled` | Done, not retried | `EventReactionCancelled` |
-| `EventReactionFailed` (or throws) | `failureRetryHandler` returns `Retry(delay)` or `DoNotRetry(result)` | `result`, if not retried |
-| `EventReactionTimedOut` | `timeoutRetryHandler` returns `Retry(delay)` or `DoNotRetry(result)` | `result`, if not retried |
+#### Delayed triggers
 
-`BackoffStrategy` gives exponential delays — 1s, 2s, 4s… up to a cap (10 minutes by default) — and is
-handy in your retry handlers, as the quickstart shows.
-
-The executor works with any queue: it dispatches through an `EventReactionTriggerSink` and receives
-reactions from an `EventReactionTriggerSource`. kotmod ships a durable implementation on db-scheduler
-(next section); to use something else, implement the two interfaces yourself
-(see [Using another queue](#using-another-queue-eg-google-pubsub)).
-
-#### Delayed reactions
-
-Give a reaction a `notBefore` and it doesn't run before that time. For example, ask for a review a week
-after an order ships:
+Give a trigger a `notBefore` and it doesn't run before that time. For example, ask for a review a week after an
+order ships:
 
 ```kotlin
-fun reviewReminderOutbox(
-    jdbc: JdbcContext,
-    serialization: DataSerializationContext<OrderEvent>,
-    offsets: PostgresOffsetManager,
-    executor: EventReactionExecutor<OrderNotification, *>,
-): AggregateEventOutbox<OrderNotification> =
-    AggregateEventOutbox(
-        backend = PostgresDomainPollingBackend(jdbc),
-        executor = executor,
-        eventToReactions = { event ->
-            if (event.metadata.aggregateType != Orders.type) {
-                emptyList()
-            } else {
-                when (serialization.deserialize(event.serialized)) {
-                    is OrderShipped ->
-                        listOf(
-                            EventReaction(
-                                id = EventReactionId("review-reminder-${event.metadata.eventId.value}"),
-                                trigger = SendReviewReminder(orderId = event.metadata.aggregateId.value),
-                                notBefore = event.metadata.timestamp + 7.days,
-                            ),
-                        )
-                    else -> emptyList()
-                }
+class ReviewReminders :
+    Reactions<OrderNotification>(
+        name = "review-reminders",
+        triggers = OrderNotification.serializer(),
+    ) {
+    init {
+        on(Orders) { event, metadata ->
+            if (event is OrderShipped) {
+                trigger(SendReviewReminder(metadata.aggregateId.value), notBefore = metadata.timestamp + 7.days)
             }
-        },
-        getPosition = { offsets.getPosition("review-reminders") },
-        savePosition = { offsets.savePosition("review-reminders", it) },
-        isLeader = { true },
-    )
+        }
+    }
+
+    override suspend fun handle(
+        trigger: OrderNotification,
+        context: ReactionContext,
+    ) {
+        println("Asking for a review: $trigger")
+    }
+}
 ```
 
-- With db-scheduler, a delayed reaction waits in `scheduled_tasks` until it is due, at no extra cost.
-- If a queue delivers a reaction early, the executor puts it back until it is due. It doesn't run, and it
-  doesn't count as a retry.
-- Delayed reactions can't be ordered: a delayed reaction would hold back every later reaction of its
-  aggregate. If an ordered outbox or subscription returns one, dispatching fails with an
-  `IllegalArgumentException` naming it. The poller logs the failure and retries that batch on every poll, so
-  the outbox (or, for a contract, all its subscriptions) stops dispatching at that event until you fix the
-  code.
+- With db-scheduler, delayed work waits in `scheduled_tasks` until it is due, at no extra cost.
+- If a queue delivers work early, kotmod puts it back until it is due. It doesn't run, and it doesn't count as
+  a retry.
+- [Ordered use cases](#ordered-use-cases) can't produce delayed triggers: one would hold back every later
+  reaction of its aggregate. If one does, its event is parked (below), so the mistake shows up loudly without
+  stopping anything else.
 
-### Durable reactions with db-scheduler
+#### When a mapping fails
+
+Sometimes a use case can't turn an event into triggers: its `on(...)` block throws, the event can't be
+deserialized, or an ordered use case produces a delayed trigger. The reactor doesn't stop. It **parks** the
+event in that use case's own queue, as an item with id `<useCase>/<eventId>/mapping`, logs the error, and moves
+on. Other use cases still get their triggers for the event.
+
+A parked event is retried with capped backoff (1s, 2s, 4s… up to 10 minutes), forever, logging each failure; it
+is never dropped. Each retry reads the event again and runs the use case's current code, so deploying a fix is
+enough. The event's triggers are then queued with the ids they would have had, and run. With ordering, the
+aggregate's later work in that use case waits behind the parked event, so it still runs in order; other
+aggregates and other use cases are unaffected. If the fixed code no longer listens to the event's aggregate
+type, the parked event is dropped with a warning.
+
+### Running use cases on db-scheduler
 
 This is kotmod's ready-made queue, in the optional `kotmod-db-scheduler` module. It needs nothing but your
 Postgres database; to use a different queue instead, see
 [Using another queue](#using-another-queue-eg-google-pubsub).
 
-`DbSchedulerEventReactions` stores reactions in db-scheduler's `scheduled_tasks` table and runs them on
-your db-scheduler `Scheduler`. Your application owns the `Scheduler` — its threads, polling and
-lifecycle — and kotmod provides the task, sink and source.
-
-Create one `DbSchedulerEventReactions` per executor; each becomes one db-scheduler task, and each
-reaction is an instance of that task, identified by its reaction id. Several executors can share one
-scheduler:
+`DbSchedulerQueues` stores work in db-scheduler's `scheduled_tasks` table and runs it on your db-scheduler
+`Scheduler`. Your application owns the `Scheduler` — its threads, polling and lifecycle. One `DbSchedulerQueues`
+serves a whole context: each use case, and each [process manager](#process-managers) channel, becomes one
+db-scheduler task named after it, and each piece of work is an instance of that task. Register every use case
+before reading `queues.tasks`:
 
 ```kotlin
-@Serializable
-sealed interface BillingTrigger : EventReactionTrigger
-
-@Serializable
-data class ChargeCustomer(
-    val orderId: String,
-    override val timeout: Duration? = null,
-) : BillingTrigger
-
-object BillingTriggerSerializer : EventReactionTriggerSerializer<BillingTrigger> {
-    override suspend fun serialize(trigger: BillingTrigger): String = Json.encodeToString(BillingTrigger.serializer(), trigger)
-
-    override suspend fun deserialize(serializedTrigger: String): BillingTrigger =
-        Json.decodeFromString(BillingTrigger.serializer(), serializedTrigger)
-}
-
-fun sharedScheduler(
+fun startReactions(
     dataSource: DataSource,
-    billing: DbSchedulerEventReactions<BillingTrigger>,
-    notifications: DbSchedulerEventReactions<OrderNotification>,
-): Scheduler =
-    Scheduler
-        .create(dataSource, billing.task, notifications.task)
-        .threads(10)
-        .enableImmediateExecution()
-        .build()
+    jdbc: JdbcContext,
+    election: PostgresLeaderElection,
+): Pair<EventReactor, Scheduler> {
+    val queues = DbSchedulerQueues(jdbc)
+    val reactor = EventReactor(jdbc, queues, isLeader = election::isLeader)
+    reactor.register(OrderNotifications(::sendConfirmation))
+    reactor.register(ReviewReminders())
+    reactor.register(OrderStatusProjection(jdbc))
+    val scheduler =
+        Scheduler
+            .create(dataSource, *queues.tasks.toTypedArray())
+            .threads(10)
+            .enableImmediateExecution()
+            .build()
+    queues.bind(scheduler)
+    reactor.start()
+    scheduler.start()
+    return reactor to scheduler
+}
 ```
 
 How it behaves:
 
-- **Duplicates.** Dispatching a reaction id that is already pending does nothing.
-- **Retries.** A `Retry(delay)` from your handlers reschedules the reaction with its retry count
-  incremented, so backoff keeps growing across restarts. Every attempt gets a fresh
-  `EventReactionExecutionId`.
-- **Startup order.** If the scheduler runs a reaction before its executor has started, the reaction is
-  pushed back a few seconds (without using up a retry) and a warning is logged.
-- **Unreadable data.** If a reaction's stored data can't be decoded — say a trigger class was renamed —
-  db-scheduler retries it with backoff from 10 seconds up to 1 hour until a fix is deployed.
-- **Removing a reaction.** To stop a pending unordered reaction for good, cancel its task instance (for
-  ordered reactions, see [Ordered reactions](#ordered-reactions)):
+- **Duplicates.** Queuing an id that is already pending does nothing.
+- **Retries.** A `Retry(delay)` reschedules the work with its attempt count incremented, so backoff keeps
+  growing across restarts.
+- **Startup order.** If the scheduler runs work before the reactor has started, the work is pushed back a few
+  seconds (without counting an attempt) and a warning is logged.
+- **Unreadable data.** If stored work can't be decoded — say a trigger class was renamed — db-scheduler retries
+  it with backoff from 10 seconds up to 1 hour until a fix is deployed. Keep old names readable with
+  `@SerialName`.
+- **Removing pending work.** To stop pending unordered work for good, cancel its task instance; its id is the
+  reaction id, `<useCase>/<eventId>/<n>` (for ordered work, see [Ordered use cases](#ordered-use-cases)):
 
 ```kotlin
 fun cancelPendingConfirmation(
     scheduler: Scheduler,
-    notifications: DbSchedulerEventReactions<OrderNotification>,
     eventId: EventId,
 ) {
-    scheduler.cancel(notifications.task.instanceId("confirmation-${eventId.value}"))
+    scheduler.cancel(TaskInstanceId.of("order-notifications", "order-notifications/${eventId.value}/0"))
 }
 ```
 
-### Ordered reactions
+### Ordered use cases
 
-By default reactions are unordered: two reactions from the same aggregate can run at the same time, or
-finish in a different order from the events. That is fine for sending emails, but not for projections or
-anything else that must apply an aggregate's changes in order. For those, ask for ordering:
+By default a use case's work is unordered: two pieces of work from the same aggregate can run at the same time,
+or finish in a different order from the events. That is fine for sending emails, but not for projections or
+anything else that must apply an aggregate's changes in order. For those, override `ordering`:
 
 - `ReactionOrdering.Unordered` is the default.
-- `ReactionOrdering.PerAggregate(onGiveUp = …)` runs an aggregate's reactions one at a time, in event
+- `ReactionOrdering.PerAggregate(onGiveUp = …)` runs an aggregate's work in this use case one at a time, in event
   order.
 
-Set it with `ordering = ReactionOrdering.PerAggregate(…)` on `AggregateEventOutbox`, or on
-`PublicEventContract.subscribe(executor, ordering = …) { … }`. The outbox dispatches each aggregate's
-events in sequence order (see `event.metadata.sequence`), even in the rare case where the order in the
-log differs because a transaction changed several aggregates. To do this, every outbox and contract checks
-each event it reads; for an aggregate that has never been written out of order this check is a single
-primary-key lookup.
-
-Ordering needs support from the queue (for Pub/Sub, see
-[Using another queue](#using-another-queue-eg-google-pubsub)). With db-scheduler, pass `jdbc` to
-`DbSchedulerEventReactions`; an
-ordered outbox or subscription whose sink does not support ordering fails with an
-`IllegalArgumentException` as soon as it is created, rather than running unordered:
-
 ```kotlin
-fun orderedNotifications(jdbc: JdbcContext): DbSchedulerEventReactions<OrderNotification> =
-    DbSchedulerEventReactions("order-notifications", OrderNotificationSerializer, jdbc = jdbc)
+@Serializable
+sealed interface OrderStatusChange
 
-fun orderedOutbox(
-    jdbc: JdbcContext,
-    serialization: DataSerializationContext<OrderEvent>,
-    offsets: PostgresOffsetManager,
-    executor: EventReactionExecutor<OrderNotification, *>,
-): AggregateEventOutbox<OrderNotification> =
-    AggregateEventOutbox(
-        backend = PostgresDomainPollingBackend(jdbc),
-        executor = executor,
-        eventToReactions = { event ->
-            when (serialization.deserialize(event.serialized)) {
-                is OrderPlaced -> listOf(EventReaction(EventReactionId("confirmation-${event.metadata.eventId.value}"), SendOrderConfirmation(event.metadata.aggregateId.value)))
-                else -> emptyList()
-            }
-        },
-        getPosition = { offsets.getPosition("order-notifications") },
-        savePosition = { offsets.savePosition("order-notifications", it) },
-        isLeader = { true },
-        ordering = ReactionOrdering.PerAggregate(onGiveUp = OnGiveUp.BlockAggregate),
-    )
+@Serializable
+data class StatusChanged(
+    val orderId: String,
+    val status: String,
+) : OrderStatusChange
+
+class OrderStatusProjection(
+    private val jdbc: JdbcContext,
+) : Reactions<OrderStatusChange>(
+        name = "order-status-projection",
+        triggers = OrderStatusChange.serializer(),
+    ) {
+    init {
+        on(Orders) { event, metadata ->
+            val status =
+                when (event) {
+                    is OrderPlaced -> "placed"
+                    is OrderShipped -> "shipped"
+                    is OrderCancelled -> "cancelled"
+                }
+            trigger(StatusChanged(metadata.aggregateId.value, status))
+        }
+    }
+
+    override val ordering = ReactionOrdering.PerAggregate(onGiveUp = OnGiveUp.BlockAggregate)
+
+    override suspend fun handle(
+        trigger: OrderStatusChange,
+        context: ReactionContext,
+    ) = when (trigger) {
+        is StatusChanged -> saveStatus(trigger.orderId, trigger.status)
+    }
+
+    private fun saveStatus(
+        orderId: String,
+        status: String,
+    ) {
+        jdbc.withConnection { conn ->
+            conn
+                .prepareStatement(
+                    "INSERT INTO order_status (id, status) VALUES (?, ?) " +
+                        "ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status",
+                ).use { ps ->
+                    ps.setString(1, orderId)
+                    ps.setString(2, status)
+                    ps.executeUpdate()
+                }
+        }
+    }
+}
 ```
 
-Register the reactions' tasks with your `Scheduler` as before; `tasks` gives the list to pass (`task` is
-still there for the single-task case).
+The reactor reads each aggregate's events in sequence order (see `metadata.sequence`), even in the rare case
+where the order in the log differs because a transaction changed several aggregates. For an aggregate that has
+never been written out of order, checking this is a single primary-key lookup per event. Ordering is per
+aggregate instance and per use case: different aggregates never wait on each other, and neither do different
+use cases. A use case with several sources gets ordering per aggregate of each; since an aggregate type reaches a
+use case through only one source, their orders never mix.
 
-**When a reaction gives up.** A reaction gives up when your retry handler returns `DoNotRetry` with a failed
-result. The
-`OnGiveUp` policy says what happens to the aggregate's later reactions:
+Ordering needs support from the queue. `DbSchedulerQueues` has it (for Pub/Sub, see
+[Using another queue](#using-another-queue-eg-google-pubsub)); a queue without it fails when the use case is
+registered, rather than running unordered.
+
+**When work gives up.** Work gives up when `onFailure` returns `GiveUp`. The `OnGiveUp` policy says what happens
+to the aggregate's later work in this use case:
 
 | Policy | Behaviour |
 |---|---|
-| `OnGiveUp.ContinueWithNext` (default) | The failed reaction is completed as failed and the next one runs |
-| `OnGiveUp.BlockAggregate` | The aggregate's later reactions wait until an operator retries or skips the failed one |
+| `OnGiveUp.ContinueWithNext` (default) | The failed work is completed as given up and the next one runs |
+| `OnGiveUp.BlockAggregate` | The aggregate's later work waits until an operator retries or skips the failed one |
 
-Use `BlockAggregate` when running later reactions after a missed one would leave wrong data, such as a
-projection that skipped an event. Other aggregates are not affected. To find and clear blocked reactions,
-use the helpers on `DbSchedulerEventReactions`, passing your `Scheduler` (or any `SchedulerClient`):
+Use `BlockAggregate` when running later work after a missed one would leave wrong data, such as a projection that
+skipped an event. Other aggregates are not affected. To find and clear blocked work, use the helpers on
+`DbSchedulerQueues`, passing your `Scheduler` (or any `SchedulerClient`) and the use case's name:
 
-- `blockedReactions(client)` lists each blocked reaction with its aggregate key, reaction id and
+- `blockedReactions(client, useCase)` lists each blocked reaction with its aggregate key, reaction id and
   sequence number.
-- `retryBlocked(client, id)` runs it again now, with its retry count reset.
-- `skipBlocked(client, id)` drops it without running it, so the aggregate's next reaction can run.
+- `retryBlocked(client, useCase, id)` runs it again now, with its attempt count reset.
+- `skipBlocked(client, useCase, id)` drops it without running it, so the aggregate's next work can run.
 
-An ordered reaction's db-scheduler instance id is built from its aggregate, sequence number and reaction
-id, so `task.instanceId(reactionId)` does not find it; use these helpers instead.
+```kotlin
+fun retryBlockedProjection(
+    scheduler: Scheduler,
+    queues: DbSchedulerQueues,
+) {
+    for (blocked in queues.blockedReactions(scheduler, "order-status-projection")) {
+        println("${blocked.key} is held back by ${blocked.reactionId.value} at sequence ${blocked.sequence}")
+        queues.retryBlocked(scheduler, "order-status-projection", blocked.reactionId)
+    }
+}
+```
 
-**How waiting works.** An ordered reaction only runs when no earlier reaction of the same aggregate is
-still pending. Otherwise it waits and checks again, starting after the `orderedRecheckDelay` constructor
-parameter (2 seconds by default) and doubling each time up to 1 minute. When a reaction finishes, kotmod nudges the aggregate's
-next reaction to run immediately, so a backlog normally runs back to back. The cost of ordering is
-therefore a little extra database work for waiting reactions, and one aggregate's reactions run on at most
-one thread at a time; different aggregates still run in parallel.
+Ordered work's db-scheduler instance id is built from its aggregate, sequence number and reaction id, so
+`TaskInstanceId.of(useCase, reactionId)` does not find it; use these helpers instead.
 
-**Recommended index.** The pending check looks reactions up by task and instance id, so add this to your
-own `scheduled_tasks` migration (it is optional, but worth having once many reactions can be waiting; use
-your table name if you pass a custom `tableName`):
+**How waiting works.** Ordered work only runs when no earlier work of the same aggregate is still pending in its
+use case's queue. Otherwise it waits and checks again, starting after `DbSchedulerQueues`'
+`orderedRecheckDelay` (2 seconds by default) and doubling each time up to 1 minute. When work finishes, kotmod
+nudges the aggregate's next work to run immediately, so a backlog normally runs back to back. The cost of
+ordering is therefore a little extra database work for waiting work, and one aggregate's work in a use case runs
+on at most one thread at a time; different aggregates still run in parallel.
+
+**Recommended index.** The pending check looks work up by task and instance id, so add this to your own
+`scheduled_tasks` migration (it is optional, but worth having once much work can be waiting; use your table name
+if you pass a custom `tableName`):
 
 ```sql
 CREATE INDEX scheduled_tasks_ordered_idx ON scheduled_tasks (task_name, task_instance COLLATE "C");
 ```
 
-**Scope.**
-
-- Ordering applies per executor (per db-scheduler task name) and aggregate. Two executors that handle
-  the same aggregate do not wait on each other.
-- Ordered subscriptions of one contract that share an executor share ordering for an aggregate: each
-  event's reactions run one at a time, in subscription order. Give each of them distinct reaction ids.
-- An ordered executor can be fed by only one outbox or contract; a second one fails when it is constructed
-  or subscribes. Executors that share one `DbSchedulerEventReactions` task name would share ordering across
-  sources, which is not supported: give each ordered outbox or contract its own task name.
-- Delivery is still at-least-once, so reactions must still be idempotent. In one rare case, ordering can
-  briefly be broken: if the outbox crashes after dispatching several reactions from the same event but
-  before saving its position, an earlier one of those that had already completed can run again at the same
-  time as a later one.
+**Delivery is still at least once.** In one rare case, ordering can briefly be broken: if the reactor crashes
+after queueing several triggers from the same event but before saving its position, an earlier one that had
+already completed can run again at the same time as a later one. Keep ordered work idempotent too.
 
 ### Using another queue (e.g. Google Pub/Sub)
 
-db-scheduler is a convenient default, not a requirement. An `EventReactionExecutor` only needs a queue
-that implements two interfaces from the core `kotmod` module:
+db-scheduler is a convenient default, not a requirement. The reactor and process managers only need a
+`ReactionQueues`: given a queue name, whether it must be ordered and how to store its items, it returns a
+`ReactionChannel` made of two interfaces from the core `kotmod` module:
 
-- **`EventReactionTriggerSink`** — `publish(id, trigger, ordering, notBefore)` queues a reaction. Publishing
-  an id that is already queued should not queue it twice; if your queue can't guarantee that, rely on your
-  reactions being idempotent (they must be anyway, since delivery is at-least-once). Carry `notBefore` with
-  the message, and if your queue can delay delivery, don't deliver before it.
-- **`EventReactionTriggerSource`** — `subscribe(block)` starts delivering queued reactions. For each
-  delivery, call `block` with the reaction id, a fresh execution id, the trigger, the retry count and the
-  reaction's `notBefore`, and act on what it returns:
-  - `ReactionOutcome.Finished` — the reaction is done (succeeded, cancelled or gave up): remove it from
-    the queue.
+- **`EventReactionTriggerSink`** — `publish(id, trigger, ordering, notBefore)` queues an item. Publishing an id
+  that is already queued should not queue it twice; if your queue can't guarantee that, rely on `handle` being
+  idempotent (it must be anyway, since delivery is at least once). Carry `notBefore` with the message, and if
+  your queue can delay delivery, don't deliver before it.
+- **`EventReactionTriggerSource`** — `subscribe(block)` starts delivering queued items. For each delivery, call
+  `block` with the reaction id, a fresh execution id, the item, the retry count and its `notBefore`, and act on
+  what it returns:
+  - `ReactionOutcome.Finished` — it is done (succeeded or gave up): remove it from the queue.
   - `ReactionOutcome.Retry(delay)` — deliver it again after about `delay`, counting a retry.
-  - `ReactionOutcome.Wait(delay)` — it isn't due yet: deliver it again after about `delay` without
-    counting a retry.
+  - `ReactionOutcome.Wait(delay)` — it isn't due yet: deliver it again after about `delay` without counting a
+    retry.
   - An exception — deliver it again later.
 
-Everything else — timeouts, retry decisions, `onCompletion`, the outbox and public contracts — works the
-same whichever queue you use. Leave out the `kotmod-db-scheduler` dependency if you don't use it.
+kotmod asks for one queue per use case (named after it) and one per process manager channel
+(`<process type>-<channel>`). It stores its own items in them — your triggers, wrapped with what kotmod needs to
+run them, and [parked mappings](#when-a-mapping-fails) — so your queue only moves them between publish and
+delivery. Everything else — timeouts, `onFailure`, `onCompletion`, parked mappings — works the same whichever
+queue you use. Leave out the `kotmod-db-scheduler` dependency if you don't use it.
 
 Here is a sketch for Google Pub/Sub, using the official Java client (`com.google.cloud:google-cloud-pubsub`).
 It is not part of kotmod and is not compiled or tested here; a ready-made Pub/Sub module is planned.
 
 <!-- not-compiled -->
 ```kotlin
-class PubSubReactions<T : EventReactionTrigger>(
-    // For ordered reactions, build the publisher with setEnableMessageOrdering(true)
-    // and enable message ordering on the subscription.
+class PubSubQueues(
+    // One topic for every queue: each message carries its queue's name, and each queue has its own subscription,
+    // filtered on it (attributes.queue = "<name>"). Enable message ordering on the subscriptions of ordered queues.
+    private val topic: TopicName,
+    private val subscriptionFor: (queue: String) -> ProjectSubscriptionName,
+) : ReactionQueues {
+    override fun <T : EventReactionTrigger> channel(
+        name: String,
+        triggerSerializer: EventReactionTriggerSerializer<T>,
+        ordered: Boolean,
+    ): ReactionChannel<T> {
+        val publisher = Publisher.newBuilder(topic).setEnableMessageOrdering(ordered).build()
+        val queue = PubSubQueue(name, publisher, subscriptionFor(name), triggerSerializer, supportsOrdering = ordered)
+        return ReactionChannel(queue, queue)
+    }
+}
+
+class PubSubQueue<T : EventReactionTrigger>(
+    private val name: String,
     private val publisher: Publisher,
     private val subscription: ProjectSubscriptionName,
     private val serializer: EventReactionTriggerSerializer<T>,
+    override val supportsOrdering: Boolean,
 ) : EventReactionTriggerSink<T>, EventReactionTriggerSource<T> {
-    override val supportsOrdering = true
-
     override suspend fun publish(
         id: EventReactionId,
         trigger: T,
@@ -1060,12 +1069,13 @@ class PubSubReactions<T : EventReactionTrigger>(
         val message =
             PubsubMessage.newBuilder()
                 .setData(ByteString.copyFromUtf8(serializer.serialize(trigger)))
+                .putAttributes("queue", name)
                 .putAttributes("reactionId", id.value)
                 .apply { if (ordering != null) setOrderingKey(ordering.key) }
                 // Carry notBefore with the message; Pub/Sub can't hold it back (see "Delays on Google Cloud").
                 .apply { if (notBefore != null) putAttributes("notBefore", notBefore.toString()) }
                 .build()
-        // Wait for Pub/Sub to accept it: the outbox only moves on once publish returns.
+        // Wait for Pub/Sub to accept it: the reactor only moves on once publish returns.
         withContext(Dispatchers.IO) { publisher.publish(message).get() }
     }
 
@@ -1094,7 +1104,7 @@ class PubSubReactions<T : EventReactionTrigger>(
                     is ReactionOutcome.Finished -> reply.ack()
                     is ReactionOutcome.Retry -> reply.nack()
                     // A nack ignores the delay, so this only suits waits of a few minutes. For longer ones, hand
-                    // the reaction back to Cloud Tasks for `outcome.delay` and ack this message instead (see
+                    // the message back to Cloud Tasks for `outcome.delay` and ack this one instead (see
                     // "Delays on Google Cloud"). Pub/Sub counts a nack as a delivery attempt, which a
                     // dead-letter policy would treat as a failure.
                     is ReactionOutcome.Wait -> reply.nack()
@@ -1111,48 +1121,53 @@ class PubSubReactions<T : EventReactionTrigger>(
 }
 ```
 
-Create one and pass it as both the sink and the source of an `EventReactionExecutor`, just as
-`DbSchedulerEventReactions` is used in the quickstart.
+Pass a `PubSubQueues` to `EventReactor` (and to your process managers) where the quickstart passes
+`DbSchedulerQueues`.
 
 How Pub/Sub differs from db-scheduler:
 
+- **One subscription per use case.** Each use case's queue maps to one subscription: a topic per use case, or, as
+  in the sketch, one topic with a `queue` attribute and a filtered subscription per use case.
 - **Retry delays are approximate.** Pub/Sub can't redeliver a message after a chosen delay; a `nack()` is
-  redelivered according to the subscription's retry policy. Set its minimum and maximum backoff to suit
-  your reactions, or use the retry handlers' delays only as a guide.
-- **No deduplication by reaction id.** Pub/Sub may deliver a message more than once, and the outbox may
-  publish a reaction again after a restart. Keep `execute` and `onCompletion` idempotent.
-- **Retry counts need a dead-letter policy.** Pub/Sub only counts delivery attempts when the subscription
-  has one; without it, the retry count passed to your handlers is always 0. A dead-letter topic is also
-  where messages go after too many failed deliveries.
-- **Ordering uses ordering keys.** `DispatchOrdering.key` is the aggregate, so publishing with
-  `setOrderingKey(ordering.key)` makes Pub/Sub deliver each aggregate's reactions in order, one at a time,
-  and a `nack()` holds back that aggregate's later reactions until it is redelivered. If a publish fails,
-  the client pauses that ordering key until you call `publisher.resumePublish(key)`.
-- **`OnGiveUp.BlockAggregate` has no direct equivalent.** In this sketch a reaction that gives up is
-  acknowledged and the aggregate's next reaction runs, as with `ContinueWithNext`. Record failures in
-  `onCompletion` (or route them to a dead-letter topic) to deal with them.
+  redelivered according to the subscription's retry policy. Set its minimum and maximum backoff to suit your
+  use cases, or treat `onFailure`'s delays only as a guide.
+- **No deduplication by reaction id.** Pub/Sub may deliver a message more than once, and the reactor may publish
+  a trigger again after a restart. Keep `handle` and `onCompletion` idempotent, and pass `context.reactionId` as
+  the idempotency key of external calls.
+- **Retry counts need a dead-letter policy.** Pub/Sub only counts delivery attempts when the subscription has
+  one; without it, `context.attempt` is always 0. A dead-letter topic is also where messages go after too many
+  failed deliveries.
+- **Ordering uses ordering keys.** `DispatchOrdering.key` is `<aggregateType>/<aggregateId>`, so publishing with
+  `setOrderingKey(ordering.key)` makes Pub/Sub deliver each aggregate's work in order, one at a time, and a
+  `nack()` holds back that aggregate's later messages until it is redelivered. That is exactly what a parked
+  mapping needs: it is a message with its event's ordering key, so it blocks that aggregate only. If a publish
+  fails, the client pauses that ordering key until you call `publisher.resumePublish(key)`.
+- **Parked mappings read your database.** A parked mapping reads its event again from the event log, so the
+  subscriber must run in your application, with access to its database.
+- **`OnGiveUp.BlockAggregate` has no direct equivalent.** In this sketch, work that gives up is acknowledged and
+  the aggregate's next work runs, as with `ContinueWithNext`. Record failures in `onCompletion` (or route them to
+  a dead-letter topic) to deal with them. A stuck ordering key shows up as redelivery or dead-lettering, not as a
+  row you can list.
 - **`ReactionOutcome.Wait` only suits short waits.** A `nack()` ignores the delay: the message comes back
-  according to the subscription's retry policy (at most 10 minutes later), and each redelivery counts
-  towards the dead-letter limit (at most 100 attempts). A reaction that must wait longer than a few
-  minutes would be redelivered many times, or dead-lettered before it is due. For longer waits, hand the
-  reaction to a scheduler such as Cloud Tasks and ack the original (see below).
-- **Long reactions are fine.** The client keeps extending a message's acknowledgement deadline while
-  `block` runs, up to its maximum extension period (one hour by default).
-- **No leader election is needed for the queue.** As with db-scheduler, every node can run a subscriber;
-  only the outbox and public contracts need [one active poller](#running-in-production).
+  according to the subscription's retry policy (at most 10 minutes later), and each redelivery counts towards the
+  dead-letter limit (at most 100 attempts). Work that must wait longer than a few minutes would be redelivered
+  many times, or dead-lettered before it is due. For longer waits, hand the message to a scheduler such as Cloud
+  Tasks and ack the original (see below).
+- **Long work is fine.** The client keeps extending a message's acknowledgement deadline while `block` runs, up
+  to its maximum extension period (one hour by default).
+- **No leader election is needed for the queue.** As with db-scheduler, every node can run subscribers; only the
+  reactor, contracts and process managers need [one active poller](#running-in-production).
 
-**Delays on Google Cloud.** Pub/Sub can't hold a message back until a time. A sink can instead hand a
-delayed reaction to **Cloud Tasks** with a schedule time, and have the task publish it to Pub/Sub when it's
-due. Cloud Tasks can only schedule about 30 days ahead, so for a longer delay the reaction is scheduled for
-the furthest time allowed and arrives before its `notBefore`. The executor then returns `Wait` without
-running it, and the source should hand the reaction to Cloud Tasks again for the remaining time and ack the
-original message.
+**Delays on Google Cloud.** Pub/Sub can't hold a message back until a time. A sink can instead hand delayed work
+to **Cloud Tasks** with a schedule time, and have the task publish it to Pub/Sub when it's due. Cloud Tasks can
+only schedule about 30 days ahead, so for a longer delay the work is scheduled for the furthest time allowed and
+arrives before its `notBefore`. kotmod then returns `Wait` without running it, and the source should hand the
+message to Cloud Tasks again for the remaining time and ack the original.
 
 ### Publishing events to other contexts
 
-Internal domain events change as your model changes, so other services shouldn't depend on them
-directly. Instead, publish **public events** — a deliberately stable contract — with a
-`PublicEventContract`:
+Internal domain events change as your model changes, so other contexts shouldn't depend on them directly.
+Instead, publish **public events** — a deliberately stable contract — with a `PublicEventContract`:
 
 ```kotlin
 @Serializable
@@ -1165,55 +1180,110 @@ data class OrderPlacedV1(
 
 fun orderContract(
     jdbc: JdbcContext,
-    serialization: DataSerializationContext<OrderEvent>,
     offsets: PostgresOffsetManager,
-    billingExecutor: EventReactionExecutor<BillingTrigger, *>,
-): PublicEventContract<OrderEvent, OrderPublicEvent> {
-    val contract =
-        PublicEventContract<OrderEvent, OrderPublicEvent>(
-            backend = PostgresDomainPollingBackend(jdbc),
-            serialization = serialization,
-            internalToPublic = { event ->
-                when (event) {
-                    is OrderPlaced -> OrderPlacedV1(event.item)
-                    else -> null
-                }
-            },
-            getPosition = { offsets.getPosition("order-contract") },
-            savePosition = { offsets.savePosition("order-contract", it) },
-            isLeader = { true },
-            aggregateTypes = setOf(Orders.type),
-        )
-
-    contract.subscribe(billingExecutor) { envelope ->
-        when (envelope.event) {
-            is OrderPlacedV1 ->
-                listOf(
-                    EventReaction<BillingTrigger>(
-                        id = EventReactionId("charge-${envelope.metadata.eventId.value}"),
-                        trigger = ChargeCustomer(orderId = envelope.metadata.aggregateId.value),
-                    ),
-                )
-        }
-    }
-    return contract
-}
+): PublicEventContract<OrderEvent, OrderPublicEvent> =
+    PublicEventContract(
+        backend = PostgresDomainPollingBackend(jdbc),
+        serialization = Orders.eventSerialization,
+        internalToPublic = { event ->
+            when (event) {
+                is OrderPlaced -> OrderPlacedV1(event.item)
+                else -> null
+            }
+        },
+        getPosition = { offsets.getPosition("order-contract") },
+        savePosition = { offsets.savePosition("order-contract", it) },
+        isLeader = { true },
+        aggregateTypes = setOf(Orders.type),
+    )
 ```
 
 - `internalToPublic` maps each internal event to a public one; returning `null` keeps it private.
-- Subscribers receive a `PublicEventEnvelope`: the public event plus the original event's metadata
-  (event id, aggregate id, correlation id and so on).
-- A contract can have several subscribers, each with its own executor. Subscribe before calling
-  `start()`.
-- A contract reads the event log independently of the outbox, so give it its own consumer name.
+- Use cases in other contexts react to the public events with `on(contract)`, each event with the original
+  event's metadata (event id, aggregate id, sequence and so on); see
+  [Consuming another context's events](#consuming-another-contexts-events).
+- The publishing context builds and starts the contract. Register the use cases that listen to it before it
+  starts.
+- A contract reads the event log independently of the reactor, so give it its own consumer name.
 - `aggregateTypes` lists the aggregate types the contract publishes; events of other types are skipped
   without being deserialized. The event log holds every aggregate's events, so with a filter, adding an
   aggregate or a [process manager](#process-managers) to the context never stalls this contract on an event
-  type its `serialization` can't read.
+  type its `serialization` can't read. A use case can combine a contract with other sources only when the
+  contract has this filter.
 - Without `aggregateTypes`, a contract deserializes **every** event in the log before mapping it, so its
   `serialization` must be able to read every event type your application writes, including the facts a
   process manager records. If you have several event families (orders and audit events, say), register them
   all in one `jsonDataSerializationContext<DomainEvent>` and use `DomainEvent` as the contract's internal type.
+
+### Consuming another context's events
+
+A use case reacts to another context's public events with `on(contract)`, typed like any other source:
+
+```kotlin
+@Serializable
+sealed interface BillingTrigger
+
+@Serializable
+data class ChargeCustomer(
+    val orderId: String,
+) : BillingTrigger
+
+interface PaymentGateway {
+    suspend fun charge(
+        orderId: String,
+        idempotencyKey: String,
+    )
+}
+
+class CustomerBilling(
+    orderEvents: PublicEventContract<*, OrderPublicEvent>,
+    private val gateway: PaymentGateway,
+) : Reactions<BillingTrigger>(
+        name = "customer-billing",
+        triggers = BillingTrigger.serializer(),
+    ) {
+    init {
+        on(orderEvents) { event, metadata ->
+            when (event) {
+                is OrderPlacedV1 -> trigger(ChargeCustomer(metadata.aggregateId.value))
+            }
+        }
+    }
+
+    override suspend fun handle(
+        trigger: BillingTrigger,
+        context: ReactionContext,
+    ) = when (trigger) {
+        is ChargeCustomer -> gateway.charge(trigger.orderId, idempotencyKey = context.reactionId)
+    }
+}
+
+fun startBilling(
+    dataSource: DataSource,
+    jdbc: JdbcContext,
+    orderEvents: PublicEventContract<*, OrderPublicEvent>,
+    gateway: PaymentGateway,
+): Scheduler {
+    val queues = DbSchedulerQueues(jdbc)
+    val reactor = EventReactor(jdbc, queues, isLeader = { true }, name = "billing-reactor")
+    reactor.register(CustomerBilling(orderEvents, gateway))
+    val scheduler = Scheduler.create(dataSource, *queues.tasks.toTypedArray()).enableImmediateExecution().build()
+    queues.bind(scheduler)
+    reactor.start()
+    scheduler.start()
+    return scheduler
+}
+```
+
+- Registering the use case subscribes it to the contract's own reader, which queues its triggers in the use
+  case's queue. Register it before the publishing context starts the contract.
+- Reaction ids and ordering work as for local sources: ids are `<useCase>/<eventId>/<n>` with the original
+  event's id, and ordering is per original aggregate.
+- If the use case's block throws, the event is parked in its queue, as for a local source, and the contract's
+  reader moves on. If the contract itself can't read an event (its `serialization` or `internalToPublic` throws),
+  the contract stops at that event, for everyone listening, until the publishing context fixes it.
+- Both contexts share the database. Consuming a context that lives in another service or database is not
+  supported.
 
 ### Process managers
 
@@ -1281,8 +1351,7 @@ The process id (`deadline-<orderId>`) names an instance of the process manager's
 order.
 
 `translate` receives every event in this context's log except this process manager's own. Facts recorded by
-other process managers do reach it. Filter by aggregate type before deserializing, as `translateOrderEvent` does
-and as the quickstart's outbox does.
+other process managers do reach it. Filter by aggregate type before deserializing, as `translateOrderEvent` does.
 
 #### States own their inputs
 
@@ -1522,44 +1591,43 @@ recorded, and it is retried until you fix the wiring.
 ## Running in production
 
 **Delivery is at-least-once.** Events are committed with the state change that produced them, and the
-outbox only moves past an event once all of its reactions are dispatched, so no event is ever skipped. A
-reaction can run more than once — for example if the process dies after dispatching but before saving the
-position, or if a shutdown interrupts a running reaction. Make `execute` and `onCompletion` idempotent.
+reactor only moves past an event once every use case's triggers for it are queued, so no event is ever skipped.
+Work can run more than once — for example if the process dies after queueing but before saving the reactor's
+position, or if a shutdown interrupts running work. Make `handle` and `onCompletion` idempotent, and pass
+`context.reactionId` as the idempotency key of external calls.
 
-**Open transactions hold delivery back.** An outbox only reads past transactions that have finished, so it
+**Open transactions hold delivery back.** The reactor only reads past transactions that have finished, so it
 never skips an event that a slower transaction commits late. The flip side: while any transaction that has
 written something is still open on the same Postgres server — even in another database — later events wait
-for it, and if it never finishes, **delivery stops for every outbox and contract** with no error. Common
-culprits are connections left "idle in transaction", orphaned prepared transactions (`pg_prepared_xacts`)
-and long batch jobs. Keep transactions short, set `idle_in_transaction_session_timeout`, and monitor
-`pg_stat_activity` for old transactions with a `backend_xid`.
+for it, and if it never finishes, **delivery stops for the reactor, every contract and every process manager**
+with no error. Common culprits are connections left "idle in transaction", orphaned prepared transactions
+(`pg_prepared_xacts`) and long batch jobs. Keep transactions short, set `idle_in_transaction_session_timeout`,
+and monitor `pg_stat_activity` for old transactions with a `backend_xid`.
 
 **Moving the database to a new server.** Event positions include Postgres transaction ids, which only make
 sense on the server that issued them. `pg_upgrade` keeps them, so in-place upgrades are fine. After a
-`pg_dump`/restore or a logical-replication migration, the new server's transaction ids start lower, and
-outboxes stop with an error saying their saved position is "ahead of this Postgres server's transaction
-counter" rather than silently skipping events. To resume after the move, with nothing writing yet, set every
-row's `ddd_domain_event.transaction_id` to `'0'` and every `ddd_consumer_offset.last_transaction_id` to `0`
-(keep `last_offset`). Each consumer then resumes exactly where it left off, and new events sort after the
-migrated ones.
+`pg_dump`/restore or a logical-replication migration, the new server's transaction ids start lower, and the
+reactor, contracts and process managers stop with an error saying their saved position is "ahead of this
+Postgres server's transaction counter" rather than silently skipping events. To resume after the move, with
+nothing writing yet, set every row's `ddd_domain_event.transaction_id` to `'0'` and every
+`ddd_consumer_offset.last_transaction_id` to `0` (keep `last_offset`). Each consumer then resumes exactly where
+it left off, and new events sort after the migrated ones.
 
-**Ordered reactions are still at-least-once.** If the outbox crashes after dispatching several reactions
-from the same event but before saving its position, an earlier one that already completed can run again at
-the same time as a later one. Keep ordered reactions idempotent too. See
-[Ordered reactions](#ordered-reactions).
+**Reaction ids are deterministic.** kotmod builds each reaction id from the use case, the event and the
+trigger's position in the block's output (`<useCase>/<eventId>/<n>`), so an event read again while its work is
+pending is recognised. Keep each `on(...)` block deterministic: the same event must produce the same triggers, in
+the same order. A queue forgets an id once its work has run, so moving the reactor's position back runs finished
+work again.
 
-**Use deterministic reaction ids.** Build each reaction id from the event id plus a label, as in
-`"confirmation-${event.metadata.eventId.value}"`. Then a re-dispatched event is recognised as a
-reaction that is already pending. A random id creates a duplicate.
+**Start and stop in order.** Register every use case and build every process manager, then read
+`queues.tasks` and build the `Scheduler`. Start the reactor and process managers, then the `Scheduler`, then the
+leader election, then any public contracts; stop in the reverse order. Getting it wrong doesn't lose anything —
+work that arrives before its use case is running is rescheduled with a warning — but it adds noise and delay.
 
-**Start and stop in order.** Start executors, then the db-scheduler `Scheduler`, then the leader election,
-then the outbox and any public contracts; stop in the reverse order. Getting it wrong doesn't lose anything — reactions that
-arrive before their executor is running are rescheduled with a warning — but it adds noise and delay.
-
-**Run one active poller per consumer.** The outbox and public contracts only poll while `isLeader()`
-returns `true`. Run your application on as many nodes as you like, but make sure only one of them polls
-for each consumer. db-scheduler needs no such care: it is safe to run on every node, and each reaction
-runs on one node at a time.
+**Run one active poller per consumer.** The reactor, public contracts and process managers only poll while
+`isLeader()` returns `true`. Run your application on as many nodes as you like, but make sure only one of them
+polls for each. db-scheduler needs no such care: it is safe to run on every node, and each piece of work runs on
+one node at a time.
 
 **Leader election.** `PostgresLeaderElection` picks the polling node with a Postgres advisory lock. Each
 node creates one with the same name; whichever takes the lock leads until its connection ends, and another
@@ -1577,17 +1645,14 @@ fun leaderElection(
 }
 ```
 
-Pass `isLeader = election::isLeader` to each outbox and contract:
+Pass `isLeader = election::isLeader` to the reactor, and to each contract and process manager:
 
 ```kotlin
-    AggregateEventOutbox(
-        backend = PostgresDomainPollingBackend(jdbc),
-        executor = executor,
-        eventToReactions = { emptyList() },
-        getPosition = { offsets.getPosition("order-notifications") },
-        savePosition = { offsets.savePosition("order-notifications", it) },
-        isLeader = election::isLeader,
-    )
+fun reactorWithLeaderElection(
+    jdbc: JdbcContext,
+    queues: DbSchedulerQueues,
+    election: PostgresLeaderElection,
+): EventReactor = EventReactor(jdbc, queues, isLeader = election::isLeader)
 ```
 
 - **One election per application** is the simple default: one node polls for every consumer. To spread
@@ -1600,25 +1665,27 @@ Pass `isLeader = election::isLeader` to each outbox and contract:
   within a few intervals and releases the lock.
 - **Brief overlap.** If Postgres ends the leader's session first (a failover, `pg_terminate_backend`), another
   node can take over before the old leader notices. Pollers check `isLeader()` only at the start of each
-  poll, so two nodes may poll for up to about two `checkInterval`s plus one poll batch. That only causes
-  duplicate dispatches, which deterministic reaction ids absorb.
-- **Shutdown.** Stop outboxes and contracts first, then `election.stop()`, which releases the lock so another
-  node takes over straight away.
+  poll, so two nodes may poll for up to about two `checkInterval`s plus one poll batch. That can queue the same
+  work twice; deterministic reaction ids absorb it while the work is still pending, and an idempotent `handle`
+  covers the rest.
+- **Shutdown.** Stop the reactor, contracts and process managers first, then `election.stop()`, which releases
+  the lock so another node takes over straight away.
 
 **Know what happens when things fail:**
 
 | Situation | Behaviour |
 |---|---|
-| A reaction fails or throws | Your `failureRetryHandler` decides: retry after a delay, or complete it as failed |
-| A reaction times out | Your `timeoutRetryHandler` decides |
-| A reaction's stored data can't be read | Retried with backoff from 10 seconds up to 1 hour |
-| A node crashes mid-reaction | db-scheduler notices the missing heartbeat and runs it again |
-| The database is down while dispatching | The outbox batch stops and resumes from the last saved position on the next poll |
-| The outbox can't deserialize an event (e.g. another aggregate type's) | The batch stops and is retried every poll, so later events wait — filter by aggregate type as the quickstart does |
+| `handle` throws or times out | `onFailure` decides: `Retry(delay)` or `GiveUp` (by default it retries with capped backoff, forever). With ordering, only that aggregate's later work in that use case waits |
+| A use case's `on(...)` block throws, or its event can't be deserialized | The event is [parked](#when-a-mapping-fails) in that use case's queue and retried with capped backoff, forever, logging each failure; other use cases and the reactor carry on |
+| `onFailure` or `onCompletion` throws | The work is retried after a backoff, so `handle` may run again |
+| Stored work can't be read (e.g. a trigger class was renamed) | Retried with backoff from 10 seconds up to 1 hour |
+| A node crashes mid-work | db-scheduler notices the missing heartbeat and runs it again |
+| The database or queue is down while the reactor queues work | The reactor stops the batch and resumes from its last saved position on the next poll |
+| A contract can't read or map an event | The contract stops at that event and retries it every poll, for everyone listening to it |
 | A command loses a concurrent update | `handle` reads and decides again, up to `maxConflictRetries` times (5 by default). `OptimisticConcurrencyException` only surfaces when those run out: reduce contention on that aggregate or raise `maxConflictRetries`. Inside an outer `jdbc.transaction { }` there are no retries: retry the whole transaction (see [Several aggregates in one transaction](#several-aggregates-in-one-transaction)) |
 
-**Tune throughput.** The outbox and contracts poll every 500ms (`pollInterval`) and read up to 100
-events per poll (`batchSize`). `Scheduler.threads(n)` caps how many reactions run at once.
+**Tune throughput.** The reactor, contracts and process managers poll every 500ms (`pollInterval`) and read up
+to 100 events per poll (`batchSize`). `Scheduler.threads(n)` caps how much work runs at once.
 
 ## Known limitations
 
@@ -1647,28 +1714,29 @@ failure in a specific spot to show up.
   check finally fails. If a check takes the lock while `stop()` is running, the "Stepped down" line is
   skipped.
 
-**Ordered reactions**
+**Use cases**
 
-- **An executor stays tied to its first ordered source.** Once an ordered outbox or contract has been built
-  on an executor, building another one on the same executor instance fails, even if the first has been
-  stopped. If you rebuild outboxes in-process (for example on an application context refresh), create new
-  executors as well.
-- **Subscriptions sharing an executor must be deterministic.** Within one contract, reactions from all
-  ordered subscriptions on an executor are numbered together. A re-dispatch after a crash is only
-  recognised as a duplicate if every one of those subscriptions returns the same reactions, in the same
-  order, for the same event.
-- **At most 9,999 reactions per event on one ordered executor.** Beyond that, reactions sort in the wrong
-  order. This is not checked.
+- **Replays repeat finished work.** A queue recognises a reaction id only while its work is pending. Moving the
+  reactor's position back, or a crash between queueing work and saving the position after the work has already
+  run, runs it again. `handle` must be idempotent.
+- **A use case's blocks must be deterministic.** Reaction ids number an event's triggers by their position in the
+  block's output, so a re-read event is only recognised if the block returns the same triggers, in the same
+  order.
+- **A new use case doesn't see history.** It shares the reactor's position, so it sees events from when it is
+  first deployed. Backfilling one use case is not supported.
+- **Removing a use case leaves its queued work behind.** Its db-scheduler task is no longer registered, so its
+  rows stay in `scheduled_tasks`. Let its work finish, or cancel its rows, before removing it.
+- **At most 9,999 triggers per event in an ordered use case.** Beyond that, they sort in the wrong order. This
+  is not checked.
 - **Aggregate types containing `/` can share ordering keys.** The ordering key is
   `"<aggregate type>/<aggregate id>"`, so type `a/b` with id `c` and type `a` with id `b/c` share one key.
-  Their reactions then wait on each other unnecessarily; nothing runs out of order.
-- **Unreadable reaction data affects the blocked-reaction helpers.** If any pending reaction of the task has
-  stored data that can't be decoded, `blockedReactions`, `retryBlocked` and `skipBlocked` fail. A reaction
-  whose trigger can't be decoded holds back its aggregate's later reactions without being listed by
-  `blockedReactions`.
-- **Prompt hand-over needs immediate execution.** When a reaction finishes, the aggregate's next reaction is
-  rescheduled to run now. It only starts straight away if the `Scheduler` uses
-  `enableImmediateExecution()`; otherwise it starts on db-scheduler's next poll.
+  Their work then waits unnecessarily; nothing runs out of order.
+- **Unreadable stored work affects the blocked-reaction helpers.** If any pending work of the use case has
+  stored data that can't be decoded, `blockedReactions`, `retryBlocked` and `skipBlocked` fail. Work whose
+  trigger can't be decoded holds back its aggregate's later work without being listed by `blockedReactions`.
+- **Prompt hand-over needs immediate execution.** When ordered work finishes, the aggregate's next work is
+  rescheduled to run now. It only starts straight away if the `Scheduler` uses `enableImmediateExecution()`;
+  otherwise it starts on db-scheduler's next poll.
 - **Replaying an aggregate that was once written out of order is slow.** For such an aggregate, every event
   pays a full check whose cost grows with the aggregate's history. This only applies to aggregates written by
   an outer transaction that changed several aggregates in a racing order, and only matters for very long

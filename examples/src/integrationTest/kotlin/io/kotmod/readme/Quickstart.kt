@@ -1,6 +1,6 @@
 package io.kotmod.readme
 
-// Keep in sync with README.md (Quickstart, steps 2, 3 and 5).
+// Keep in sync with README.md (Quickstart, steps 2, 3 and 4).
 
 import io.kotmod.AggregateId
 import io.kotmod.AggregateKind
@@ -11,15 +11,17 @@ import io.kotmod.InitialState
 import io.kotmod.Outcome
 import io.kotmod.Repository
 import io.kotmod.accept
-import io.kotmod.event.reaction.EventReactionTrigger
 import io.kotmod.jdbc.JdbcContext
+import io.kotmod.reaction.FailureDecision
+import io.kotmod.reaction.GiveUp
+import io.kotmod.reaction.ReactionContext
+import io.kotmod.reaction.ReactionResult
+import io.kotmod.reaction.Reactions
+import io.kotmod.reaction.Retry
 import io.kotmod.reject
 import io.kotmod.serialization.jsonDataSerializationContext
 import io.kotmod.serialization.toEventSerializer
-import io.kotmod.event.reaction.EventReactionTriggerSerializer
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
-import kotlin.time.Duration
 
 @Serializable
 sealed interface OrderEvent : DomainEvent
@@ -186,25 +188,53 @@ class OrderRepository(
 }
 
 @Serializable
-sealed interface OrderNotification : EventReactionTrigger
+sealed interface OrderNotification
 
 @Serializable
 data class SendOrderConfirmation(
     val orderId: String,
-    override val timeout: Duration? = null,
 ) : OrderNotification
 
 @Serializable
 data class SendReviewReminder(
     val orderId: String,
-    override val timeout: Duration? = null,
 ) : OrderNotification
 
-object OrderNotificationSerializer : EventReactionTriggerSerializer<OrderNotification> {
-    override suspend fun serialize(trigger: OrderNotification): String = Json.encodeToString(OrderNotification.serializer(), trigger)
+class OrderNotifications(
+    private val confirm: (orderId: String) -> Unit,
+) : Reactions<OrderNotification>(
+        name = "order-notifications",
+        triggers = OrderNotification.serializer(),
+    ) {
+    init {
+        on(Orders) { event, metadata ->
+            when (event) {
+                is OrderPlaced -> trigger(SendOrderConfirmation(metadata.aggregateId.value))
+                is OrderShipped, is OrderCancelled -> Unit
+            }
+        }
+    }
 
-    override suspend fun deserialize(serializedTrigger: String): OrderNotification =
-        Json.decodeFromString(OrderNotification.serializer(), serializedTrigger)
+    override suspend fun handle(
+        trigger: OrderNotification,
+        context: ReactionContext,
+    ) = when (trigger) {
+        is SendOrderConfirmation -> confirm(trigger.orderId)
+        is SendReviewReminder -> println("Asking for a review of order ${trigger.orderId}")
+    }
+
+    override fun onFailure(
+        trigger: OrderNotification,
+        attempt: Int,
+        error: Throwable,
+    ): FailureDecision = if (attempt < 5) Retry(backoff(attempt)) else GiveUp
+
+    override suspend fun onCompletion(
+        trigger: OrderNotification,
+        result: ReactionResult,
+    ) {
+        println("$trigger finished: $result")
+    }
 }
 
 fun sendConfirmation(orderId: String) {

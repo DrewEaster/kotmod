@@ -3,8 +3,9 @@ package io.kotmod.readme
 // Keep in sync with README.md (Guides). These must compile; QuickstartTest runs the quickstart.
 
 import com.github.kagkarlsson.scheduler.Scheduler
-import io.kotmod.AggregateId
+import com.github.kagkarlsson.scheduler.task.TaskInstanceId
 import io.kotmod.AggregateAlreadyExistsException
+import io.kotmod.AggregateId
 import io.kotmod.AggregateManager
 import io.kotmod.AggregateType
 import io.kotmod.CommandAlreadyRecordedException
@@ -19,18 +20,11 @@ import io.kotmod.PersistedEvent
 import io.kotmod.PublicDomainEvent
 import io.kotmod.Repository
 import io.kotmod.contract.PublicEventContract
-import io.kotmod.event.reaction.EventReaction
-import io.kotmod.event.reaction.EventReactionExecutor
-import io.kotmod.event.reaction.EventReactionId
-import io.kotmod.event.reaction.EventReactionTrigger
-import io.kotmod.event.reaction.EventReactionTriggerSerializer
 import io.kotmod.event.reaction.OnGiveUp
 import io.kotmod.event.reaction.ReactionOrdering
-import io.kotmod.event.reaction.dbscheduler.DbSchedulerEventReactions
 import io.kotmod.event.reaction.dbscheduler.DbSchedulerQueues
 import io.kotmod.jdbc.JdbcContext
 import io.kotmod.jdbc.transaction
-import io.kotmod.outbox.AggregateEventOutbox
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.PostgresDomainPollingBackend
 import io.kotmod.postgres.PostgresLeaderElection
@@ -43,15 +37,16 @@ import io.kotmod.process.ignore
 import io.kotmod.process.schedule
 import io.kotmod.process.target
 import io.kotmod.process.transition
+import io.kotmod.reaction.EventReactor
+import io.kotmod.reaction.ReactionContext
+import io.kotmod.reaction.Reactions
 import io.kotmod.serialization.jsonDataSerializationContext
 import io.kotmod.serialization.toEventSerializer
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import java.sql.DriverManager
 import javax.sql.DataSource
-import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
 import kotlin.time.Instant
 
@@ -149,101 +144,125 @@ val orderEventSerialization =
         }
     }
 
-// Guide: Durable reactions with db-scheduler
+// Guide: Use cases
 
-@Serializable
-sealed interface BillingTrigger : EventReactionTrigger
+class ReviewReminders :
+    Reactions<OrderNotification>(
+        name = "review-reminders",
+        triggers = OrderNotification.serializer(),
+    ) {
+    init {
+        on(Orders) { event, metadata ->
+            if (event is OrderShipped) {
+                trigger(SendReviewReminder(metadata.aggregateId.value), notBefore = metadata.timestamp + 7.days)
+            }
+        }
+    }
 
-@Serializable
-data class ChargeCustomer(
-    val orderId: String,
-    override val timeout: Duration? = null,
-) : BillingTrigger
-
-object BillingTriggerSerializer : EventReactionTriggerSerializer<BillingTrigger> {
-    override suspend fun serialize(trigger: BillingTrigger): String = Json.encodeToString(BillingTrigger.serializer(), trigger)
-
-    override suspend fun deserialize(serializedTrigger: String): BillingTrigger =
-        Json.decodeFromString(BillingTrigger.serializer(), serializedTrigger)
+    override suspend fun handle(
+        trigger: OrderNotification,
+        context: ReactionContext,
+    ) {
+        println("Asking for a review: $trigger")
+    }
 }
 
-fun sharedScheduler(
+// Guide: Running use cases on db-scheduler
+
+fun startReactions(
     dataSource: DataSource,
-    billing: DbSchedulerEventReactions<BillingTrigger>,
-    notifications: DbSchedulerEventReactions<OrderNotification>,
-): Scheduler =
-    Scheduler
-        .create(dataSource, billing.task, notifications.task)
-        .threads(10)
-        .enableImmediateExecution()
-        .build()
+    jdbc: JdbcContext,
+    election: PostgresLeaderElection,
+): Pair<EventReactor, Scheduler> {
+    val queues = DbSchedulerQueues(jdbc)
+    val reactor = EventReactor(jdbc, queues, isLeader = election::isLeader)
+    reactor.register(OrderNotifications(::sendConfirmation))
+    reactor.register(ReviewReminders())
+    reactor.register(OrderStatusProjection(jdbc))
+    val scheduler =
+        Scheduler
+            .create(dataSource, *queues.tasks.toTypedArray())
+            .threads(10)
+            .enableImmediateExecution()
+            .build()
+    queues.bind(scheduler)
+    reactor.start()
+    scheduler.start()
+    return reactor to scheduler
+}
 
 fun cancelPendingConfirmation(
     scheduler: Scheduler,
-    notifications: DbSchedulerEventReactions<OrderNotification>,
     eventId: EventId,
 ) {
-    scheduler.cancel(notifications.task.instanceId("confirmation-${eventId.value}"))
+    scheduler.cancel(TaskInstanceId.of("order-notifications", "order-notifications/${eventId.value}/0"))
 }
 
-// Guide: Ordered reactions
+// Guide: Ordered use cases
 
-fun orderedNotifications(jdbc: JdbcContext): DbSchedulerEventReactions<OrderNotification> =
-    DbSchedulerEventReactions("order-notifications", OrderNotificationSerializer, jdbc = jdbc)
+@Serializable
+sealed interface OrderStatusChange
 
-fun orderedOutbox(
-    jdbc: JdbcContext,
-    serialization: DataSerializationContext<OrderEvent>,
-    offsets: PostgresOffsetManager,
-    executor: EventReactionExecutor<OrderNotification, *>,
-): AggregateEventOutbox<OrderNotification> =
-    AggregateEventOutbox(
-        backend = PostgresDomainPollingBackend(jdbc),
-        executor = executor,
-        eventToReactions = { event ->
-            when (serialization.deserialize(event.serialized)) {
-                is OrderPlaced -> listOf(EventReaction(EventReactionId("confirmation-${event.metadata.eventId.value}"), SendOrderConfirmation(event.metadata.aggregateId.value)))
-                else -> emptyList()
-            }
-        },
-        getPosition = { offsets.getPosition("order-notifications") },
-        savePosition = { offsets.savePosition("order-notifications", it) },
-        isLeader = { true },
-        ordering = ReactionOrdering.PerAggregate(onGiveUp = OnGiveUp.BlockAggregate),
-    )
+@Serializable
+data class StatusChanged(
+    val orderId: String,
+    val status: String,
+) : OrderStatusChange
 
-// Guide: Delayed reactions
-
-fun reviewReminderOutbox(
-    jdbc: JdbcContext,
-    serialization: DataSerializationContext<OrderEvent>,
-    offsets: PostgresOffsetManager,
-    executor: EventReactionExecutor<OrderNotification, *>,
-): AggregateEventOutbox<OrderNotification> =
-    AggregateEventOutbox(
-        backend = PostgresDomainPollingBackend(jdbc),
-        executor = executor,
-        eventToReactions = { event ->
-            if (event.metadata.aggregateType != Orders.type) {
-                emptyList()
-            } else {
-                when (serialization.deserialize(event.serialized)) {
-                    is OrderShipped ->
-                        listOf(
-                            EventReaction(
-                                id = EventReactionId("review-reminder-${event.metadata.eventId.value}"),
-                                trigger = SendReviewReminder(orderId = event.metadata.aggregateId.value),
-                                notBefore = event.metadata.timestamp + 7.days,
-                            ),
-                        )
-                    else -> emptyList()
+class OrderStatusProjection(
+    private val jdbc: JdbcContext,
+) : Reactions<OrderStatusChange>(
+        name = "order-status-projection",
+        triggers = OrderStatusChange.serializer(),
+    ) {
+    init {
+        on(Orders) { event, metadata ->
+            val status =
+                when (event) {
+                    is OrderPlaced -> "placed"
+                    is OrderShipped -> "shipped"
+                    is OrderCancelled -> "cancelled"
                 }
-            }
-        },
-        getPosition = { offsets.getPosition("review-reminders") },
-        savePosition = { offsets.savePosition("review-reminders", it) },
-        isLeader = { true },
-    )
+            trigger(StatusChanged(metadata.aggregateId.value, status))
+        }
+    }
+
+    override val ordering = ReactionOrdering.PerAggregate(onGiveUp = OnGiveUp.BlockAggregate)
+
+    override suspend fun handle(
+        trigger: OrderStatusChange,
+        context: ReactionContext,
+    ) = when (trigger) {
+        is StatusChanged -> saveStatus(trigger.orderId, trigger.status)
+    }
+
+    private fun saveStatus(
+        orderId: String,
+        status: String,
+    ) {
+        jdbc.withConnection { conn ->
+            conn
+                .prepareStatement(
+                    "INSERT INTO order_status (id, status) VALUES (?, ?) " +
+                        "ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status",
+                ).use { ps ->
+                    ps.setString(1, orderId)
+                    ps.setString(2, status)
+                    ps.executeUpdate()
+                }
+        }
+    }
+}
+
+fun retryBlockedProjection(
+    scheduler: Scheduler,
+    queues: DbSchedulerQueues,
+) {
+    for (blocked in queues.blockedReactions(scheduler, "order-status-projection")) {
+        println("${blocked.key} is held back by ${blocked.reactionId.value} at sequence ${blocked.sequence}")
+        queues.retryBlocked(scheduler, "order-status-projection", blocked.reactionId)
+    }
+}
 
 // Guide: Publishing events to other contexts
 
@@ -257,39 +276,80 @@ data class OrderPlacedV1(
 
 fun orderContract(
     jdbc: JdbcContext,
-    serialization: DataSerializationContext<OrderEvent>,
     offsets: PostgresOffsetManager,
-    billingExecutor: EventReactionExecutor<BillingTrigger, *>,
-): PublicEventContract<OrderEvent, OrderPublicEvent> {
-    val contract =
-        PublicEventContract<OrderEvent, OrderPublicEvent>(
-            backend = PostgresDomainPollingBackend(jdbc),
-            serialization = serialization,
-            internalToPublic = { event ->
-                when (event) {
-                    is OrderPlaced -> OrderPlacedV1(event.item)
-                    else -> null
-                }
-            },
-            getPosition = { offsets.getPosition("order-contract") },
-            savePosition = { offsets.savePosition("order-contract", it) },
-            isLeader = { true },
-            aggregateTypes = setOf(Orders.type),
-        )
+): PublicEventContract<OrderEvent, OrderPublicEvent> =
+    PublicEventContract(
+        backend = PostgresDomainPollingBackend(jdbc),
+        serialization = Orders.eventSerialization,
+        internalToPublic = { event ->
+            when (event) {
+                is OrderPlaced -> OrderPlacedV1(event.item)
+                else -> null
+            }
+        },
+        getPosition = { offsets.getPosition("order-contract") },
+        savePosition = { offsets.savePosition("order-contract", it) },
+        isLeader = { true },
+        aggregateTypes = setOf(Orders.type),
+    )
 
-    contract.subscribe(billingExecutor) { envelope ->
-        when (envelope.event) {
-            is OrderPlacedV1 ->
-                listOf(
-                    EventReaction<BillingTrigger>(
-                        id = EventReactionId("charge-${envelope.metadata.eventId.value}"),
-                        trigger = ChargeCustomer(orderId = envelope.metadata.aggregateId.value),
-                    ),
-                )
+// Guide: Consuming another context's events
+
+@Serializable
+sealed interface BillingTrigger
+
+@Serializable
+data class ChargeCustomer(
+    val orderId: String,
+) : BillingTrigger
+
+interface PaymentGateway {
+    suspend fun charge(
+        orderId: String,
+        idempotencyKey: String,
+    )
+}
+
+class CustomerBilling(
+    orderEvents: PublicEventContract<*, OrderPublicEvent>,
+    private val gateway: PaymentGateway,
+) : Reactions<BillingTrigger>(
+        name = "customer-billing",
+        triggers = BillingTrigger.serializer(),
+    ) {
+    init {
+        on(orderEvents) { event, metadata ->
+            when (event) {
+                is OrderPlacedV1 -> trigger(ChargeCustomer(metadata.aggregateId.value))
+            }
         }
     }
-    return contract
+
+    override suspend fun handle(
+        trigger: BillingTrigger,
+        context: ReactionContext,
+    ) = when (trigger) {
+        is ChargeCustomer -> gateway.charge(trigger.orderId, idempotencyKey = context.reactionId)
+    }
 }
+
+fun startBilling(
+    dataSource: DataSource,
+    jdbc: JdbcContext,
+    orderEvents: PublicEventContract<*, OrderPublicEvent>,
+    gateway: PaymentGateway,
+): Scheduler {
+    val queues = DbSchedulerQueues(jdbc)
+    val reactor = EventReactor(jdbc, queues, isLeader = { true }, name = "billing-reactor")
+    reactor.register(CustomerBilling(orderEvents, gateway))
+    val scheduler = Scheduler.create(dataSource, *queues.tasks.toTypedArray()).enableImmediateExecution().build()
+    queues.bind(scheduler)
+    reactor.start()
+    scheduler.start()
+    return scheduler
+}
+
+// Running in production
 
 fun leaderElection(
     url: String,
@@ -301,20 +361,11 @@ fun leaderElection(
     return election
 }
 
-fun outboxWithLeaderElection(
+fun reactorWithLeaderElection(
     jdbc: JdbcContext,
+    queues: DbSchedulerQueues,
     election: PostgresLeaderElection,
-    offsets: PostgresOffsetManager,
-    executor: EventReactionExecutor<OrderNotification, *>,
-): AggregateEventOutbox<OrderNotification> =
-    AggregateEventOutbox(
-        backend = PostgresDomainPollingBackend(jdbc),
-        executor = executor,
-        eventToReactions = { emptyList() },
-        getPosition = { offsets.getPosition("order-notifications") },
-        savePosition = { offsets.savePosition("order-notifications", it) },
-        isLeader = election::isLeader,
-    )
+): EventReactor = EventReactor(jdbc, queues, isLeader = election::isLeader)
 
 // Guide: Process managers
 

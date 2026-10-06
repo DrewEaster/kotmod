@@ -6,22 +6,12 @@ import com.github.kagkarlsson.scheduler.Scheduler
 import io.kotmod.AggregateId
 import io.kotmod.AggregateManager
 import io.kotmod.CommandResult
-import io.kotmod.event.reaction.BackoffStrategy
-import io.kotmod.event.reaction.EventReaction
-import io.kotmod.event.reaction.EventReactionCompletionResult
-import io.kotmod.event.reaction.EventReactionExecutionResult
-import io.kotmod.event.reaction.EventReactionExecutor
-import io.kotmod.event.reaction.EventReactionId
-import io.kotmod.event.reaction.RetrySignal
-import io.kotmod.event.reaction.dbscheduler.DbSchedulerEventReactions
+import io.kotmod.event.reaction.dbscheduler.DbSchedulerQueues
 import io.kotmod.jdbc.DataSourceJdbcContext
-import io.kotmod.outbox.AggregateEventOutbox
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
-import io.kotmod.postgres.PostgresDomainPollingBackend
-import io.kotmod.postgres.PostgresOffsetManager
-import io.kotmod.postgres.StartFrom
 import io.kotmod.postgres.support.IntegrationTest
 import io.kotmod.postgres.support.eventually
+import io.kotmod.reaction.EventReactor
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.BeforeEach
@@ -60,95 +50,40 @@ class QuickstartTest : IntegrationTest() {
                     initial = NoOrder,
                 )
 
-            // Another aggregate type writing to the same event log, as an app with an audit log would.
-            recordView(auditLog(jdbc), AggregateId("order-1"), viewer = "support", requestId = "view-1")
+            val queues = DbSchedulerQueues(jdbc)
 
-            val orderId = AggregateId("order-1")
-
-            orders.handle(orderId, PlaceOrder("book"))
-
-            val result = orders.handle(orderId, ShipOrder)
-
-            val notifications = DbSchedulerEventReactions("order-notifications", OrderNotificationSerializer)
+            val reactor = EventReactor(jdbc, queues, isLeader = { true })
+            reactor.register(OrderNotifications(::sendConfirmation))
 
             val scheduler =
                 Scheduler
-                    .create(dataSource, notifications.task)
+                    .create(dataSource, *queues.tasks.toTypedArray())
                     .threads(4)
                     .enableImmediateExecution()
                     .build()
+            queues.bind(scheduler)
 
-            val executor =
-                EventReactionExecutor<OrderNotification, Unit>(
-                    sink = notifications.sink(scheduler),
-                    source = notifications.source,
-                    createExecutionContext = { _, _ -> },
-                    execute = { _, _, trigger, _, _ ->
-                        when (trigger) {
-                            is SendOrderConfirmation -> sendConfirmation(trigger.orderId)
-                            is SendReviewReminder -> println("Asking for a review of order ${trigger.orderId}")
-                        }
-                        EventReactionExecutionResult.EventReactionExecutionCompleted
-                    },
-                    failureRetryHandler = { _, _, _, retryCount, _, ex ->
-                        if (retryCount < 5) {
-                            RetrySignal.Retry(BackoffStrategy().calculateBackoff(retryCount))
-                        } else {
-                            RetrySignal.DoNotRetry(
-                                EventReactionCompletionResult.EventReactionFailed(ex.message ?: "failed", allowManualRetry = true),
-                            )
-                        }
-                    },
-                    timeoutRetryHandler = { _, _, _, retryCount, _ ->
-                        RetrySignal.Retry(BackoffStrategy().calculateBackoff(retryCount))
-                    },
-                    onCompletion = { id, _, _, _, _, result ->
-                        println("Reaction ${id.value} finished: $result")
-                    },
-                )
-
-            val offsets = PostgresOffsetManager(jdbc)
-
-            val outbox =
-                AggregateEventOutbox<OrderNotification>(
-                    backend = PostgresDomainPollingBackend(jdbc),
-                    executor = executor,
-                    eventToReactions = { event ->
-                        if (event.metadata.aggregateType != Orders.type) {
-                            // The event log holds every aggregate type's events; only order events can be read here.
-                            emptyList()
-                        } else {
-                            when (Orders.eventSerialization.deserialize(event.serialized)) {
-                                is OrderPlaced ->
-                                    listOf(
-                                        EventReaction(
-                                            id = EventReactionId("confirmation-${event.metadata.eventId.value}"),
-                                            trigger = SendOrderConfirmation(orderId = event.metadata.aggregateId.value),
-                                        ),
-                                    )
-                                else -> emptyList()
-                            }
-                        }
-                    },
-                    getPosition = { offsets.getPosition("order-notifications", startFrom = StartFrom.Beginning) },
-                    savePosition = { offsets.savePosition("order-notifications", it) },
-                    isLeader = { true },
-                )
-
-            executor.start()
+            reactor.start()
             scheduler.start()
-            outbox.start()
 
             try {
+                // Another aggregate type writing to the same event log, as an app with an audit log would.
+                recordView(auditLog(jdbc), AggregateId("order-1"), viewer = "support", requestId = "view-1")
+
+                val orderId = AggregateId("order-1")
+
+                orders.handle(orderId, PlaceOrder("book"))
+
+                val result = orders.handle(orderId, ShipOrder)
+
+                assertEquals(CommandResult.Accepted(ShippedOrder("book")), result)
                 eventually(15.seconds) { sentConfirmations.isNotEmpty() }
                 delay(500) // give a duplicate time to show up
             } finally {
-                outbox.stop()
                 scheduler.stop()
-                executor.stop()
+                reactor.stop()
             }
 
-            assertEquals(CommandResult.Accepted(ShippedOrder("book")), result)
             assertEquals(listOf("order-1"), sentConfirmations.toList())
         }
 
