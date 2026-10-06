@@ -25,7 +25,7 @@ class UseCaseRuntimeTest {
     private var now = Instant.parse("2026-10-06T10:00:00Z")
     private val queues = ManualQueues(enforceOrdering = true)
 
-    private fun runtime(useCase: Reactions<Notice>) = UseCaseRuntime(useCase, queues, clock = { now }).also { it.start() }
+    private fun runtime(useCase: Reactions<Notice>) = UseCaseRuntime(useCase, queues, readEvent = { null }, clock = { now }).also { it.start() }
 
     private suspend fun UseCaseRuntime<Notice>.send(
         id: String,
@@ -46,7 +46,7 @@ class UseCaseRuntimeTest {
     @Test
     fun `an ordered use case needs a queue that supports ordering`() {
         assertFailsWith<IllegalArgumentException> {
-            UseCaseRuntime(RecordingUseCase(ordering = ReactionOrdering.PerAggregate()), ManualQueues(supportsOrdering = false), clock = { now })
+            UseCaseRuntime(RecordingUseCase(ordering = ReactionOrdering.PerAggregate()), ManualQueues(supportsOrdering = false), readEvent = { null }, clock = { now })
         }
     }
 
