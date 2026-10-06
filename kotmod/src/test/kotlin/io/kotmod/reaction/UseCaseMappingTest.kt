@@ -3,16 +3,24 @@ package io.kotmod.reaction
 import io.kotmod.PersistedEvent
 import io.kotmod.event.reaction.DispatchOrdering
 import io.kotmod.event.reaction.EventReactionId
+import io.kotmod.event.reaction.EventReactionTrigger
+import io.kotmod.event.reaction.EventReactionTriggerSerializer
+import io.kotmod.event.reaction.EventReactionTriggerSink
 import io.kotmod.event.reaction.OnGiveUp
+import io.kotmod.event.reaction.ReactionChannel
 import io.kotmod.event.reaction.ReactionOrdering
 import io.kotmod.event.reaction.ReactionOutcome
+import io.kotmod.event.reaction.ReactionQueues
 import io.kotmod.process.ManualQueues
 import io.kotmod.support.OrderPlaced
 import io.kotmod.support.OrderShipped
 import io.kotmod.support.persistedEvent
 import kotlinx.coroutines.runBlocking
+import java.io.IOException
+import java.util.concurrent.CancellationException
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.hours
@@ -139,24 +147,94 @@ class UseCaseMappingTest {
         }
 
     @Test
-    fun `with ordering, an aggregate's later events wait behind its parked mapping and run in sequence order after the fix`() =
+    fun `with ordering, an aggregate's later events wait behind its still-failing parked mapping and run in order after the fix`() =
         runBlocking {
-            var brokenFor = 1
+            var brokenFor = 2
             val useCase =
                 RecordingUseCase(ordering = ReactionOrdering.PerAggregate(), mapping = { _, m ->
-                    if (m.aggregateId.value == "o-1" && m.sequence == 1L && brokenFor-- > 0) error("fix not deployed yet")
+                    val parkedEvent = m.aggregateId.value == "o-1" && m.sequence == 1L
+                    if (parkedEvent && brokenFor-- > 0) error("fix not deployed yet")
                     trigger(Confirm("${m.aggregateId.value}#${m.sequence}"))
+                    if (parkedEvent) trigger(Confirm("o-1#1-again"))
                 })
             val runtime = runtime(useCase)
             runtime.read(orderEvent(OrderPlaced("a"), eventId = "e-1", orderId = "o-1", sequence = 1))
             runtime.read(orderEvent(OrderShipped("a"), eventId = "e-2", orderId = "o-1", sequence = 2))
             runtime.read(orderEvent(OrderPlaced("b"), eventId = "e-3", orderId = "o-2", sequence = 1))
 
-            queues.deliver("confirmations")
+            assertEquals(listOf<ReactionOutcome>(ReactionOutcome.Retry(1.seconds), ReactionOutcome.Finished(gaveUp = false)), queues.deliver("confirmations"))
 
             assertEquals(listOf<Notice>(Confirm("o-2#1")), useCase.handled.map { it.first })
+            assertEquals(listOf("confirmations/e-1/mapping", "confirmations/e-2/0"), ids("confirmations"))
             deliverAll("confirmations")
-            assertEquals(listOf<Notice>(Confirm("o-2#1"), Confirm("o-1#1"), Confirm("o-1#2")), useCase.handled.map { it.first })
+            assertEquals(
+                listOf<Notice>(Confirm("o-2#1"), Confirm("o-1#1"), Confirm("o-1#1-again"), Confirm("o-1#2")),
+                useCase.handled.map { it.first },
+            )
+        }
+
+    @Test
+    fun `routing an event again after its mapping succeeded queues no new work`() =
+        runBlocking {
+            val runtime = runtime(RecordingUseCase())
+            val event = log.add(orderEvent(OrderPlaced("book")))
+
+            runtime.routeLocal(event)
+            runtime.routeLocal(event)
+
+            assertEquals(listOf("confirmations/e-1/0"), ids("confirmations"))
+        }
+
+    @Test
+    fun `routing a parked event again queues no new work`() =
+        runBlocking {
+            val runtime = runtime(RecordingUseCase(mapping = { _, _ -> error("broken") }))
+            val event = log.add(orderEvent(OrderPlaced("book")))
+
+            runtime.routeLocal(event)
+            runtime.routeLocal(event)
+
+            assertEquals(listOf("confirmations/e-1/mapping"), ids("confirmations"))
+        }
+
+    @Test
+    fun `if queueing fails part-way, the failure reaches the reader and routing the event again queues every trigger exactly once`() =
+        runBlocking {
+            val flaky = FailingQueues(queues, failOnPublish = 2)
+            val useCase =
+                RecordingUseCase(mapping = { _, m ->
+                    trigger(Confirm(m.aggregateId.value))
+                    trigger(Confirm("${m.aggregateId.value}-again"))
+                })
+            val runtime = UseCaseRuntime(useCase, flaky, log::readEvent, clock = { now }).also { it.start() }
+            val event = log.add(orderEvent(OrderPlaced("book")))
+
+            assertFailsWith<IOException> { runtime.routeLocal(event) }
+            assertEquals(listOf("confirmations/e-1/0"), ids("confirmations"))
+            runtime.routeLocal(event)
+            deliverAll("confirmations")
+
+            assertEquals(listOf<Notice>(Confirm("o-1"), Confirm("o-1-again")), useCase.handled.map { it.first })
+            assertEquals(listOf("confirmations/e-1/0", "confirmations/e-1/1"), useCase.handled.map { it.second.reactionId })
+        }
+
+    @Test
+    fun `a block that throws a CancellationException while the reader is running is parked`() =
+        runBlocking {
+            val useCase = RecordingUseCase(mapping = { _, _ -> throw CancellationException("the app's, not the reader's") })
+
+            runtime(useCase).read(orderEvent(OrderPlaced("book")))
+
+            assertEquals(listOf("confirmations/e-1/mapping"), ids("confirmations"))
+        }
+
+    @Test
+    fun `a parked mapping whose block throws a CancellationException keeps retrying`() =
+        runBlocking {
+            runtime(RecordingUseCase(mapping = { _, _ -> throw CancellationException("the app's") })).read(orderEvent(OrderPlaced("book")))
+
+            assertEquals(listOf<ReactionOutcome>(ReactionOutcome.Retry(1.seconds)), queues.deliver("confirmations"))
+            assertEquals(listOf("confirmations/e-1/mapping"), ids("confirmations"))
         }
 
     @Test
@@ -233,4 +311,33 @@ class UseCaseMappingTest {
             assertEquals(listOf<ReactionOutcome>(ReactionOutcome.Retry(1.seconds)), queues.deliver("confirmations"))
             assertEquals(listOf("confirmations/e-1/mapping"), ids("confirmations"))
         }
+}
+
+/** Wraps [inner], throwing on its [failOnPublish]th publish (counting across channels). */
+private class FailingQueues(
+    private val inner: ReactionQueues,
+    private var failOnPublish: Int,
+) : ReactionQueues {
+    override fun <T : EventReactionTrigger> channel(
+        name: String,
+        triggerSerializer: EventReactionTriggerSerializer<T>,
+        ordered: Boolean,
+    ): ReactionChannel<T> {
+        val channel = inner.channel(name, triggerSerializer, ordered)
+        val sink =
+            object : EventReactionTriggerSink<T> {
+                override val supportsOrdering = channel.sink.supportsOrdering
+
+                override suspend fun publish(
+                    id: EventReactionId,
+                    trigger: T,
+                    ordering: DispatchOrdering?,
+                    notBefore: Instant?,
+                ) {
+                    if (--failOnPublish == 0) throw IOException("queue unavailable")
+                    channel.sink.publish(id, trigger, ordering, notBefore)
+                }
+            }
+        return ReactionChannel(sink, channel.source)
+    }
 }

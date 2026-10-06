@@ -16,6 +16,8 @@ import io.kotmod.process.JsonTriggerSerializer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.SerialName
@@ -121,13 +123,21 @@ internal class UseCaseRuntime<T : Any>(
         val items =
             try {
                 encodeAll(map())
-            } catch (e: CancellationException) {
-                throw e
             } catch (e: Throwable) {
+                rethrowIfCancelled(e)
                 park(metadata, source, e)
                 return
             }
         publishAll(metadata, items)
+    }
+
+    /**
+     * Rethrows [error] if it is a [CancellationException] and this coroutine was cancelled. The mapping blocks don't
+     * suspend, so a CancellationException thrown while the coroutine is still active came from the app's code: it is
+     * a mapping failure like any other.
+     */
+    private suspend fun rethrowIfCancelled(error: Throwable) {
+        if (error is CancellationException && !currentCoroutineContext().isActive) throw error
     }
 
     private fun encode(trigger: T): String = Json.encodeToString(useCase.triggers, trigger)
@@ -195,9 +205,8 @@ internal class UseCaseRuntime<T : Any>(
         try {
             remap(item)
             ReactionOutcome.Finished(gaveUp = false)
-        } catch (e: CancellationException) {
-            throw e
         } catch (e: Throwable) {
+            rethrowIfCancelled(e)
             val delay = backoff.calculateBackoff(attempt)
             log.error(
                 "Parked mapping {} of use case {} (event {} of {}/{} from {}) failed again; retrying in {} [attempt={}]",
