@@ -121,10 +121,3 @@ class DbSchedulerEventReactions<T : EventReactionTrigger>(
             data.blocked && data.ordering?.reactionId == id.value
         } ?: throw IllegalArgumentException("No blocked event reaction ${id.value} for task $taskName")
 }
-
-/** An ordered reaction holding back its aggregate (identified by [key]) after giving up. */
-data class BlockedReaction(
-    val key: String,
-    val reactionId: EventReactionId,
-    val sequence: Long,
-)

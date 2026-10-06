@@ -157,14 +157,14 @@ class ProcessManagerTest {
     private suspend fun ProcessManager<Window, WindowInput, *>.openWindowFor(orderId: String) {
         log.add(persistedEvent(globalOffset = 0, eventId = "e-$orderId", aggregateType = "Order", aggregateId = orderId))
         tickForTest()
-        queues.deliver("inputs")
+        queues.deliver("Window-inputs")
         log.copyProcessStream()
         tickForTest()
     }
 
     private suspend fun ProcessManager<Window, WindowInput, *>.elapse() {
         now = closeAt
-        queues.deliver("internal")
+        queues.deliver("Window-internal")
         log.copyProcessStream()
         tickForTest()
     }
@@ -172,7 +172,7 @@ class ProcessManagerTest {
     @Test
     fun `the manager asks for its three channels`() {
         manager()
-        assertEquals(listOf("inputs" to false, "internal" to false, "commands" to false), queues.channels)
+        assertEquals(listOf("Window-inputs" to false, "Window-internal" to false, "Window-commands" to false), queues.channels)
     }
 
     @Test
@@ -183,7 +183,7 @@ class ProcessManagerTest {
             pm.openWindowFor("o-1")
 
             assertEquals(OpenWindow("o-1"), windows.store[AggregateId("window-o-1")])
-            val scheduled = queues.pending("internal").single()
+            val scheduled = queues.pending("Window-internal").single()
             assertTrue(scheduled.id.value.startsWith("sched-"))
             assertEquals(closeAt, scheduled.notBefore)
         }
@@ -194,13 +194,13 @@ class ProcessManagerTest {
             val pm = manager()
             pm.openWindowFor("o-1")
 
-            assertIs<ReactionOutcome.Wait>(queues.deliver("internal").single())
+            assertIs<ReactionOutcome.Wait>(queues.deliver("Window-internal").single())
             assertEquals(OpenWindow("o-1"), windows.store[AggregateId("window-o-1")])
 
             pm.elapse()
 
             assertEquals(ClosedWindow("o-1"), windows.store[AggregateId("window-o-1")])
-            val command = queues.pending("commands").single()
+            val command = queues.pending("Window-commands").single()
             assertTrue(command.id.value.startsWith("cmd-"))
             assertEquals("\"ship\"", (command.trigger as CommandTrigger).command)
         }
@@ -213,10 +213,10 @@ class ProcessManagerTest {
             pm.openWindowFor("o-1")
             pm.elapse()
 
-            queues.deliver("commands")
+            queues.deliver("Window-commands")
 
             assertEquals(ShippedOrder("o-1"), orderRepository.store[AggregateId("o-1")])
-            assertTrue(queues.pending("internal").none { it.id.value.startsWith("rejected-") })
+            assertTrue(queues.pending("Window-internal").none { it.id.value.startsWith("rejected-") })
         }
 
     @Test
@@ -226,8 +226,8 @@ class ProcessManagerTest {
             pm.openWindowFor("o-1")
             pm.elapse()
 
-            queues.deliver("commands")
-            queues.deliver("internal")
+            queues.deliver("Window-commands")
+            queues.deliver("Window-internal")
 
             assertEquals(ClosedWindow("o-1", blocked = OrderNotFound), windows.store[AggregateId("window-o-1")])
         }
@@ -238,15 +238,15 @@ class ProcessManagerTest {
             val pm = manager()
             pm.openWindowFor("o-1")
             pm.elapse()
-            val command = queues.pending("commands").single()
+            val command = queues.pending("Window-commands").single()
 
-            queues.deliver("commands")
+            queues.deliver("Window-commands")
             queues.redeliver(command)
-            queues.deliver("commands")
+            queues.deliver("Window-commands")
 
             assertEquals(1, orderBackend.commands.size)
-            assertEquals(1, queues.pending("internal").count { it.id.value.startsWith("rejected-") })
-            queues.deliver("internal")
+            assertEquals(1, queues.pending("Window-internal").count { it.id.value.startsWith("rejected-") })
+            queues.deliver("Window-internal")
             assertEquals(ClosedWindow("o-1", blocked = OrderNotFound), windows.store[AggregateId("window-o-1")])
         }
 
@@ -267,7 +267,7 @@ class ProcessManagerTest {
             pm.openWindowFor("o-1")
             now = closeAt
 
-            assertIs<ReactionOutcome.Retry>(queues.deliver("internal").single())
+            assertIs<ReactionOutcome.Retry>(queues.deliver("Window-internal").single())
             assertEquals(OpenWindow("o-1"), windows.store[AggregateId("window-o-1")])
         }
 
@@ -279,8 +279,8 @@ class ProcessManagerTest {
 
             pm.tickForTest()
 
-            assertEquals("Order/o-1", queues.pending("inputs").single().ordering?.key)
-            assertEquals(listOf("inputs" to true, "internal" to false, "commands" to false), queues.channels)
+            assertEquals("Order/o-1", queues.pending("Window-inputs").single().ordering?.key)
+            assertEquals(listOf("Window-inputs" to true, "Window-internal" to false, "Window-commands" to false), queues.channels)
         }
 
     @Test
@@ -314,8 +314,8 @@ class ProcessManagerTest {
         manager(start = false).subscribeToOrders()
         manager(inputOrdering = ReactionOrdering.PerAggregate(), start = false).subscribeToOrders("ordered-orders")
 
-        assertEquals("contract-orders" to false, queues.channels[3])
-        assertEquals("contract-ordered-orders" to true, queues.channels[7])
+        assertEquals("Window-contract-orders" to false, queues.channels[3])
+        assertEquals("Window-contract-ordered-orders" to true, queues.channels[7])
     }
 
     @Test
@@ -328,8 +328,8 @@ class ProcessManagerTest {
 
             contract.tickForTest()
 
-            assertEquals(EventReactionId("in-p-1"), queues.pending("contract-orders").single().id)
-            queues.deliver("contract-orders")
+            assertEquals(EventReactionId("in-p-1"), queues.pending("Window-contract-orders").single().id)
+            queues.deliver("Window-contract-orders")
             assertEquals(OpenWindow("o-1"), windows.store[AggregateId("window-o-1")])
         }
 
@@ -343,7 +343,7 @@ class ProcessManagerTest {
 
             contract.tickForTest()
 
-            assertTrue(queues.pending("contract-orders").isEmpty())
+            assertTrue(queues.pending("Window-contract-orders").isEmpty())
         }
 
     @Test

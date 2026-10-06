@@ -194,7 +194,7 @@ class ProcessManagerIntegrationTest : IntegrationTest() {
         viaContract: Boolean = false,
         block: suspend () -> Unit,
     ) {
-        val queues = DbSchedulerProcessManagerQueues("windows", jdbc)
+        val queues = DbSchedulerQueues(jdbc)
         val offsets = PostgresOffsetManager(jdbc)
         val windows =
             ProcessManager(

@@ -46,8 +46,9 @@ import kotlin.time.Instant
  * - Scheduled inputs (timeouts) are delivered at their time.
  *
  * It reads the event log with its own poller (only while [isLeader]), and runs its work on channels from [queues]:
- * `inputs`, `internal` (scheduled inputs and rejection feedback), `commands`, and one per [subscribeTo]. Failures are
- * retried with capped backoff and never given up. Start it before the queue's scheduler, and stop it after.
+ * `<type>-inputs`, `<type>-internal` (scheduled inputs and rejection feedback), `<type>-commands`, and
+ * `<type>-contract-<name>` per [subscribeTo]. Failures are retried with capped backoff and never given up. Start it
+ * before the queue's scheduler, and stop it after.
  *
  * @param type the process manager's aggregate type; its instances and events are recorded under it.
  * @param repository stores each instance's state, in the same transaction as its events.
@@ -119,10 +120,14 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
     private val inputTriggers = JsonTriggerSerializer(InputTrigger.serializer())
     private val ordered = inputOrdering != ReactionOrdering.Unordered
 
-    private val inputs = processExecutor(queues.channel("inputs", inputTriggers, ordered), clock, ::deliverInput)
-    private val internal = processExecutor(queues.channel("internal", inputTriggers, ordered = false), clock, ::deliverInput)
+    private val inputs = processExecutor(queues.channel("${type.value}-inputs", inputTriggers, ordered), clock, ::deliverInput)
+    private val internal = processExecutor(queues.channel("${type.value}-internal", inputTriggers, ordered = false), clock, ::deliverInput)
     private val commands =
-        processExecutor(queues.channel("commands", JsonTriggerSerializer(CommandTrigger.serializer()), ordered = false), clock, ::runCommand)
+        processExecutor(
+            queues.channel("${type.value}-commands", JsonTriggerSerializer(CommandTrigger.serializer()), ordered = false),
+            clock,
+            ::runCommand,
+        )
     private val contractExecutors = mutableListOf<EventReactionExecutor<InputTrigger, Unit>>()
     private val subscriptionNames = mutableSetOf<String>()
     private var started = false
@@ -146,7 +151,7 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
 
     /**
      * Delivers another context's public events to this process manager: [translate] turns each one into the process id
-     * and input it is for, or `null` to ignore it. [name] names the channel, must be unique within this process manager
+     * and input it is for, or `null` to ignore it. [name] names the channel (`<type>-contract-<name>`), must be unique within this process manager
      * and must stay the same across restarts. Must be called before [start].
      */
     fun <P : PublicDomainEvent> subscribeTo(
@@ -156,7 +161,7 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
     ) {
         check(!started) { "subscribeTo() must be called before start()" }
         require(name !in subscriptionNames) { "This process manager already subscribes to a contract named $name" }
-        val executor = processExecutor(queues.channel("contract-$name", inputTriggers, ordered), clock, ::deliverInput)
+        val executor = processExecutor(queues.channel("${type.value}-contract-$name", inputTriggers, ordered), clock, ::deliverInput)
         contract.subscribe(executor, inputOrdering) { envelope ->
             val (processId, input) = translate(envelope) ?: return@subscribe emptyList()
             val inputId = "in-${envelope.metadata.eventId.value}"

@@ -27,7 +27,7 @@ import io.kotmod.event.reaction.EventReactionTriggerSerializer
 import io.kotmod.event.reaction.OnGiveUp
 import io.kotmod.event.reaction.ReactionOrdering
 import io.kotmod.event.reaction.dbscheduler.DbSchedulerEventReactions
-import io.kotmod.event.reaction.dbscheduler.DbSchedulerProcessManagerQueues
+import io.kotmod.event.reaction.dbscheduler.DbSchedulerQueues
 import io.kotmod.jdbc.JdbcContext
 import io.kotmod.jdbc.transaction
 import io.kotmod.outbox.AggregateEventOutbox
@@ -422,7 +422,7 @@ fun dispatchDeadlines(
     orders: AggregateManager<Order, OrderCommand, OrderEvent, OrderRejection>,
     deadlines: Repository<DispatchDeadline>,
     deadlineEvents: DataSerializationContext<DispatchDeadlineEvent>,
-    queues: DbSchedulerProcessManagerQueues,
+    queues: DbSchedulerQueues,
 ): ProcessManager<DispatchDeadline, DispatchDeadlineInput, DispatchDeadlineEvent> {
     val offsets = PostgresOffsetManager(jdbc)
     return ProcessManager(
@@ -450,7 +450,7 @@ fun startDispatchDeadlines(
     deadlines: Repository<DispatchDeadline>,
     deadlineEvents: DataSerializationContext<DispatchDeadlineEvent>,
 ): Scheduler {
-    val queues = DbSchedulerProcessManagerQueues("dispatch-deadlines", jdbc)
+    val queues = DbSchedulerQueues(jdbc)
     val process = dispatchDeadlines(jdbc, serialization, orders, deadlines, deadlineEvents, queues)
     val scheduler = Scheduler.create(dataSource, *queues.tasks.toTypedArray()).enableImmediateExecution().build()
     queues.bind(scheduler)

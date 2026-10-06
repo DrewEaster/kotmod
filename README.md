@@ -1454,7 +1454,7 @@ fun dispatchDeadlines(
     orders: AggregateManager<Order, OrderCommand, OrderEvent, OrderRejection>,
     deadlines: Repository<DispatchDeadline>,
     deadlineEvents: DataSerializationContext<DispatchDeadlineEvent>,
-    queues: DbSchedulerProcessManagerQueues,
+    queues: DbSchedulerQueues,
 ): ProcessManager<DispatchDeadline, DispatchDeadlineInput, DispatchDeadlineEvent> {
     val offsets = PostgresOffsetManager(jdbc)
     return ProcessManager(
@@ -1482,7 +1482,7 @@ fun startDispatchDeadlines(
     deadlines: Repository<DispatchDeadline>,
     deadlineEvents: DataSerializationContext<DispatchDeadlineEvent>,
 ): Scheduler {
-    val queues = DbSchedulerProcessManagerQueues("dispatch-deadlines", jdbc)
+    val queues = DbSchedulerQueues(jdbc)
     val process = dispatchDeadlines(jdbc, serialization, orders, deadlines, deadlineEvents, queues)
     val scheduler = Scheduler.create(dataSource, *queues.tasks.toTypedArray()).enableImmediateExecution().build()
     queues.bind(scheduler)
@@ -1497,8 +1497,10 @@ fun startDispatchDeadlines(
   created later wouldn't be registered with the scheduler.
 - Per-aggregate ordering (`inputOrdering`) delivers an order's events in order, which this process relies on:
   an input the initial state ignores is gone, so out-of-order delivery could lose "shipped".
-- There is one channel per kind of work: inputs (ordered per source aggregate here),
-  internal (timeouts and rejection feedback), commands, and one for each `subscribeTo`.
+- There is one channel per kind of work, each a db-scheduler task named after the process type: inputs (ordered
+  per source aggregate here, `DispatchDeadline-inputs`), internal (timeouts and rejection feedback,
+  `DispatchDeadline-internal`), commands (`DispatchDeadline-commands`), and `DispatchDeadline-contract-<name>` for each
+  `subscribeTo`. One `DbSchedulerQueues` serves every process manager and use case of the context.
 - Inputs are stored as JSON with the input class's name. Renaming an input class breaks inputs that are already
   scheduled or in flight, so keep the old name with `@SerialName`.
 
