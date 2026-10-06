@@ -14,34 +14,34 @@ import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 
 /**
- * A use case: follow-up work in your application, reacting to events. It owns the whole reaction — which events it
- * reacts to, the triggers they produce, and how each trigger is handled — and runs on an [EventReactor].
+ * An event policy: follow-up work in your application, reacting to events. It owns the whole reaction — which events
+ * it reacts to, the triggers they produce, and how each trigger is handled — and runs on an [EventReactor].
  *
  * Declare its sources in `init`: `on(kind) { event, metadata -> … }` for one of this context's aggregate kinds and
  * `on(contract) { event, metadata -> … }` for another context's public events. Inside the block, `trigger(t)` queues a
  * trigger (`trigger(t, notBefore = instant)` delays it). Keep the block deterministic: the same event must produce the
  * same triggers in the same order, because kotmod numbers them to recognise a re-read event. An aggregate type can
- * reach a use case through only one source.
+ * reach a policy through only one source.
  *
  * [handle] does the work: returning means done; throwing, or running longer than [timeout], is a failure that
  * [onFailure] decides on. [onCompletion] is told how the work ended. Delivery is at least once, so [handle] must be
  * idempotent; [ReactionContext.reactionId] is a stable idempotency key.
  *
  * @param T the trigger type: plain `@Serializable` data.
- * @param name names the use case's queue, so keep it stable across releases. Unique within a reactor.
+ * @param name names the policy's queue, so keep it stable across releases. Unique within a reactor.
  * @param triggers serializes the triggers while they wait in the queue.
  */
-abstract class Reactions<T : Any>(
+abstract class EventPolicy<T : Any>(
     val name: String,
     val triggers: KSerializer<T>,
 ) {
     init {
-        require(name.isNotBlank()) { "A use case's name must not be blank" }
+        require(name.isNotBlank()) { "An event policy's name must not be blank" }
     }
 
     private val declared = mutableListOf<ReactionSource<T>>()
 
-    /** Set when the use case is registered with a reactor; its sources can't change after that. */
+    /** Set when the policy is registered with a reactor; its sources can't change after that. */
     @Volatile
     internal var registered: Boolean = false
 
@@ -67,8 +67,8 @@ abstract class Reactions<T : Any>(
     /**
      * Reacts to another context's public events, published by [contract]. Call it from `init`.
      *
-     * The contract's own reader feeds this use case, so the contract must be started (after the use case is registered)
-     * or nothing is delivered. It must read the same event log (database) as the reactor: a parked mapping re-reads its
+     * The contract's own reader feeds this policy, so the contract must be started (after the policy is registered) or
+     * nothing is delivered. It must read the same event log (database) as the reactor: a parked mapping re-reads its
      * event through the reactor, and an event missing there would be retried forever.
      */
     protected fun <P : PublicDomainEvent> on(
@@ -107,11 +107,11 @@ abstract class Reactions<T : Any>(
     internal fun kindSourceFor(type: AggregateType): ReactionSource<T>? = declared.firstOrNull { it is KindSource<*, *> && it.covers(type) }
 
     private fun declare(source: ReactionSource<T>) {
-        check(!registered) { "Use case $name is already registered with a reactor: declare its sources in its init block" }
+        check(!registered) { "Event policy $name is already registered with a reactor: declare its sources in its init block" }
         val clash = declared.firstOrNull { it.overlaps(source) }
         require(clash == null) {
-            "Use case $name listens to the same aggregate type through ${clash?.description} and ${source.description}; " +
-                "an aggregate type can reach a use case through only one source"
+            "Event policy $name listens to the same aggregate type through ${clash?.description} and ${source.description}; " +
+                "an aggregate type can reach a policy through only one source"
         }
         declared += source
     }
@@ -122,10 +122,10 @@ abstract class Reactions<T : Any>(
  * the outer scope's [TriggerScope.trigger] by accident: name the outer receiver explicitly (`this@on.trigger(…)`).
  */
 @DslMarker
-annotation class ReactionsDsl
+annotation class EventPolicyDsl
 
-/** The receiver of a use case's `on(...)` block: [trigger] queues work for the event being read. */
-@ReactionsDsl
+/** The receiver of an event policy's `on(...)` block: [trigger] queues work for the event being read. */
+@EventPolicyDsl
 class TriggerScope<T : Any> internal constructor() {
     internal val produced = mutableListOf<ProducedTrigger<T>>()
 
@@ -138,8 +138,16 @@ class TriggerScope<T : Any> internal constructor() {
     }
 }
 
-/** A trigger a use case's block produced, before it is queued. */
+/** A trigger an event policy's block produced, before it is queued. */
 internal data class ProducedTrigger<out T : Any>(
     val trigger: T,
     val notBefore: Instant?,
 )
+
+/** The name [EventPolicy] had before 0.3.1. */
+@Deprecated("Renamed to EventPolicy", ReplaceWith("EventPolicy<T>", "io.kotmod.reaction.EventPolicy"))
+typealias Reactions<T> = EventPolicy<T>
+
+/** The name [EventPolicyDsl] had before 0.3.1. */
+@Deprecated("Renamed to EventPolicyDsl", ReplaceWith("EventPolicyDsl", "io.kotmod.reaction.EventPolicyDsl"))
+typealias ReactionsDsl = EventPolicyDsl

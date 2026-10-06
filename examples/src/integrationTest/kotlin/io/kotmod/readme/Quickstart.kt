@@ -16,7 +16,7 @@ import io.kotmod.reaction.FailureDecision
 import io.kotmod.reaction.GiveUp
 import io.kotmod.reaction.ReactionContext
 import io.kotmod.reaction.ReactionResult
-import io.kotmod.reaction.Reactions
+import io.kotmod.reaction.EventPolicy
 import io.kotmod.reaction.Retry
 import io.kotmod.reject
 import io.kotmod.serialization.jsonDataSerializationContext
@@ -187,8 +187,8 @@ class OrderRepository(
     }
 }
 
-// This use case does one kind of work. One that does several makes its trigger type a sealed interface, with one
-// class per kind of work (see "Use cases" in the guides).
+// This event policy does one kind of work. One that does several makes its trigger type a sealed interface, with one
+// class per kind of work (see "Event policies" in the guides).
 @Serializable
 data class SendOrderConfirmation(
     val orderId: String,
@@ -196,7 +196,7 @@ data class SendOrderConfirmation(
 
 class OrderNotifications(
     private val confirm: (orderId: String) -> Unit,
-) : Reactions<SendOrderConfirmation>(
+) : EventPolicy<SendOrderConfirmation>(
         name = "order-notifications",
         triggers = SendOrderConfirmation.serializer(),
     ) {

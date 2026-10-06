@@ -35,15 +35,15 @@ import kotlin.time.Duration.Companion.seconds
  * End-to-end failure scenarios on Postgres and db-scheduler. A "fix deployed later" is simulated with a flag the test
  * flips once it has seen the failure parked, so the parked state is observed deterministically before it is resolved.
  */
-class UseCaseFailuresIntegrationTest : IntegrationTest() {
+class EventPolicyFailuresIntegrationTest : IntegrationTest() {
     private fun Seen.forOrder(orderId: String) = handled.filter { it is Confirm && it.orderId == orderId }
 
-    private fun Scheduler.instanceIds(useCase: String) = getScheduledExecutionsForTask(useCase, String::class.java).map { it.taskInstance.id }
+    private fun Scheduler.instanceIds(policy: String) = getScheduledExecutionsForTask(policy, String::class.java).map { it.taskInstance.id }
 
     private fun reactorOffset() = PostgresOffsetManager(jdbc).getPosition("reactor").globalOffset
 
     @Test
-    fun `a broken mapping is parked in its own use case while the others run, and after the fix it runs exactly once`() =
+    fun `a broken mapping is parked in its own event policy while the others run, and after the fix it runs exactly once`() =
         runBlocking<Unit> {
             val fixed = AtomicBoolean(false)
             val failures = AtomicInteger()
@@ -172,7 +172,7 @@ class UseCaseFailuresIntegrationTest : IntegrationTest() {
         }
 
     @Test
-    fun `a failing handle retries only that reaction, and with ordering only its aggregate waits, in its use case only`() =
+    fun `a failing handle retries only that reaction, and with ordering only its aggregate waits, in its event policy only`() =
         runBlocking<Unit> {
             // o-1's first reaction keeps failing until o-2 has been handled and o-1's second is queued behind it, so
             // the order the projection sees is deterministic.
@@ -202,11 +202,11 @@ class UseCaseFailuresIntegrationTest : IntegrationTest() {
             assertEquals((0 until attempts.size).toList(), attempts, "each retry counted once")
             assertEquals(attempts.size - 1, projection.seen.failures.size, "every attempt but the last failed")
             assertEquals(1, projection.seen.contexts.count { it.reactionId == "projection/e-2/0" }, "the later reaction ran once, not retried")
-            assertEquals(listOf(0, 0, 0), emails.seen.contexts.map { it.attempt }, "the other use case never retried")
+            assertEquals(listOf(0, 0, 0), emails.seen.contexts.map { it.attempt }, "the other event policy never retried")
         }
 
     @Test
-    fun `an ordered use case that produces a delayed trigger parks the event rather than stalling the reader`() =
+    fun `an ordered event policy that produces a delayed trigger parks the event rather than stalling the reader`() =
         runBlocking<Unit> {
             val projection =
                 OrderWork("projection", ordering = ReactionOrdering.PerAggregate(), mapping = { _, m ->
@@ -250,7 +250,7 @@ class UseCaseFailuresIntegrationTest : IntegrationTest() {
         }
 
     @Test
-    fun `an ordered use case that gives up with BlockAggregate holds its aggregate until an operator retries it`() =
+    fun `an ordered event policy that gives up with BlockAggregate holds its aggregate until an operator retries it`() =
         runBlocking<Unit> {
             val failing = AtomicBoolean(true)
             val projection =

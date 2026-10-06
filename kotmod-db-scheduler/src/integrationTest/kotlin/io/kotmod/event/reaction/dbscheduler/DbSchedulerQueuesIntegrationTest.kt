@@ -212,13 +212,13 @@ class DbSchedulerQueuesIntegrationTest : IntegrationTest() {
     @Test
     fun `ordered work left in a queue that is no longer ordered still runs`() =
         runBlocking<Unit> {
-            // Deployed as an ordered use case: one ordered reaction is queued but hasn't run yet.
+            // Deployed as an ordered event policy: one ordered reaction is queued but hasn't run yet.
             val before = queues()
             val ordered = TestConsumer(before.channel("test-reactions", TestTriggerSerializer, ordered = true))
             scheduler(before)
             ordered.dispatch(EventReactionId("r-1"), TestTrigger("queued while ordered"), DispatchOrdering("Order/o-1", 1, 0, OnGiveUp.ContinueWithNext))
 
-            // Redeployed as an unordered use case.
+            // Redeployed as an unordered event policy.
             val after = queues()
             val consumer = TestConsumer(after.queue())
             val scheduler = scheduler(after)

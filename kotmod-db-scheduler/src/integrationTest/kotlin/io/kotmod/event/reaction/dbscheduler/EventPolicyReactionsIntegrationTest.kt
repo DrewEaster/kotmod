@@ -19,9 +19,9 @@ import kotlin.test.assertTrue
 import kotlin.time.Clock
 import kotlin.time.Duration.Companion.seconds
 
-class UseCaseReactionsIntegrationTest : IntegrationTest() {
+class EventPolicyReactionsIntegrationTest : IntegrationTest() {
     @Test
-    fun `several use cases each run their own reactions for one event, and one listening to another type runs nothing`() =
+    fun `several event policies each run their own reactions for one event, and one listening to another type runs nothing`() =
         runBlocking {
             val emails = OrderWork("emails")
             val audits = OrderWork("audits")
@@ -68,7 +68,7 @@ class UseCaseReactionsIntegrationTest : IntegrationTest() {
         }
 
     @Test
-    fun `an ordered and an unordered use case on the same aggregate don't block each other`() =
+    fun `an ordered and an unordered event policy on the same aggregate don't block each other`() =
         runBlocking {
             val projection = OrderWork("projection", ordering = ReactionOrdering.PerAggregate(), work = { w, _ -> if (w == Confirm("o-1", 1)) error("projection down") })
             val emails = OrderWork("emails")
@@ -80,11 +80,11 @@ class UseCaseReactionsIntegrationTest : IntegrationTest() {
             }
 
             assertEquals(listOf<Work>(Confirm("o-1", 1), Confirm("o-1", 2)), emails.seen.handled.toList())
-            assertTrue(projection.seen.handled.isEmpty(), "o-1's second event waits behind its failing first, in this use case only")
+            assertTrue(projection.seen.handled.isEmpty(), "o-1's second event waits behind its failing first, in this event policy only")
         }
 
     @Test
-    fun `a use case with a local and a contract source gets typed events from both, and their ordering keys never mix`() =
+    fun `an event policy with a local and a contract source gets typed events from both, and their ordering keys never mix`() =
         runBlocking {
             val payments = paymentContract(jdbc)
             val fraud =
@@ -147,7 +147,7 @@ class UseCaseReactionsIntegrationTest : IntegrationTest() {
         }
 
     @Test
-    fun `a use case added to a running context sees only events from then on`() =
+    fun `an event policy added to a running context sees only events from then on`() =
         runBlocking {
             val emails = OrderWork("emails")
             runningReactor(dataSource, jdbc, listOf(emails)) { _, _ ->

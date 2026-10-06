@@ -17,9 +17,9 @@ import kotlin.time.Instant
 typealias RetryCount = Int
 
 /**
- * One item in a reaction queue, as an [EventReactionTriggerSink] stores it. kotmod's own items implement it (a use
- * case's trigger with what kotmod needs to run it, a parked mapping, a process manager's input or command); a queue
- * only moves them between publish and delivery, converting them with an [EventReactionTriggerSerializer].
+ * One item in a reaction queue, as an [EventReactionTriggerSink] stores it. kotmod's own items implement it (an
+ * event policy's trigger with what kotmod needs to run it, a parked mapping, a process manager's input or command); a
+ * queue only moves them between publish and delivery, converting them with an [EventReactionTriggerSerializer].
  *
  * @property timeout how long one attempt may run; `null` uses the runtime's default.
  */
@@ -42,8 +42,8 @@ internal data class EventReaction<T : EventReactionTrigger>(
 )
 
 /**
- * Identifies one reaction across all of its retries. kotmod derives it deterministically (for a use case,
- * `<useCase>/<eventId>/<n>`), so queuing the same work again is recognised as a duplicate while it is pending.
+ * Identifies one reaction across all of its retries. kotmod derives it deterministically (for an event policy,
+ * `<policy>/<eventId>/<n>`), so queuing the same work again is recognised as a duplicate while it is pending.
  */
 @JvmInline
 value class EventReactionId(
@@ -142,7 +142,7 @@ interface Cancellable {
     fun cancel()
 }
 
-/** Delivers queued reactions to the kotmod runtime subscribed to it (a use case's, or a process manager channel's). */
+/** Delivers queued reactions to the kotmod runtime subscribed to it (an event policy's, or a process manager channel's). */
 interface EventReactionTriggerSource<T : EventReactionTrigger> {
     /**
      * Starts delivering reactions to [block], which runs one attempt and returns a [ReactionOutcome]:

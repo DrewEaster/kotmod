@@ -46,7 +46,7 @@ class DbSchedulerQueuesTest {
 
         val error = assertFailsWith<IllegalArgumentException> { queues.channel("fraud-checks", FakeTriggerSerializer, ordered = false) }
         assertEquals(
-            "DbSchedulerQueues already has a queue named fraud-checks: use-case names and process manager channels must be unique",
+            "DbSchedulerQueues already has a queue named fraud-checks: event policy names and process manager channels must be unique",
             error.message,
         )
     }
@@ -59,7 +59,7 @@ class DbSchedulerQueuesTest {
         val error = assertFailsWith<IllegalStateException> { queues.channel("late", FakeTriggerSerializer, ordered = false) }
         assertEquals(
             "Queue late was asked for after DbSchedulerQueues.tasks was read, so its task would never be registered: read tasks " +
-                "after registering every use case and building every process manager",
+                "after registering every event policy and building every process manager",
             error.message,
         )
     }

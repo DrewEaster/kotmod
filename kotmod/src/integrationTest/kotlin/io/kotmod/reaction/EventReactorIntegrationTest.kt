@@ -20,7 +20,7 @@ import kotlin.test.assertEquals
 import kotlin.time.Instant
 
 class EventReactorIntegrationTest : IntegrationTest() {
-    private class Confirmations : Reactions<String>("confirmations", String.serializer()) {
+    private class Confirmations : EventPolicy<String>("confirmations", String.serializer()) {
         init {
             on(testOrders) { event, metadata -> if (event is OrderPlaced) trigger(metadata.aggregateId.value) }
         }

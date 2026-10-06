@@ -20,8 +20,8 @@ import kotlin.time.Duration.Companion.seconds
 private val log = LoggerFactory.getLogger("io.kotmod.event.reaction.dbscheduler.ReactionTask")
 
 /**
- * Builds the db-scheduler task that decodes each stored reaction and runs it through the subscribed runtime (a use
- * case's, or a process manager channel's).
+ * Builds the db-scheduler task that decodes each stored reaction and runs it through the subscribed runtime (an
+ * event policy's, or a process manager channel's).
  *
  * An ordered reaction runs only once no earlier reaction of its aggregate is pending for this task; until then it
  * is rechecked after [orderedRecheckDelay], doubling per wait up to a minute, without using up a retry. A blocked reaction stays parked.

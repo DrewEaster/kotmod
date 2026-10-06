@@ -16,20 +16,20 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Instant
 
 /**
- * Runs a context's use cases. It reads the event log once, after one saved position, and hands each event to every
- * registered use case that listens to its aggregate type with `on(kind)`. It queues each use case's triggers on that
- * use case's own queue from [queues] (named after the use case). Use cases listening to another context's contract with
+ * Runs a context's event policies. It reads the event log once, after one saved position, and hands each event to
+ * every registered policy that listens to its aggregate type with `on(kind)`. It queues each policy's triggers on that
+ * policy's own queue from [queues] (named after the policy). Policies listening to another context's contract with
  * `on(contract)` are fed by that contract's own reader instead.
  *
- * - If a use case can't map an event (its block throws, the event can't be deserialized, or an ordered use case produces
- *   a delayed trigger), the event is parked in that use case's queue and the reactor moves on. Other use cases still
+ * - If a policy can't map an event (its block throws, the event can't be deserialized, or an ordered policy produces
+ *   a delayed trigger), the event is parked in that policy's queue and the reactor moves on. Other policies still
  *   get their triggers for the event.
- * - The position is saved after each event, once every use case's triggers for it are queued. After a crash the event
+ * - The position is saved after each event, once every policy's triggers for it are queued. After a crash the event
  *   is read again and queued with the same ids, which a queue recognises while the work is pending.
- * - It reads only while [isLeader]; run one active reactor per context. kotmod's internal events never reach a use
- *   case.
+ * - It reads only while [isLeader]; run one active reactor per context. kotmod's internal events never reach an
+ *   event policy.
  *
- * Register every use case, then start the reactor before the queue's scheduler, and stop it after. A new reactor
+ * Register every event policy, then start the reactor before the queue's scheduler, and stop it after. A new reactor
  * starts at the head of the event log as of its first [start]: it sees events written from then on, not history.
  * [register], [start] and [stop] are meant to be called from one thread, at startup and shutdown; they are not
  * safe to call concurrently.
@@ -68,9 +68,9 @@ class EventReactor internal constructor(
         clock = { Clock.System.now() },
     )
 
-    private val runtimes = mutableListOf<UseCaseRuntime<*>>()
+    private val runtimes = mutableListOf<PolicyRuntime<*>>()
 
-    /** Set by the first start; no use case can be registered after it. */
+    /** Set by the first start; no event policy can be registered after it. */
     @Volatile
     private var started = false
 
@@ -91,47 +91,47 @@ class EventReactor internal constructor(
         )
 
     /**
-     * Registers [useCase]: it gets its own queue, named after it, and its `on(contract)` sources start listening to their
+     * Registers [policy]: it gets its own queue, named after it, and its `on(contract)` sources start listening to their
      * contracts. Must be called before [start], before reading the queues' tasks, and before those contracts start.
      * Each such contract must read the same event log (database) as this reactor, because a parked mapping re-reads its
-     * event through the reactor, and a contract that is never started delivers nothing to its use cases.
+     * event through the reactor, and a contract that is never started delivers nothing to its event policies.
      */
-    fun <T : Any> register(useCase: Reactions<T>) {
-        check(!started) { "Use case ${useCase.name} was registered after reactor $name started: register every use case before start()" }
-        require(runtimes.none { it.useCase.name == useCase.name }) { "Reactor $name already has a use case named ${useCase.name}" }
-        check(!useCase.registered) { "Use case ${useCase.name} is already registered with a reactor" }
+    fun <T : Any> register(policy: EventPolicy<T>) {
+        check(!started) { "Event policy ${policy.name} was registered after reactor $name started: register every policy before start()" }
+        require(runtimes.none { it.policy.name == policy.name }) { "Reactor $name already has an event policy named ${policy.name}" }
+        check(!policy.registered) { "Event policy ${policy.name} is already registered with a reactor" }
         // Check every contract first, so a refused registration attaches nothing and creates no queue.
-        val contractSources = useCase.sources.filterIsInstance<ContractSource<T, *>>()
+        val contractSources = policy.sources.filterIsInstance<ContractSource<T, *>>()
         contractSources.forEach { it.ensureCanFeed() }
-        val runtime = UseCaseRuntime(useCase, queues, readEvent, clock)
+        val runtime = PolicyRuntime(policy, queues, readEvent, clock)
         contractSources.forEach { it.feed(runtime) }
         runtimes += runtime
-        useCase.registered = true
+        policy.registered = true
     }
 
     /**
-     * Starts handling the use cases' queues and reading the event log. A new reactor's starting position is fixed before
+     * Starts handling the policies' queues and reading the event log. A new reactor's starting position is fixed before
      * this returns, so events committed afterwards are always seen. Does nothing if already running; a stopped reactor
      * can be started again.
      */
     fun start() {
         if (running) return
-        startUseCases()
+        startPolicies()
         getPosition()
         poller.start()
         running = true
     }
 
-    /** Stops reading, then stops handling the use cases' queues. */
+    /** Stops reading, then stops handling the policies' queues. */
     suspend fun stop() {
         poller.stop()
         runtimes.forEach { it.stop() }
         running = false
     }
 
-    internal fun startUseCasesForTest() = startUseCases()
+    internal fun startPoliciesForTest() = startPolicies()
 
-    private fun startUseCases() {
+    private fun startPolicies() {
         started = true
         runtimes.forEach { it.start() }
     }

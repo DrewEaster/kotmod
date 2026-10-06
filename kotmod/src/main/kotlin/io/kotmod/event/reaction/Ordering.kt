@@ -3,7 +3,7 @@ package io.kotmod.event.reaction
 import io.kotmod.EventMetadata
 import kotlin.time.Duration
 
-/** Whether a use case's reactions run in their aggregate's history order. */
+/** Whether an event policy's reactions run in their aggregate's history order. */
 sealed interface ReactionOrdering {
     /** Reactions may run in any order and in parallel (the default). */
     data object Unordered : ReactionOrdering
@@ -17,7 +17,7 @@ sealed interface ReactionOrdering {
     ) : ReactionOrdering
 }
 
-/** What an ordered use case does when a reaction gives up for good. */
+/** What an ordered event policy does when a reaction gives up for good. */
 enum class OnGiveUp {
     /** Complete it as failed and move on to the aggregate's next reaction. */
     ContinueWithNext,
@@ -26,7 +26,7 @@ enum class OnGiveUp {
     BlockAggregate,
 }
 
-/** The ordering stamp kotmod attaches to a reaction dispatched by an ordered use case. */
+/** The ordering stamp kotmod attaches to a reaction dispatched by an ordered event policy. */
 data class DispatchOrdering(
     val key: String,
     val sequence: Long,

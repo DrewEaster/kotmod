@@ -27,15 +27,15 @@ import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 
-class UseCaseMappingTest {
+class PolicyMappingTest {
     private var now = Instant.parse("2026-10-06T10:00:00Z")
     private val log = InMemoryLog()
     private val queues = ManualQueues(enforceOrdering = true)
 
-    private fun runtime(useCase: Reactions<Notice>) = UseCaseRuntime(useCase, queues, log::readEvent, clock = { now }).also { it.start() }
+    private fun runtime(policy: EventPolicy<Notice>) = PolicyRuntime(policy, queues, log::readEvent, clock = { now }).also { it.start() }
 
-    /** Appends [event] to the log and routes it to this use case, as the reactor does. */
-    private suspend fun UseCaseRuntime<Notice>.read(event: PersistedEvent) = routeLocal(log.add(event))
+    /** Appends [event] to the log and routes it to this event policy, as the reactor does. */
+    private suspend fun PolicyRuntime<Notice>.read(event: PersistedEvent) = routeLocal(log.add(event))
 
     private suspend fun deliverAll(channel: String) {
         repeat(6) { queues.deliver(channel) }
@@ -44,15 +44,15 @@ class UseCaseMappingTest {
     private fun ids(channel: String) = queues.pending(channel).map { it.id.value }
 
     @Test
-    fun `each trigger gets a deterministic id, and an ordered use case stamps it with its aggregate, sequence and position`() =
+    fun `each trigger gets a deterministic id, and an ordered event policy stamps it with its aggregate, sequence and position`() =
         runBlocking {
-            val useCase =
-                RecordingUseCase(ordering = ReactionOrdering.PerAggregate(), mapping = { _, m ->
+            val policy =
+                RecordingPolicy(ordering = ReactionOrdering.PerAggregate(), mapping = { _, m ->
                     trigger(Confirm(m.aggregateId.value))
                     trigger(Confirm("${m.aggregateId.value}-again"))
                 })
 
-            runtime(useCase).read(orderEvent(OrderPlaced("book"), eventId = "e-1", orderId = "o-1", sequence = 3))
+            runtime(policy).read(orderEvent(OrderPlaced("book"), eventId = "e-1", orderId = "o-1", sequence = 3))
 
             val pending = queues.pending("confirmations")
             assertEquals(listOf("confirmations/e-1/0", "confirmations/e-1/1"), pending.map { it.id.value })
@@ -64,11 +64,11 @@ class UseCaseMappingTest {
         }
 
     @Test
-    fun `an unordered use case queues delayed triggers with their notBefore and no stamp`() =
+    fun `an unordered event policy queues delayed triggers with their notBefore and no stamp`() =
         runBlocking {
-            val useCase = RecordingUseCase(mapping = { _, m -> trigger(Confirm(m.aggregateId.value), notBefore = now + 1.hours) })
+            val policy = RecordingPolicy(mapping = { _, m -> trigger(Confirm(m.aggregateId.value), notBefore = now + 1.hours) })
 
-            runtime(useCase).read(orderEvent(OrderPlaced("book")))
+            runtime(policy).read(orderEvent(OrderPlaced("book")))
 
             val queued = queues.pending("confirmations").single()
             assertEquals(now + 1.hours, queued.notBefore)
@@ -76,11 +76,11 @@ class UseCaseMappingTest {
         }
 
     @Test
-    fun `events of aggregate types the use case doesn't listen to are skipped`() =
+    fun `events of aggregate types the event policy doesn't listen to are skipped`() =
         runBlocking {
-            val useCase = RecordingUseCase(mapping = { _, _ -> error("must not be called") })
+            val policy = RecordingPolicy(mapping = { _, _ -> error("must not be called") })
 
-            runtime(useCase).read(paymentEvent("c-1"))
+            runtime(policy).read(paymentEvent("c-1"))
 
             assertTrue(queues.published.isEmpty())
         }
@@ -88,13 +88,13 @@ class UseCaseMappingTest {
     @Test
     fun `a block that throws after triggering parks the event in its own queue and queues nothing else`() =
         runBlocking {
-            val useCase =
-                RecordingUseCase(mapping = { _, m ->
+            val policy =
+                RecordingPolicy(mapping = { _, m ->
                     trigger(Confirm(m.aggregateId.value))
                     error("broken mapping")
                 })
 
-            runtime(useCase).read(orderEvent(OrderPlaced("book")))
+            runtime(policy).read(orderEvent(OrderPlaced("book")))
 
             val parked = queues.pending("confirmations").single()
             assertEquals("confirmations/e-1/mapping", parked.id.value)
@@ -105,20 +105,20 @@ class UseCaseMappingTest {
     @Test
     fun `an event that can't be deserialized is parked`() =
         runBlocking {
-            runtime(RecordingUseCase()).read(persistedEvent(globalOffset = 1, eventType = "OrderRefunded"))
+            runtime(RecordingPolicy()).read(persistedEvent(globalOffset = 1, eventType = "OrderRefunded"))
 
             assertEquals(listOf("confirmations/e-1/mapping"), ids("confirmations"))
         }
 
     @Test
-    fun `an ordered use case parks an event whose block produces a delayed trigger, stamped with the event's position`() =
+    fun `an ordered event policy parks an event whose block produces a delayed trigger, stamped with the event's position`() =
         runBlocking {
-            val useCase =
-                RecordingUseCase(ordering = ReactionOrdering.PerAggregate(), mapping = { _, m ->
+            val policy =
+                RecordingPolicy(ordering = ReactionOrdering.PerAggregate(), mapping = { _, m ->
                     trigger(Confirm(m.aggregateId.value), notBefore = now + 1.hours)
                 })
 
-            runtime(useCase).read(orderEvent(OrderPlaced("book"), sequence = 2))
+            runtime(policy).read(orderEvent(OrderPlaced("book"), sequence = 2))
 
             val parked = queues.pending("confirmations").single()
             assertEquals("confirmations/e-1/mapping", parked.id.value)
@@ -130,19 +130,19 @@ class UseCaseMappingTest {
     fun `once the block is fixed, a parked mapping queues the event's triggers with their normal ids, exactly once`() =
         runBlocking {
             var brokenFor = 2
-            val useCase =
-                RecordingUseCase(mapping = { _, m ->
+            val policy =
+                RecordingPolicy(mapping = { _, m ->
                     if (brokenFor-- > 0) error("fix not deployed yet")
                     trigger(Confirm(m.aggregateId.value))
                 })
-            runtime(useCase).read(orderEvent(OrderPlaced("book")))
+            runtime(policy).read(orderEvent(OrderPlaced("book")))
 
             val outcomes = queues.deliver("confirmations") + queues.deliver("confirmations")
 
             assertEquals(listOf<ReactionOutcome>(ReactionOutcome.Retry(1.seconds), ReactionOutcome.Finished(gaveUp = false)), outcomes)
             assertEquals(listOf("confirmations/e-1/0"), ids("confirmations"))
             queues.deliver("confirmations")
-            assertEquals(listOf<Notice>(Confirm("o-1")), useCase.handled.map { it.first })
+            assertEquals(listOf<Notice>(Confirm("o-1")), policy.handled.map { it.first })
             assertEquals(1, queues.published.count { it.id.value == "confirmations/e-1/0" })
         }
 
@@ -150,33 +150,33 @@ class UseCaseMappingTest {
     fun `with ordering, an aggregate's later events wait behind its still-failing parked mapping and run in order after the fix`() =
         runBlocking {
             var brokenFor = 2
-            val useCase =
-                RecordingUseCase(ordering = ReactionOrdering.PerAggregate(), mapping = { _, m ->
+            val policy =
+                RecordingPolicy(ordering = ReactionOrdering.PerAggregate(), mapping = { _, m ->
                     val parkedEvent = m.aggregateId.value == "o-1" && m.sequence == 1L
                     if (parkedEvent && brokenFor-- > 0) error("fix not deployed yet")
                     trigger(Confirm("${m.aggregateId.value}#${m.sequence}"))
                     if (parkedEvent) trigger(Confirm("o-1#1-again"))
                 })
-            val runtime = runtime(useCase)
+            val runtime = runtime(policy)
             runtime.read(orderEvent(OrderPlaced("a"), eventId = "e-1", orderId = "o-1", sequence = 1))
             runtime.read(orderEvent(OrderShipped("a"), eventId = "e-2", orderId = "o-1", sequence = 2))
             runtime.read(orderEvent(OrderPlaced("b"), eventId = "e-3", orderId = "o-2", sequence = 1))
 
             assertEquals(listOf<ReactionOutcome>(ReactionOutcome.Retry(1.seconds), ReactionOutcome.Finished(gaveUp = false)), queues.deliver("confirmations"))
 
-            assertEquals(listOf<Notice>(Confirm("o-2#1")), useCase.handled.map { it.first })
+            assertEquals(listOf<Notice>(Confirm("o-2#1")), policy.handled.map { it.first })
             assertEquals(listOf("confirmations/e-1/mapping", "confirmations/e-2/0"), ids("confirmations"))
             deliverAll("confirmations")
             assertEquals(
                 listOf<Notice>(Confirm("o-2#1"), Confirm("o-1#1"), Confirm("o-1#1-again"), Confirm("o-1#2")),
-                useCase.handled.map { it.first },
+                policy.handled.map { it.first },
             )
         }
 
     @Test
     fun `routing an event again after its mapping succeeded queues no new work`() =
         runBlocking {
-            val runtime = runtime(RecordingUseCase())
+            val runtime = runtime(RecordingPolicy())
             val event = log.add(orderEvent(OrderPlaced("book")))
 
             runtime.routeLocal(event)
@@ -188,7 +188,7 @@ class UseCaseMappingTest {
     @Test
     fun `routing a parked event again queues no new work`() =
         runBlocking {
-            val runtime = runtime(RecordingUseCase(mapping = { _, _ -> error("broken") }))
+            val runtime = runtime(RecordingPolicy(mapping = { _, _ -> error("broken") }))
             val event = log.add(orderEvent(OrderPlaced("book")))
 
             runtime.routeLocal(event)
@@ -201,12 +201,12 @@ class UseCaseMappingTest {
     fun `if queueing fails part-way, the failure reaches the reader and routing the event again queues every trigger exactly once`() =
         runBlocking {
             val flaky = FailingQueues(queues, failOnPublish = 2)
-            val useCase =
-                RecordingUseCase(mapping = { _, m ->
+            val policy =
+                RecordingPolicy(mapping = { _, m ->
                     trigger(Confirm(m.aggregateId.value))
                     trigger(Confirm("${m.aggregateId.value}-again"))
                 })
-            val runtime = UseCaseRuntime(useCase, flaky, log::readEvent, clock = { now }).also { it.start() }
+            val runtime = PolicyRuntime(policy, flaky, log::readEvent, clock = { now }).also { it.start() }
             val event = log.add(orderEvent(OrderPlaced("book")))
 
             assertFailsWith<IOException> { runtime.routeLocal(event) }
@@ -214,16 +214,16 @@ class UseCaseMappingTest {
             runtime.routeLocal(event)
             deliverAll("confirmations")
 
-            assertEquals(listOf<Notice>(Confirm("o-1"), Confirm("o-1-again")), useCase.handled.map { it.first })
-            assertEquals(listOf("confirmations/e-1/0", "confirmations/e-1/1"), useCase.handled.map { it.second.reactionId })
+            assertEquals(listOf<Notice>(Confirm("o-1"), Confirm("o-1-again")), policy.handled.map { it.first })
+            assertEquals(listOf("confirmations/e-1/0", "confirmations/e-1/1"), policy.handled.map { it.second.reactionId })
         }
 
     @Test
     fun `a block that throws a CancellationException while the reader is running is parked`() =
         runBlocking {
-            val useCase = RecordingUseCase(mapping = { _, _ -> throw CancellationException("the app's, not the reader's") })
+            val policy = RecordingPolicy(mapping = { _, _ -> throw CancellationException("the app's, not the reader's") })
 
-            runtime(useCase).read(orderEvent(OrderPlaced("book")))
+            runtime(policy).read(orderEvent(OrderPlaced("book")))
 
             assertEquals(listOf("confirmations/e-1/mapping"), ids("confirmations"))
         }
@@ -231,7 +231,7 @@ class UseCaseMappingTest {
     @Test
     fun `a parked mapping whose block throws a CancellationException keeps retrying`() =
         runBlocking {
-            runtime(RecordingUseCase(mapping = { _, _ -> throw CancellationException("the app's") })).read(orderEvent(OrderPlaced("book")))
+            runtime(RecordingPolicy(mapping = { _, _ -> throw CancellationException("the app's") })).read(orderEvent(OrderPlaced("book")))
 
             assertEquals(listOf<ReactionOutcome>(ReactionOutcome.Retry(1.seconds)), queues.deliver("confirmations"))
             assertEquals(listOf("confirmations/e-1/mapping"), ids("confirmations"))
@@ -240,7 +240,7 @@ class UseCaseMappingTest {
     @Test
     fun `a mapping that always throws stays parked, retrying with growing backoff, and is never dropped`() =
         runBlocking {
-            runtime(RecordingUseCase(mapping = { _, _ -> error("always broken") })).read(orderEvent(OrderPlaced("book")))
+            runtime(RecordingPolicy(mapping = { _, _ -> error("always broken") })).read(orderEvent(OrderPlaced("book")))
 
             val outcomes = (1..5).flatMap { queues.deliver("confirmations") }
 
@@ -253,12 +253,12 @@ class UseCaseMappingTest {
     fun `a parked mapping redelivered after it succeeded adds no duplicate work while its triggers are pending`() =
         runBlocking {
             var brokenFor = 1
-            val useCase =
-                RecordingUseCase(mapping = { _, m ->
+            val policy =
+                RecordingPolicy(mapping = { _, m ->
                     if (brokenFor-- > 0) error("fix not deployed yet")
                     trigger(Confirm(m.aggregateId.value))
                 }).apply { failWith = { _, context -> if (context.attempt == 0) RuntimeException("first try fails") else null } }
-            runtime(useCase).read(orderEvent(OrderPlaced("book")))
+            runtime(policy).read(orderEvent(OrderPlaced("book")))
             val parked = queues.pending("confirmations").single()
 
             queues.deliver("confirmations") // the parked mapping succeeds and queues confirmations/e-1/0
@@ -268,7 +268,7 @@ class UseCaseMappingTest {
             assertEquals(2, queues.published.count { it.id.value == "confirmations/e-1/0" })
             assertEquals(
                 listOf(ReactionContext("confirmations/e-1/0", 0), ReactionContext("confirmations/e-1/0", 1)),
-                useCase.handled.map { it.second },
+                policy.handled.map { it.second },
             )
         }
 
@@ -277,12 +277,12 @@ class UseCaseMappingTest {
         runBlocking {
             var brokenFor = 1
             val remindAt = now + 1.hours
-            val useCase =
-                RecordingUseCase(mapping = { _, m ->
+            val policy =
+                RecordingPolicy(mapping = { _, m ->
                     if (brokenFor-- > 0) error("fix not deployed yet")
                     trigger(Confirm(m.aggregateId.value), notBefore = remindAt)
                 })
-            runtime(useCase).read(orderEvent(OrderPlaced("book")))
+            runtime(policy).read(orderEvent(OrderPlaced("book")))
 
             queues.deliver("confirmations")
             assertEquals(remindAt, queues.pending("confirmations").single().notBefore)
@@ -290,14 +290,14 @@ class UseCaseMappingTest {
             now = remindAt
             queues.deliver("confirmations")
 
-            assertEquals(listOf<Notice>(Confirm("o-1")), useCase.handled.map { it.first })
+            assertEquals(listOf<Notice>(Confirm("o-1")), policy.handled.map { it.first })
         }
 
     @Test
-    fun `a parked mapping whose use case no longer listens to the event's aggregate type finishes without triggers`() =
+    fun `a parked mapping whose event policy no longer listens to the event's aggregate type finishes without triggers`() =
         runBlocking {
-            runtime(RecordingUseCase(mapping = { _, _ -> error("broken") })).read(orderEvent(OrderPlaced("book")))
-            runtime(RecordingUseCase(kind = null)) // the redeployed use case no longer listens to orders
+            runtime(RecordingPolicy(mapping = { _, _ -> error("broken") })).read(orderEvent(OrderPlaced("book")))
+            runtime(RecordingPolicy(kind = null)) // the redeployed event policy no longer listens to orders
 
             assertEquals(listOf<ReactionOutcome>(ReactionOutcome.Finished(gaveUp = false)), queues.deliver("confirmations"))
             assertTrue(queues.pending("confirmations").isEmpty())
@@ -306,7 +306,7 @@ class UseCaseMappingTest {
     @Test
     fun `a parked mapping whose event is missing from the log keeps retrying`() =
         runBlocking {
-            runtime(RecordingUseCase(mapping = { _, _ -> error("broken") })).routeLocal(orderEvent(OrderPlaced("book")))
+            runtime(RecordingPolicy(mapping = { _, _ -> error("broken") })).routeLocal(orderEvent(OrderPlaced("book")))
 
             assertEquals(listOf<ReactionOutcome>(ReactionOutcome.Retry(1.seconds)), queues.deliver("confirmations"))
             assertEquals(listOf("confirmations/e-1/mapping"), ids("confirmations"))

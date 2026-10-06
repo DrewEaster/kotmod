@@ -98,26 +98,26 @@ internal class DbSchedulerEventReactions<T : EventReactionTrigger>(
         orderedQueries?.let { nudgeNext(client, taskName, it, key) }
     }
 
-    /** The parked mappings of use case [useCase] (this task): reactions with id `<useCase>/<eventId>/mapping`. */
+    /** The parked mappings of event policy [policy] (this task): reactions with id `<policy>/<eventId>/mapping`. */
     fun parkedMappings(
         client: SchedulerClient,
-        useCase: String,
+        policy: String,
     ): List<ParkedMapping> =
         client
             .getScheduledExecutionsForTask(taskName, String::class.java)
             .mapNotNull { execution ->
                 val data = ReactionTaskData.decode(execution.data)
                 val reactionId = data.ordering?.reactionId ?: execution.taskInstance.id
-                parkedEventId(useCase, reactionId)?.let { ParkedMapping(EventId(it), EventReactionId(reactionId), data.retryCount) }
+                parkedEventId(policy, reactionId)?.let { ParkedMapping(EventId(it), EventReactionId(reactionId), data.retryCount) }
             }
 
-    /** Drops [useCase]'s parked mapping of [eventId] without retrying it, so its aggregate's next reaction can run. */
+    /** Drops [policy]'s parked mapping of [eventId] without retrying it, so its aggregate's next reaction can run. */
     fun skipParked(
         client: SchedulerClient,
-        useCase: String,
+        policy: String,
         eventId: EventId,
     ) {
-        val reactionId = parkedMappingId(useCase, eventId)
+        val reactionId = parkedMappingId(policy, eventId)
         val execution =
             client.getScheduledExecutionsForTask(taskName, String::class.java).singleOrNull { execution ->
                 val data = ReactionTaskData.decode(execution.data)
@@ -138,17 +138,17 @@ internal class DbSchedulerEventReactions<T : EventReactionTrigger>(
         } ?: throw IllegalArgumentException("No blocked event reaction ${id.value} for task $taskName")
 }
 
-// A use case parks an event it couldn't map as reaction `<useCase>/<eventId>/mapping` (see io.kotmod.reaction.UseCaseRuntime).
+// An event policy parks an event it couldn't map as reaction `<policy>/<eventId>/mapping` (see io.kotmod.reaction.PolicyRuntime).
 private fun parkedMappingId(
-    useCase: String,
+    policy: String,
     eventId: EventId,
-) = "$useCase/${eventId.value}/mapping"
+) = "$policy/${eventId.value}/mapping"
 
 private fun parkedEventId(
-    useCase: String,
+    policy: String,
     reactionId: String,
 ): String? {
-    val prefix = "$useCase/"
+    val prefix = "$policy/"
     val suffix = "/mapping"
     if (!reactionId.startsWith(prefix) || !reactionId.endsWith(suffix) || reactionId.length <= prefix.length + suffix.length) return null
     return reactionId.substring(prefix.length, reactionId.length - suffix.length)

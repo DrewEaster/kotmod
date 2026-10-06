@@ -29,21 +29,21 @@ import kotlin.time.Clock
 import kotlin.time.Duration
 import kotlin.time.Instant
 
-/** What a use case's queue holds. kotmod's own envelope around the app's triggers; the queue only stores it. */
+/** What an event policy's queue holds. kotmod's own envelope around the app's triggers; the queue only stores it. */
 @Serializable
-internal sealed interface UseCaseItem : EventReactionTrigger
+internal sealed interface PolicyItem : EventReactionTrigger
 
-/** One of the use case's triggers, as JSON written with its `triggers` serializer. */
+/** One of the policy's triggers, as JSON written with its `triggers` serializer. */
 @Serializable
 @SerialName("trigger")
 internal data class TriggerItem(
     val trigger: String,
     @Transient override val timeout: Duration? = null,
-) : UseCaseItem
+) : PolicyItem
 
 /**
- * An event the use case couldn't map to triggers (its block threw, the event couldn't be deserialized, or an ordered
- * use case produced a delayed trigger). Running it reads the event again and retries the mapping with the current code.
+ * An event the policy couldn't map to triggers (its block threw, the event couldn't be deserialized, or an ordered
+ * policy produced a delayed trigger). Running it reads the event again and retries the mapping with the current code.
  */
 @Serializable
 @SerialName("parked")
@@ -53,34 +53,34 @@ internal data class ParkedMapping(
     val aggregateId: String,
     val source: String,
     @Transient override val timeout: Duration? = null,
-) : UseCaseItem
+) : PolicyItem
 
-private val log = LoggerFactory.getLogger("io.kotmod.reaction.UseCaseRuntime")
+private val log = LoggerFactory.getLogger("io.kotmod.reaction.PolicyRuntime")
 
 /**
- * Runs one use case on its own queue, named after it and ordered when the use case is.
+ * Runs one event policy on its own queue, named after it and ordered when the policy is.
  *
- * It maps events to triggers, numbering them `<useCase>/<eventId>/<n>` so a re-read event is recognised. A mapping that
- * fails is parked in the queue as `<useCase>/<eventId>/mapping` (stamped like the event's first trigger, so an ordered
+ * It maps events to triggers, numbering them `<policy>/<eventId>/<n>` so a re-read event is recognised. A mapping that
+ * fails is parked in the queue as `<policy>/<eventId>/mapping` (stamped like the event's first trigger, so an ordered
  * aggregate's later work waits behind it) instead of stopping the reader. It handles each delivered item: a trigger
- * with the use case's timeout and failure policy, a parked mapping by reading its event again (with [readEvent]) and
+ * with the policy's timeout and failure handling, a parked mapping by reading its event again (with [readEvent]) and
  * retrying the mapping, with capped backoff, forever.
  */
-internal class UseCaseRuntime<T : Any>(
-    val useCase: Reactions<T>,
+internal class PolicyRuntime<T : Any>(
+    val policy: EventPolicy<T>,
     queues: ReactionQueues,
     private val readEvent: (EventId) -> PersistedEvent?,
     private val clock: () -> Instant = { Clock.System.now() },
 ) {
-    private val ordered = useCase.ordering is ReactionOrdering.PerAggregate
-    private val channel = queues.channel(useCase.name, JsonTriggerSerializer(UseCaseItem.serializer()), ordered)
+    private val ordered = policy.ordering is ReactionOrdering.PerAggregate
+    private val channel = queues.channel(policy.name, JsonTriggerSerializer(PolicyItem.serializer()), ordered)
     private val backoff = BackoffStrategy()
 
     @Volatile
     private var subscription: Cancellable? = null
 
     init {
-        require(!ordered || channel.sink.supportsOrdering) { "Use case ${useCase.name} is ordered, so its queue must support ordering" }
+        require(!ordered || channel.sink.supportsOrdering) { "Event policy ${policy.name} is ordered, so its queue must support ordering" }
     }
 
     /** Starts handling the queue's deliveries. Does nothing if already started. */
@@ -103,15 +103,15 @@ internal class UseCaseRuntime<T : Any>(
         notBefore: Instant?,
     ) = channel.sink.publish(id, TriggerItem(encode(trigger)), ordering, notBefore)
 
-    /** Maps [event], read by the reactor, if one of this use case's aggregate kind sources covers its type. */
+    /** Maps [event], read by the reactor, if one of this policy's aggregate kind sources covers its type. */
     suspend fun routeLocal(event: PersistedEvent) {
-        val source = useCase.kindSourceFor(event.metadata.aggregateType) ?: return
+        val source = policy.kindSourceFor(event.metadata.aggregateType) ?: return
         mapAndPublish(event.metadata, source) { source.map(event) }
     }
 
     /**
-     * Runs [map] (this use case's block for the event described by [metadata], from [source]) and queues what it
-     * triggered. If mapping fails — [map] throws, a trigger can't be serialized, or an ordered use case produced a
+     * Runs [map] (this policy's block for the event described by [metadata], from [source]) and queues what it
+     * triggered. If mapping fails — [map] throws, a trigger can't be serialized, or an ordered policy produced a
      * delayed trigger — the event is parked instead, and nothing it triggered is queued. A failure to queue propagates,
      * so the reader stops and reads the event again.
      */
@@ -140,11 +140,11 @@ internal class UseCaseRuntime<T : Any>(
         if (error is CancellationException && !currentCoroutineContext().isActive) throw error
     }
 
-    private fun encode(trigger: T): String = Json.encodeToString(useCase.triggers, trigger)
+    private fun encode(trigger: T): String = Json.encodeToString(policy.triggers, trigger)
 
     private fun encodeAll(produced: List<ProducedTrigger<T>>): List<Pair<TriggerItem, Instant?>> {
         check(!ordered || produced.none { it.notBefore != null }) {
-            "Use case ${useCase.name} is ordered, so it can't produce delayed triggers: a delayed trigger would hold back " +
+            "Event policy ${policy.name} is ordered, so it can't produce delayed triggers: a delayed trigger would hold back " +
                 "every later reaction of its aggregate"
         }
         return produced.map { TriggerItem(encode(it.trigger)) to it.notBefore }
@@ -155,8 +155,8 @@ internal class UseCaseRuntime<T : Any>(
         items: List<Pair<TriggerItem, Instant?>>,
     ) {
         items.forEachIndexed { n, (item, notBefore) ->
-            val id = EventReactionId("${useCase.name}/${metadata.eventId.value}/$n")
-            channel.sink.publish(id, item, useCase.ordering.stampFor(metadata, n), notBefore)
+            val id = EventReactionId("${policy.name}/${metadata.eventId.value}/$n")
+            channel.sink.publish(id, item, policy.ordering.stampFor(metadata, n), notBefore)
         }
     }
 
@@ -166,8 +166,8 @@ internal class UseCaseRuntime<T : Any>(
         error: Throwable,
     ) {
         log.error(
-            "Use case {} couldn't map event {} of {}/{} from {}; parking it in its queue and moving on",
-            useCase.name,
+            "Event policy {} couldn't map event {} of {}/{} from {}; parking it in its queue and moving on",
+            policy.name,
             metadata.eventId.value,
             metadata.aggregateType.value,
             metadata.aggregateId.value,
@@ -175,16 +175,16 @@ internal class UseCaseRuntime<T : Any>(
             error,
         )
         channel.sink.publish(
-            EventReactionId("${useCase.name}/${metadata.eventId.value}/mapping"),
+            EventReactionId("${policy.name}/${metadata.eventId.value}/mapping"),
             ParkedMapping(metadata.eventId.value, metadata.aggregateType.value, metadata.aggregateId.value, source.description),
-            useCase.ordering.stampFor(metadata, 0),
+            policy.ordering.stampFor(metadata, 0),
             null,
         )
     }
 
     private suspend fun deliver(
         id: EventReactionId,
-        item: UseCaseItem,
+        item: PolicyItem,
         attempt: Int,
         notBefore: Instant?,
     ): ReactionOutcome {
@@ -192,7 +192,7 @@ internal class UseCaseRuntime<T : Any>(
         if (notBefore != null && now < notBefore) return ReactionOutcome.Wait(notBefore - now)
         return when (item) {
             // A trigger that can't be decoded throws here, back to the queue, which retries it until a fix is deployed.
-            is TriggerItem -> runTrigger(id, Json.decodeFromString(useCase.triggers, item.trigger), attempt)
+            is TriggerItem -> runTrigger(id, Json.decodeFromString(policy.triggers, item.trigger), attempt)
             is ParkedMapping -> runParked(id, item, attempt)
         }
     }
@@ -209,9 +209,9 @@ internal class UseCaseRuntime<T : Any>(
             rethrowIfCancelled(e)
             val delay = backoff.calculateBackoff(attempt)
             log.error(
-                "Parked mapping {} of use case {} (event {} of {}/{} from {}) failed again; retrying in {} [attempt={}]",
+                "Parked mapping {} of event policy {} (event {} of {}/{} from {}) failed again; retrying in {} [attempt={}]",
                 id.value,
-                useCase.name,
+                policy.name,
                 item.eventId,
                 item.aggregateType,
                 item.aggregateId,
@@ -227,11 +227,11 @@ internal class UseCaseRuntime<T : Any>(
         val event =
             withContext(Dispatchers.IO) { readEvent(EventId(item.eventId)) }
                 ?: error("Event ${item.eventId} is not in the event log")
-        val source = useCase.sourceFor(event.metadata.aggregateType)
+        val source = policy.sourceFor(event.metadata.aggregateType)
         if (source == null) {
             log.warn(
-                "Use case {} no longer listens to aggregate type {}; dropping its parked mapping of event {}",
-                useCase.name,
+                "Event policy {} no longer listens to aggregate type {}; dropping its parked mapping of event {}",
+                policy.name,
                 event.metadata.aggregateType.value,
                 item.eventId,
             )
@@ -249,9 +249,9 @@ internal class UseCaseRuntime<T : Any>(
         // cancellation crosses the timeout boundary (which keeps the app's exception from being copied by stack-trace recovery).
         val error: Throwable? =
             try {
-                withTimeout(useCase.timeout) {
+                withTimeout(policy.timeout) {
                     try {
-                        useCase.handle(trigger, ReactionContext(id.value, attempt))
+                        policy.handle(trigger, ReactionContext(id.value, attempt))
                         null
                     } catch (e: Throwable) {
                         // A timeout or a cancellation (e.g. the scheduler is stopping) is not a failure: it crosses the
@@ -262,22 +262,22 @@ internal class UseCaseRuntime<T : Any>(
                     }
                 }
             } catch (e: TimeoutCancellationException) {
-                ReactionTimeoutException(useCase.timeout)
+                ReactionTimeoutException(policy.timeout)
             }
         if (error == null) return finish(id, trigger, ReactionResult.Completed, attempt)
-        log.error("Reaction {} of use case {} failed [attempt={}]", id.value, useCase.name, attempt, error)
+        log.error("Reaction {} of event policy {} failed [attempt={}]", id.value, policy.name, attempt, error)
         val decision =
             try {
-                useCase.onFailure(trigger, attempt, error)
+                policy.onFailure(trigger, attempt, error)
             } catch (e: Throwable) {
                 rethrowIfCancelled(e)
-                log.error("onFailure of use case {} threw for reaction {}; retrying the reaction", useCase.name, id.value, e)
+                log.error("onFailure of event policy {} threw for reaction {}; retrying the reaction", policy.name, id.value, e)
                 return ReactionOutcome.Retry(backoff.calculateBackoff(attempt))
             }
         return when (decision) {
             is Retry -> ReactionOutcome.Retry(decision.delay)
             GiveUp -> {
-                log.warn("Use case {} gave up on reaction {} [attempt={}]", useCase.name, id.value, attempt)
+                log.warn("Event policy {} gave up on reaction {} [attempt={}]", policy.name, id.value, attempt)
                 finish(id, trigger, ReactionResult.GaveUp(error), attempt)
             }
         }
@@ -290,11 +290,11 @@ internal class UseCaseRuntime<T : Any>(
         attempt: Int,
     ): ReactionOutcome =
         try {
-            useCase.onCompletion(trigger, result)
+            policy.onCompletion(trigger, result)
             ReactionOutcome.Finished(gaveUp = result is ReactionResult.GaveUp)
         } catch (e: Throwable) {
             rethrowIfCancelled(e)
-            log.error("onCompletion of use case {} threw for reaction {}; retrying the reaction", useCase.name, id.value, e)
+            log.error("onCompletion of event policy {} threw for reaction {}; retrying the reaction", policy.name, id.value, e)
             ReactionOutcome.Retry(backoff.calculateBackoff(attempt))
         }
 }

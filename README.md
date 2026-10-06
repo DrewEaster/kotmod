@@ -16,15 +16,16 @@ in**, so those events reliably drive follow-up work in your own service and in o
   - [Event-only aggregates](#event-only-aggregates)
   - [Event serialization and schema migrations](#event-serialization-and-schema-migrations)
   - [Postgres setup](#postgres-setup)
-  - [Use cases](#use-cases)
-  - [Running use cases on db-scheduler](#running-use-cases-on-db-scheduler)
-  - [Ordered use cases](#ordered-use-cases)
+  - [Event policies](#event-policies)
+  - [Running event policies on db-scheduler](#running-event-policies-on-db-scheduler)
+  - [Ordered event policies](#ordered-event-policies)
   - [Using another queue (e.g. Google Pub/Sub)](#using-another-queue-eg-google-pubsub)
   - [Publishing events to other contexts](#publishing-events-to-other-contexts)
   - [Consuming another context's events](#consuming-another-contexts-events)
   - [Process managers](#process-managers)
 - [Running in production](#running-in-production)
 - [Known limitations](#known-limitations)
+- [Upgrading from 0.3.0](#upgrading-from-030)
 - [Upgrading from 0.2.0](#upgrading-from-020)
 - [Upgrading from 0.1.0](#upgrading-from-010)
 - [Status and contributing](#status-and-contributing)
@@ -38,10 +39,10 @@ atomically: if the message fails after the commit (or the commit fails after the
 disagree. This is the *dual-write problem*.
 
 kotmod writes an aggregate's new state, its events and the command that caused them in **one database
-transaction**. A reactor then reads those events in order and runs your *use cases* on them — durable, retried
+transaction**. A reactor then reads those events in order and runs your *event policies* on them — durable, retried
 follow-up work, written as plain application code — and contracts publish them to other bounded contexts.
 
-Use cases run on whatever queue you choose. kotmod ships one built on
+Event policies run on whatever queue you choose. kotmod ships one built on
 [db-scheduler](https://github.com/kagkarlsson/db-scheduler), which needs nothing but the Postgres database
 you already have, and you can plug in another, such as Google Pub/Sub, by implementing one small factory and
 two small interfaces (see [Using another queue](#using-another-queue-eg-google-pubsub)).
@@ -59,9 +60,9 @@ plugins {
 }
 
 dependencies {
-    implementation("io.github.dreweaster:kotmod:0.3.0")
-    implementation("io.github.dreweaster:kotmod-db-scheduler:0.3.0") // optional: the ready-made reaction queue
-    // implementation("io.github.dreweaster:kotmod-sqldelight:0.3.0") // only if your app uses SQLDelight
+    implementation("io.github.dreweaster:kotmod:0.3.1")
+    implementation("io.github.dreweaster:kotmod-db-scheduler:0.3.1") // optional: the ready-made reaction queue
+    // implementation("io.github.dreweaster:kotmod-sqldelight:0.3.1") // only if your app uses SQLDelight
 
     // Used directly by the code in this README:
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
@@ -78,9 +79,9 @@ Requirements:
 
 kotmod is split into modules:
 
-- `kotmod` — aggregates, events, use cases, process managers and Postgres support, on plain JDBC with no other
+- `kotmod` — aggregates, events, event policies, process managers and Postgres support, on plain JDBC with no other
   database library. This is the only module you need.
-- `kotmod-db-scheduler` — optional. A ready-made queue for use cases and process managers on
+- `kotmod-db-scheduler` — optional. A ready-made queue for event policies and process managers on
   [db-scheduler](https://github.com/kagkarlsson/db-scheduler) 16.12.0, which it brings in. Leave it out if
   you run them on another queue, such as Google Pub/Sub
   (see [Using another queue](#using-another-queue-eg-google-pubsub)).
@@ -112,7 +113,7 @@ CREATE TABLE IF NOT EXISTS orders (
 
 kotmod needs its own tables too. Copy the statements in `DddSchema.ddl` (in `io.kotmod.postgres`) into
 your migrations; they create the event log, aggregate bookkeeping, handled-command history and consumer
-offsets. Use cases run on db-scheduler, which needs its `scheduled_tasks` table: create it from
+offsets. Event policies run on db-scheduler, which needs its `scheduled_tasks` table: create it from
 db-scheduler's
 [`postgresql_tables.sql`](https://github.com/kagkarlsson/db-scheduler/blob/v16.12.0/db-scheduler/src/test/resources/postgresql_tables.sql).
 
@@ -331,13 +332,13 @@ class OrderRepository(
 
 ### 4. React to events
 
-Follow-up work, such as sending an email when an order is placed, is a **use case**. It says which events it
+Follow-up work, such as sending an email when an order is placed, is an **event policy**. It says which events it
 reacts to, what work they trigger, and how that work is done. A **trigger** is stored until its work runs, so it
 must be serializable:
 
 ```kotlin
-// This use case does one kind of work. One that does several makes its trigger type a sealed interface, with one
-// class per kind of work (see "Use cases" in the guides).
+// This event policy does one kind of work. One that does several makes its trigger type a sealed interface, with one
+// class per kind of work (see "Event policies" in the guides).
 @Serializable
 data class SendOrderConfirmation(
     val orderId: String,
@@ -345,7 +346,7 @@ data class SendOrderConfirmation(
 
 class OrderNotifications(
     private val confirm: (orderId: String) -> Unit,
-) : Reactions<SendOrderConfirmation>(
+) : EventPolicy<SendOrderConfirmation>(
         name = "order-notifications",
         triggers = SendOrderConfirmation.serializer(),
     ) {
@@ -383,16 +384,16 @@ fun sendConfirmation(orderId: String) {
 ```
 
 - `on(Orders) { event, metadata -> … }` reacts to order events, typed: `Orders` carries their serialization. The
-  event log holds every aggregate type's events; this use case only sees orders.
-- `trigger(...)` queues work. kotmod builds its id from the use case, the event and the trigger's position, so
+  event log holds every aggregate type's events; this event policy only sees orders.
+- `trigger(...)` queues work. kotmod builds its id from the event policy, the event and the trigger's position, so
   if the same event is read again while its work is pending, it is recognised as the same work.
-- `handle` does the work. Returning means done. Throwing, or running past the use case's `timeout` (60 seconds
+- `handle` does the work. Returning means done. Throwing, or running past the event policy's `timeout` (60 seconds
   by default), is a failure, and `onFailure` decides: `Retry(delay)` or `GiveUp`. By default it retries with
   `backoff(attempt)` (1s, 2s, 4s… up to 10 minutes) and never gives up.
 - `onCompletion` is told how the work ended: `ReactionResult.Completed` or `ReactionResult.GaveUp(error)`.
 
-The **reactor** runs a context's use cases. It reads the event log once, hands each event to every use case
-that listens to it, and queues their triggers. They run on db-scheduler: `DbSchedulerQueues` gives each use case
+The **reactor** runs a context's event policies. It reads the event log once, hands each event to every event policy
+that listens to it, and queues their triggers. They run on db-scheduler: `DbSchedulerQueues` gives each event policy
 its own db-scheduler task, which you register with your `Scheduler`. db-scheduler polls for due work every 10
 seconds by default; `enableImmediateExecution()` runs new work straight away:
 
@@ -411,7 +412,7 @@ val scheduler =
 queues.bind(scheduler)
 ```
 
-Register every use case before reading `queues.tasks`, and call `queues.bind(scheduler)` before starting the
+Register every event policy before reading `queues.tasks`, and call `queues.bind(scheduler)` before starting the
 reactor: queueing work needs it. Then start the reactor, then the scheduler:
 
 ```kotlin
@@ -421,7 +422,7 @@ scheduler.start()
 
 A new reactor starts at the head of the event log: it sees events written after it first starts, not history.
 Start it when your application starts, before it handles commands. To shut down, stop the scheduler, then the
-reactor: `scheduler.stop()`, then `reactor.stop()` (the reactor also handles its use cases' queues, so it stops
+reactor: `scheduler.stop()`, then `reactor.stop()` (the reactor also handles its event policies' queues, so it stops
 after the scheduler that delivers their work). The quickstart passes `isLeader = { true }` because it runs on one
 node; see [Running in production](#running-in-production) for leader election and the full shutdown order.
 The reactor saves its position under its name, `reactor` by default, so a second reactor on the same database
@@ -455,10 +456,10 @@ flowchart LR
     AM -->|one transaction| S[(State in your tables)]
     AM -->|one transaction| E[(Events in ddd_domain_event)]
     E --> R[EventReactor]
-    R --> U[Use cases]
+    R --> U[Event policies]
     U <--> D[(Your queue: db-scheduler, Pub/Sub, …)]
     E --> P[PublicEventContract]
-    P --> UO[Use cases in other contexts]
+    P --> UO[Event policies in other contexts]
 ```
 
 - **Aggregate** — a cluster of domain state changed only through commands, identified by an
@@ -468,10 +469,10 @@ flowchart LR
 - **Rejection** — why an aggregate refused a command, as one of your own types. Rejections are recorded,
   so a repeated command id gets the same answer.
 - **Domain event** — a fact recorded in the event log in the same transaction as the state change.
-- **Use case** — follow-up work written as application code: which events it reacts to, the triggers they
+- **Event policy** — follow-up work written as application code: which events it reacts to, the triggers they
   produce, and how each trigger is handled, with its own retries, timeout and ordering.
-- **Trigger** — the stored input of one piece of a use case's work, as serializable data.
-- **Reactor** — reads a context's event log once and queues every use case's triggers, each use case on its
+- **Trigger** — the stored input of one piece of an event policy's work, as serializable data.
+- **Reactor** — reads a context's event log once and queues every event policy's triggers, each event policy on its
   own queue.
 - **Queue** — where triggers wait until they run. kotmod ships one on db-scheduler; anything that implements
   `ReactionQueues` works.
@@ -494,7 +495,7 @@ Every command runs in three phases:
    else happens. Otherwise the aggregate's version and state are loaded.
 2. **Decide** — the aggregate's current state (or the initial state, if the aggregate doesn't exist yet)
    decides the command. kotmod does no database work while it runs, so keep side effects out of it; put
-   them in a [use case](#use-cases) instead.
+   them in an [event policy](#event-policies) instead.
 3. **Write** — in one transaction, the aggregate's version is advanced, your repository saves the new
    state, the events are appended and the command is recorded as handled. A rejected command writes only
    the rejection record.
@@ -528,12 +529,12 @@ suspend fun cancelOrder(
     }
 ```
 
-**Why commands are data.** Every caller, whether an HTTP handler, a use case or, later, a process
+**Why commands are data.** Every caller, whether an HTTP handler, an event policy or, later, a process
 manager, runs a command the same way: through `AggregateManager.handle`. The rules for which state accepts a
 command and how it is refused live in the states themselves, not in each caller.
 
 **Event sequence numbers.** Every event carries `event.metadata.sequence`: its number within its
-aggregate, counting 1, 2, 3… with no gaps. Use cases and public contracts can use it to tell which of an
+aggregate, counting 1, 2, 3… with no gaps. Event policies and public contracts can use it to tell which of an
 aggregate's events came first.
 
 **Idempotency.** Pass a `CommandId` you control — a request id, a message id. A repeated id returns the
@@ -557,7 +558,7 @@ state independently of the events.
 **This is permitted, but not recommended.** In domain-driven design an aggregate is the boundary of
 consistency: each command changes one aggregate in its own transaction. When a change to one aggregate
 should lead to a change in another, the usual design is to react to the first aggregate's event and run
-the second command asynchronously, with a [use case](#use-cases). That keeps
+the second command asynchronously, with an [event policy](#event-policies). That keeps
 aggregates independent, keeps transactions short and small, and lets each aggregate be changed without
 locking the others.
 
@@ -657,7 +658,7 @@ suspend fun recordView(
 
 `emit` creates the aggregate's bookkeeping the first time it is called for an id. Command ids and
 optimistic concurrency work exactly as they do for `AggregateManager`. Its events go into the same event
-log as everything else; a use case only receives the aggregate types it listens to with `on(...)`, so they
+log as everything else; an event policy only receives the aggregate types it listens to with `on(...)`, so they
 never reach one that doesn't ask for them.
 
 ### Event serialization and schema migrations
@@ -740,22 +741,22 @@ kotmod's writes share one transaction whichever side opens it:
 
 Repositories implemented with SQLDelight queries need no changes: they already run inside the transaction.
 
-### Use cases
+### Event policies
 
-A use case is a class that extends `Reactions<T>`, where `T` is its trigger type (plain `@Serializable` data).
+An event policy is a class that extends `EventPolicy<T>`, where `T` is its trigger type (plain `@Serializable` data).
 It owns the whole reaction, like `OrderNotifications` in [the quickstart](#4-react-to-events):
 
 - **Sources.** In its `init` block, `on(kind) { event, metadata -> … }` reacts to one of this context's
   aggregate kinds, with the events typed (`AggregateKind` carries their serialization).
   `on(contract) { event, metadata -> … }` reacts to another context's public events (see
   [Consuming another context's events](#consuming-another-contexts-events)). One source is the common case;
-  several are allowed, as long as each aggregate type reaches the use case through only one of them. A use case
+  several are allowed, as long as each aggregate type reaches the event policy through only one of them. An event policy
   never sees events of types it doesn't listen to.
 - **Triggers.** Inside the block, `trigger(t)` queues work and `trigger(t, notBefore = instant)` delays it. The
   block only decides what to do. Keep it free of I/O and deterministic: the same event must always produce the
   same triggers, in the same order, because their ids are numbered by position.
 - **Handling.** `handle(trigger, context)` does the work. `context.reactionId` is the same on every retry and
-  redelivery (`<useCase>/<eventId>/<n>`), so pass it as the idempotency key of external calls; `context.attempt`
+  redelivery (`<policy>/<eventId>/<n>`), so pass it as the idempotency key of external calls; `context.attempt`
   counts retries from 0.
 - **Failures.** `onFailure(trigger, attempt, error)` returns `Retry(delay)` or `GiveUp`. By default it retries
   with `backoff(attempt)` (1s, 2s, 4s… up to 10 minutes) and never gives up. Running past `timeout` (60 seconds
@@ -764,16 +765,16 @@ It owns the whole reaction, like `OrderNotifications` in [the quickstart](#4-rea
 - **Completion.** `onCompletion(trigger, result)` hears `ReactionResult.Completed` or
   `ReactionResult.GaveUp(error)`; it does nothing by default. If it throws, the work is retried after a backoff,
   so `handle` may run again.
-- **Name.** `name` names the use case's queue, so keep it stable across releases. With db-scheduler it is the
+- **Name.** `name` names the event policy's queue, so keep it stable across releases. With db-scheduler it is the
   task name, so it must be unique across everything that shares the `scheduled_tasks` table, including other
-  contexts' use cases and process manager channels.
+  contexts' event policies and process manager channels.
 
-Each use case has its own queue, so its ordering, timeout and failure policy are its own, and a slow or failing
-use case never holds up another. Delivery is at least once: make `handle` idempotent.
+Each event policy has its own queue, so its ordering, timeout and failure handling are its own, and a slow or failing
+event policy never holds up another. Delivery is at least once: make `handle` idempotent.
 
 #### Several sources and kinds of work
 
-A use case can listen to several aggregates, and do several kinds of work. Make its trigger type a sealed
+An event policy can listen to several aggregates, and do several kinds of work. Make its trigger type a sealed
 interface, with one class per kind of work, and call `on(...)` once per source. This one posts to a sales channel
 when a customer registers and when an order is placed (`Customers` is the customer aggregate's kind, defined like
 `Orders`):
@@ -796,7 +797,7 @@ data class NewOrder(
 
 class SalesFeed(
     private val post: suspend (message: String) -> Unit,
-) : Reactions<SalesFeedPost>(
+) : EventPolicy<SalesFeedPost>(
         name = "sales-feed",
         triggers = SalesFeedPost.serializer(),
     ) {
@@ -824,7 +825,7 @@ class SalesFeed(
 - Each `on(...)` block gets its own aggregate's events, typed, so `when (event)` covers that aggregate's events
   only.
 - `handle` gets every trigger, from either source, and `when (trigger)` covers each kind of work.
-- With [ordering](#ordered-use-cases), each aggregate instance's work runs in order: a customer's and an order's
+- With [ordering](#ordered-event-policies), each aggregate instance's work runs in order: a customer's and an order's
   work are ordered separately, and never wait for each other.
 
 #### Delayed triggers
@@ -839,7 +840,7 @@ data class SendReviewReminder(
 )
 
 class ReviewReminders :
-    Reactions<SendReviewReminder>(
+    EventPolicy<SendReviewReminder>(
         name = "review-reminders",
         triggers = SendReviewReminder.serializer(),
     ) {
@@ -863,34 +864,34 @@ class ReviewReminders :
 - With db-scheduler, delayed work waits in `scheduled_tasks` until it is due, at no extra cost.
 - If a queue delivers work early, kotmod puts it back until it is due. It doesn't run, and it doesn't count as
   a retry.
-- [Ordered use cases](#ordered-use-cases) can't produce delayed triggers: one would hold back every later
+- [Ordered event policies](#ordered-event-policies) can't produce delayed triggers: one would hold back every later
   reaction of its aggregate. If one does, its event is parked (below), so the mistake shows up loudly without
   stopping anything else.
 
 #### When a mapping fails
 
-Sometimes a use case can't turn an event into triggers: its `on(...)` block throws, the event can't be
-deserialized, or an ordered use case produces a delayed trigger. The reactor doesn't stop. It **parks** the
-event in that use case's own queue, as an item with id `<useCase>/<eventId>/mapping`, logs the error, and moves
-on. Other use cases still get their triggers for the event.
+Sometimes an event policy can't turn an event into triggers: its `on(...)` block throws, the event can't be
+deserialized, or an ordered event policy produces a delayed trigger. The reactor doesn't stop. It **parks** the
+event in that event policy's own queue, as an item with id `<policy>/<eventId>/mapping`, logs the error, and moves
+on. Other event policies still get their triggers for the event.
 
 A parked event is retried with capped backoff (1s, 2s, 4s… up to 10 minutes), forever, logging each failure; it
-is never dropped while the use case still listens to its aggregate type. Each retry reads the event again and
-runs the use case's current code, so deploying a fix is enough. The event's triggers are then queued with the
-ids they would have had, and run. With ordering, the aggregate's later work in that use case waits behind the
-parked event; other aggregates and other use cases are unaffected. On db-scheduler the event's triggers then
+is never dropped while the event policy still listens to its aggregate type. Each retry reads the event again and
+runs the event policy's current code, so deploying a fix is enough. The event's triggers are then queued with the
+ids they would have had, and run. With ordering, the aggregate's later work in that event policy waits behind the
+parked event; other aggregates and other event policies are unaffected. On db-scheduler the event's triggers then
 still run in order, before that later work, because ordered work runs in sequence order whenever it was queued.
 A queue that orders by publish time, such as Pub/Sub, runs them after the later work instead (see
 [Using another queue](#using-another-queue-eg-google-pubsub)). If the fixed code no longer listens to the
 event's aggregate type, the parked event is dropped with a warning.
 
 If an event will never map — say its payload is beyond repair — an operator can drop its parked mapping. On
-db-scheduler, `queues.parkedMappings(scheduler, useCase)` lists a use case's parked events (event id, reaction id
-and retry count), and `queues.skipParked(scheduler, useCase, eventId)` drops one without retrying it: that
-event's work in the use case never runs, and with ordering the aggregate's later work can then run. On another
-queue, delete the item with id `<useCase>/<eventId>/mapping` with that queue's own tools.
+db-scheduler, `queues.parkedMappings(scheduler, policy)` lists an event policy's parked events (event id, reaction id
+and retry count), and `queues.skipParked(scheduler, policy, eventId)` drops one without retrying it: that
+event's work in the event policy never runs, and with ordering the aggregate's later work can then run. On another
+queue, delete the item with id `<policy>/<eventId>/mapping` with that queue's own tools.
 
-### Running use cases on db-scheduler
+### Running event policies on db-scheduler
 
 This is kotmod's ready-made queue, in the optional `kotmod-db-scheduler` module. It needs nothing but your
 Postgres database; to use a different queue instead, see
@@ -898,8 +899,8 @@ Postgres database; to use a different queue instead, see
 
 `DbSchedulerQueues` stores work in db-scheduler's `scheduled_tasks` table and runs it on your db-scheduler
 `Scheduler`. Your application owns the `Scheduler` — its threads, polling and lifecycle. One `DbSchedulerQueues`
-serves a whole context: each use case, and each [process manager](#process-managers) channel, becomes one
-db-scheduler task named after it, and each piece of work is an instance of that task. Register every use case
+serves a whole context: each event policy, and each [process manager](#process-managers) channel, becomes one
+db-scheduler task named after it, and each piece of work is an instance of that task. Register every event policy
 before reading `queues.tasks`:
 
 ```kotlin
@@ -937,7 +938,7 @@ How it behaves:
   it with backoff from 10 seconds up to 1 hour until a fix is deployed. Keep old names readable with
   `@SerialName`.
 - **Removing pending work.** To stop pending unordered work for good, cancel its task instance; its id is the
-  reaction id, `<useCase>/<eventId>/<n>` (for ordered work, see [Ordered use cases](#ordered-use-cases)):
+  reaction id, `<policy>/<eventId>/<n>` (for ordered work, see [Ordered event policies](#ordered-event-policies)):
 
 ```kotlin
 fun cancelPendingConfirmation(
@@ -948,14 +949,14 @@ fun cancelPendingConfirmation(
 }
 ```
 
-### Ordered use cases
+### Ordered event policies
 
-By default a use case's work is unordered: two pieces of work from the same aggregate can run at the same time,
+By default an event policy's work is unordered: two pieces of work from the same aggregate can run at the same time,
 or finish in a different order from the events. That is fine for sending emails, but not for projections or
 anything else that must apply an aggregate's changes in order. For those, override `ordering`:
 
 - `ReactionOrdering.Unordered` is the default.
-- `ReactionOrdering.PerAggregate(onGiveUp = …)` runs an aggregate's work in this use case one at a time, in event
+- `ReactionOrdering.PerAggregate(onGiveUp = …)` runs an aggregate's work in this event policy one at a time, in event
   order.
 
 ```kotlin
@@ -970,7 +971,7 @@ data class StatusChanged(
 
 class OrderStatusProjection(
     private val jdbc: JdbcContext,
-) : Reactions<OrderStatusChange>(
+) : EventPolicy<OrderStatusChange>(
         name = "order-status-projection",
         triggers = OrderStatusChange.serializer(),
     ) {
@@ -1017,30 +1018,30 @@ class OrderStatusProjection(
 The reactor reads each aggregate's events in sequence order (see `metadata.sequence`), even in the rare case
 where the order in the log differs because a transaction changed several aggregates. For an aggregate that has
 never been written out of order, checking this is a single primary-key lookup per event. Ordering is per
-aggregate instance and per use case: different aggregates never wait on each other, and neither do different
-use cases. A use case with several sources gets ordering per aggregate of each; since an aggregate type reaches a
-use case through only one source, their orders never mix.
+aggregate instance and per event policy: different aggregates never wait on each other, and neither do different
+event policies. A policy with several sources gets ordering per aggregate of each; since an aggregate type
+reaches a policy through only one source, their orders never mix.
 
 Ordering needs support from the queue. `DbSchedulerQueues` has it (for Pub/Sub, see
-[Using another queue](#using-another-queue-eg-google-pubsub)); a queue without it fails when the use case is
+[Using another queue](#using-another-queue-eg-google-pubsub)); a queue without it fails when the event policy is
 registered, rather than running unordered.
 
-**When work gives up.** Work gives up when `onFailure` returns `GiveUp`. The `OnGiveUp` policy says what happens
-to the aggregate's later work in this use case:
+**When work gives up.** Work gives up when `onFailure` returns `GiveUp`. The `OnGiveUp` setting says what happens
+to the aggregate's later work in this event policy:
 
-| Policy | Behaviour |
+| Setting | Behaviour |
 |---|---|
 | `OnGiveUp.ContinueWithNext` (default) | The failed work is completed as given up and the next one runs |
 | `OnGiveUp.BlockAggregate` | The aggregate's later work waits until an operator retries or skips the failed one |
 
 Use `BlockAggregate` when running later work after a missed one would leave wrong data, such as a projection that
 skipped an event. Other aggregates are not affected. To find and clear blocked work, use the helpers on
-`DbSchedulerQueues`, passing your `Scheduler` (or any `SchedulerClient`) and the use case's name:
+`DbSchedulerQueues`, passing your `Scheduler` (or any `SchedulerClient`) and the event policy's name:
 
-- `blockedReactions(client, useCase)` lists each blocked reaction with its aggregate key, reaction id and
+- `blockedReactions(client, policy)` lists each blocked reaction with its aggregate key, reaction id and
   sequence number.
-- `retryBlocked(client, useCase, id)` runs it again now, with its attempt count reset.
-- `skipBlocked(client, useCase, id)` drops it without running it, so the aggregate's next work can run.
+- `retryBlocked(client, policy, id)` runs it again now, with its attempt count reset.
+- `skipBlocked(client, policy, id)` drops it without running it, so the aggregate's next work can run.
 
 ```kotlin
 fun retryBlockedProjection(
@@ -1055,13 +1056,13 @@ fun retryBlockedProjection(
 ```
 
 Ordered work's db-scheduler instance id is built from its aggregate, sequence number and reaction id, so
-`TaskInstanceId.of(useCase, reactionId)` does not find it; use these helpers instead.
+`TaskInstanceId.of(policy, reactionId)` does not find it; use these helpers instead.
 
 **How waiting works.** Ordered work only runs when no earlier work of the same aggregate is still pending in its
-use case's queue. Otherwise it waits and checks again, starting after `DbSchedulerQueues`'
+event policy's queue. Otherwise it waits and checks again, starting after `DbSchedulerQueues`'
 `orderedRecheckDelay` (2 seconds by default) and doubling each time up to 1 minute. When work finishes, kotmod
 nudges the aggregate's next work to run immediately, so a backlog normally runs back to back. The cost of
-ordering is therefore a little extra database work for waiting work, and one aggregate's work in a use case runs
+ordering is therefore a little extra database work for waiting work, and one aggregate's work in an event policy runs
 on at most one thread at a time; different aggregates still run in parallel.
 
 **Recommended index.** The pending check looks work up by task and instance id, so add this to your own
@@ -1095,11 +1096,11 @@ db-scheduler is a convenient default, not a requirement. The reactor and process
     retry.
   - An exception — deliver it again later.
 
-kotmod asks for one queue per use case (named after it) and one per process manager channel
+kotmod asks for one queue per event policy (named after it) and one per process manager channel
 (`<process type>-<channel>`). It stores its own items in them — your triggers, wrapped with what kotmod needs to
 run them, and [parked mappings](#when-a-mapping-fails) — so your queue only moves them between publish and
 delivery. Timeouts, `onFailure`, `onCompletion` and parked mappings work the same whichever queue you use, with
-one difference for ordered use cases: on a queue that orders by publish time, a parked mapping's triggers run
+one difference for ordered event policies: on a queue that orders by publish time, a parked mapping's triggers run
 after its aggregate's later work (see the Pub/Sub notes below). Leave out the `kotmod-db-scheduler` dependency if
 you don't use it.
 
@@ -1198,12 +1199,12 @@ Pass a `PubSubQueues` to `EventReactor` (and to your process managers) where the
 
 How Pub/Sub differs from db-scheduler:
 
-- **One subscription per queue.** Each use case's queue, and each process manager channel, maps to one
+- **One subscription per queue.** Each event policy's queue, and each process manager channel, maps to one
   subscription: a topic per queue, or, as in the sketch, one topic with a `queue` attribute and a filtered
   subscription per queue.
 - **Retry delays are approximate.** Pub/Sub can't redeliver a message after a chosen delay; a `nack()` is
   redelivered according to the subscription's retry policy. Set its minimum and maximum backoff to suit your
-  use cases, or treat `onFailure`'s delays only as a guide.
+  event policies, or treat `onFailure`'s delays only as a guide.
 - **No deduplication by reaction id.** Pub/Sub may deliver a message more than once, and the reactor may publish
   a trigger again after a restart. Keep `handle` and `onCompletion` idempotent, and pass `context.reactionId` as
   the idempotency key of external calls.
@@ -1217,7 +1218,7 @@ How Pub/Sub differs from db-scheduler:
 - **A parked mapping breaks order for its aggregate.** A parked mapping is a message with its event's ordering
   key, so while it fails it holds back that aggregate's later work, and only that aggregate's. But Pub/Sub
   orders by publish time: when it finally succeeds, the event's triggers are published behind the later work
-  that was already queued, so they run after it. In an ordered use case on Pub/Sub, treat a parked mapping as
+  that was already queued, so they run after it. In an ordered event policy on Pub/Sub, treat a parked mapping as
   breaking order for that aggregate, and keep `on(...)` blocks from throwing. db-scheduler doesn't have this
   problem: it runs ordered work in sequence order.
 - **Parked mappings read your database.** A parked mapping reads its event again from the event log, so the
@@ -1277,16 +1278,16 @@ fun orderContract(
 ```
 
 - `internalToPublic` maps each internal event to a public one; returning `null` keeps it private.
-- Use cases in other contexts react to the public events with `on(contract)`, each event with the original
+- Event policies in other contexts react to the public events with `on(contract)`, each event with the original
   event's metadata (event id, aggregate id, sequence and so on); see
   [Consuming another context's events](#consuming-another-contexts-events).
-- The publishing context builds and starts the contract. Register the use cases that listen to it before it
+- The publishing context builds and starts the contract. Register the event policies that listen to it before it
   starts.
 - A contract reads the event log independently of the reactor, so give it its own consumer name.
 - `aggregateTypes` lists the aggregate types the contract publishes; events of other types are skipped
   without being deserialized. The event log holds every aggregate's events, so with a filter, adding an
   aggregate or a [process manager](#process-managers) to the context never stalls this contract on an event
-  type its `serialization` can't read. A use case can combine a contract with other sources only when the
+  type its `serialization` can't read. An event policy can combine a contract with other sources only when the
   contract has this filter.
 - Without `aggregateTypes`, a contract deserializes **every** event in the log before mapping it, so its
   `serialization` must be able to read every event type your application writes, including the facts a
@@ -1295,7 +1296,7 @@ fun orderContract(
 
 ### Consuming another context's events
 
-A use case reacts to another context's public events with `on(contract)`, typed like any other source:
+An event policy reacts to another context's public events with `on(contract)`, typed like any other source:
 
 ```kotlin
 @Serializable
@@ -1316,7 +1317,7 @@ interface PaymentGateway {
 class CustomerBilling(
     orderEvents: PublicEventContract<*, OrderPublicEvent>,
     private val gateway: PaymentGateway,
-) : Reactions<BillingTrigger>(
+) : EventPolicy<BillingTrigger>(
         name = "customer-billing",
         triggers = BillingTrigger.serializer(),
     ) {
@@ -1356,11 +1357,11 @@ fun startBilling(
 - `startBilling` builds the billing context's own reactor, named `billing-reactor`. Every reactor on the same
   database needs its own name, because the name is where it saves its position; two reactors sharing `reactor`
   would share one position and skip events.
-- Registering the use case subscribes it to the contract's own reader, which queues its triggers in the use
-  case's queue. Register it before the publishing context starts the contract.
-- Reaction ids and ordering work as for local sources: ids are `<useCase>/<eventId>/<n>` with the original
+- Registering the event policy subscribes it to the contract's own reader, which queues its triggers in the
+  policy's queue. Register it before the publishing context starts the contract.
+- Reaction ids and ordering work as for local sources: ids are `<policy>/<eventId>/<n>` with the original
   event's id, and ordering is per original aggregate.
-- If the use case's block throws, the event is parked in its queue, as for a local source, and the contract's
+- If the event policy's block throws, the event is parked in its queue, as for a local source, and the contract's
   reader moves on. If the contract itself can't read an event (its `serialization` or `internalToPublic` throws),
   the contract stops at that event, for everyone listening, until the publishing context fixes it.
 - Both contexts share the database. Consuming a context that lives in another service or database is not
@@ -1650,7 +1651,7 @@ fun startDispatchDeadlines(
 - There is one channel per kind of work, each a db-scheduler task named after the process type: inputs (ordered
   per source aggregate here, `DispatchDeadline-inputs`), internal (timeouts and rejection feedback,
   `DispatchDeadline-internal`), commands (`DispatchDeadline-commands`), and `DispatchDeadline-contract-<name>` for each
-  `subscribeTo`. One `DbSchedulerQueues` serves every process manager and use case of the context.
+  `subscribeTo`. One `DbSchedulerQueues` serves every process manager and event policy of the context.
 - Inputs are stored as JSON with the input class's name. Renaming an input class breaks inputs that are already
   scheduled or in flight, so keep the old name with `@SerialName`.
 
@@ -1672,7 +1673,7 @@ recorded, and it is retried until you fix the wiring.
 ## Running in production
 
 **Delivery is at-least-once.** Events are committed with the state change that produced them, and the
-reactor only moves past an event once every use case's triggers for it are queued, so no event is ever skipped.
+reactor only moves past an event once every event policy's triggers for it are queued, so no event is ever skipped.
 Work can run more than once — for example if the process dies after queueing but before saving the reactor's
 position, or if a shutdown interrupts running work. Make `handle` and `onCompletion` idempotent, and pass
 `context.reactionId` as the idempotency key of external calls.
@@ -1694,13 +1695,13 @@ nothing writing yet, set every row's `ddd_domain_event.transaction_id` to `'0'` 
 `ddd_consumer_offset.last_transaction_id` to `0` (keep `last_offset`). Each consumer then resumes exactly where
 it left off, and new events sort after the migrated ones.
 
-**Reaction ids are deterministic.** kotmod builds each reaction id from the use case, the event and the
-trigger's position in the block's output (`<useCase>/<eventId>/<n>`), so an event read again while its work is
+**Reaction ids are deterministic.** kotmod builds each reaction id from the event policy, the event and the
+trigger's position in the block's output (`<policy>/<eventId>/<n>`), so an event read again while its work is
 pending is recognised. Keep each `on(...)` block deterministic: the same event must produce the same triggers, in
 the same order. A queue forgets an id once its work has run, so moving the reactor's position back runs finished
 work again.
 
-**Start and stop in order.** Register every use case and build every process manager, then read
+**Start and stop in order.** Register every event policy and build every process manager, then read
 `queues.tasks`, build the `Scheduler` and call `queues.bind(scheduler)`. Start the reactor and process managers,
 then the `Scheduler`, then the leader election, then any public contracts. To stop:
 
@@ -1710,7 +1711,7 @@ then the `Scheduler`, then the leader election, then any public contracts. To st
    queued in between waits in `scheduled_tasks` for the next node.
 4. Stop the leader election, which hands the lock to another node.
 
-Getting it wrong doesn't lose anything — work that arrives before its use case is running is rescheduled with a
+Getting it wrong doesn't lose anything — work that arrives before its event policy is running is rescheduled with a
 warning — but it adds noise and delay.
 
 **Run one active poller per consumer.** The reactor, public contracts and process managers only poll while
@@ -1764,14 +1765,14 @@ fun reactorWithLeaderElection(
 
 | Situation | Behaviour |
 |---|---|
-| `handle` throws or times out | `onFailure` decides: `Retry(delay)` or `GiveUp` (by default it retries with capped backoff, forever). With ordering, only that aggregate's later work in that use case waits |
-| A use case's `on(...)` block throws, or its event can't be deserialized | The event is [parked](#when-a-mapping-fails) in that use case's queue and retried with capped backoff, forever, logging each failure; other use cases and the reactor carry on |
+| `handle` throws or times out | `onFailure` decides: `Retry(delay)` or `GiveUp` (by default it retries with capped backoff, forever). With ordering, only that aggregate's later work in that event policy waits |
+| An event policy's `on(...)` block throws, or its event can't be deserialized | The event is [parked](#when-a-mapping-fails) in that event policy's queue and retried with capped backoff, forever, logging each failure; other event policies and the reactor carry on |
 | `onFailure` or `onCompletion` throws | The work is retried after a backoff, so `handle` may run again |
 | Stored work can't be read (e.g. a trigger class was renamed) | Retried with backoff from 10 seconds up to 1 hour |
 | A node crashes mid-work | db-scheduler notices the missing heartbeat and runs it again |
 | The database or queue is down while the reactor queues work | The reactor stops the batch and resumes from its last saved position on the next poll |
 | A contract can't read or map an event | The contract stops at that event and retries it every poll, for everyone listening to it |
-| A use case fed by a contract can't queue its work (the queue is down, or `DbSchedulerQueues` isn't bound yet) | The contract's reader stops at that event and retries it every poll, for everyone listening to the contract |
+| An event policy fed by a contract can't queue its work (the queue is down, or `DbSchedulerQueues` isn't bound yet) | The contract's reader stops at that event and retries it every poll, for everyone listening to the contract |
 | A command loses a concurrent update | `handle` reads and decides again, up to `maxConflictRetries` times (5 by default). `OptimisticConcurrencyException` only surfaces when those run out: reduce contention on that aggregate or raise `maxConflictRetries`. Inside an outer `jdbc.transaction { }` there are no retries: retry the whole transaction (see [Several aggregates in one transaction](#several-aggregates-in-one-transaction)) |
 
 **Tune throughput.** The reactor, contracts and process managers poll every 500ms (`pollInterval`) and read up
@@ -1804,27 +1805,27 @@ failure in a specific spot to show up.
   check finally fails. If a check takes the lock while `stop()` is running, the "Stepped down" line is
   skipped.
 
-**Use cases**
+**Event policies**
 
 - **Replays repeat finished work.** A queue recognises a reaction id only while its work is pending. Moving the
   reactor's position back, or a crash between queueing work and saving the position after the work has already
   run, runs it again. `handle` must be idempotent.
-- **A use case's blocks must be deterministic.** Reaction ids number an event's triggers by their position in the
+- **An event policy's blocks must be deterministic.** Reaction ids number an event's triggers by their position in the
   block's output, so a re-read event is only recognised if the block returns the same triggers, in the same
   order.
-- **A new use case doesn't see history.** It shares the reactor's position, so it sees events from when it is
-  first deployed. Backfilling one use case is not supported.
-- **Removing a use case abandons its queued work.** Its db-scheduler task is no longer registered, so its rows in
+- **A new event policy doesn't see history.** It shares the reactor's position, so it sees events from when it is
+  first deployed. Backfilling one event policy is not supported.
+- **Removing an event policy abandons its queued work.** Its db-scheduler task is no longer registered, so its rows in
   `scheduled_tasks` never run. db-scheduler logs a warning when it finds them due, and once they have been due
   for longer than the `Scheduler`'s `deleteUnresolvedAfter` (14 days by default in db-scheduler 16.12.0) it
   deletes every row of that task: pending work and parked mappings alike. Let its work finish before removing
   it, or cancel its rows deliberately.
-- **At most 9,999 triggers per event in an ordered use case.** Beyond that, they sort in the wrong order. This
+- **At most 9,999 triggers per event in an ordered event policy.** Beyond that, they sort in the wrong order. This
   is not checked.
 - **Aggregate types containing `/` can share ordering keys.** The ordering key is
   `"<aggregate type>/<aggregate id>"`, so type `a/b` with id `c` and type `a` with id `b/c` share one key.
   Their work then waits unnecessarily; nothing runs out of order.
-- **Unreadable stored work affects the operator helpers.** If any pending work of the use case has stored data
+- **Unreadable stored work affects the operator helpers.** If any pending work of the event policy has stored data
   that can't be decoded, `blockedReactions`, `retryBlocked`, `skipBlocked`, `parkedMappings` and `skipParked`
   fail. Work whose trigger can't be decoded holds back its aggregate's later work without being listed by
   `blockedReactions`.
@@ -1836,15 +1837,33 @@ failure in a specific spot to show up.
   an outer transaction that changed several aggregates in a racing order, and only matters for very long
   histories.
 
+## Upgrading from 0.3.0
+
+0.3.1 renames the class you extend for follow-up work from `Reactions<T>` to `EventPolicy<T>`; the docs now call it
+an event policy.
+
+1. **Extend `EventPolicy<T>`.** `Reactions<T>` still compiles, as a deprecated alias with a quick fix, and may
+   be removed in a later release. The same goes for the `ReactionsDsl` marker, now `EventPolicyDsl`.
+2. **Renamed parameters.** Parameters named `useCase` are now `policy`, in the same position:
+   `EventReactor.register(policy)` and `DbSchedulerQueues`' `parkedMappings`, `skipParked`, `blockedReactions`,
+   `retryBlocked` and `skipBlocked`. Only calls that pass them by name (`useCase = …`) need changing, to `policy = …`.
+3. **Nothing stored changes.** Queue and task names, reaction ids (`<policy>/<eventId>/<n>` and
+   `<policy>/<eventId>/mapping`) and queued data are as in 0.3.0, so work queued by 0.3.0 runs after the upgrade
+   with no draining. Log messages now say "event policy", and the internal runtime's logger is now
+   `io.kotmod.reaction.PolicyRuntime` (it was `io.kotmod.reaction.UseCaseRuntime`): update any log filters or
+   levels keyed on the old name.
+
 ## Upgrading from 0.2.0
 
-0.3.0 replaces event reactions built from an executor, an outbox and contract subscriptions with
-[use cases](#use-cases) run by an `EventReactor`. Code blocks below marked as before/after are sketches, not
-compiled; the [quickstart](#4-react-to-events) and the guides show compiled code. To upgrade:
+0.3 replaces event reactions built from an executor, an outbox and contract subscriptions with
+[event policies](#event-policies) (classes extending `EventPolicy<T>`) run by an `EventReactor`. These steps go
+straight to 0.3.1; 0.3.0 named the class `Reactions<T>` (see [Upgrading from 0.3.0](#upgrading-from-030)). Code
+blocks below marked as before/after are sketches, not compiled; the [quickstart](#4-react-to-events) and the guides
+show compiled code. To upgrade:
 
-1. **Drain in-flight work first.** Queue names change: each use case's queue is named after the use case, and
+1. **Drain in-flight work first.** Queue names change: each event policy's queue is named after the policy, and
    process manager channels become `<process type>-<channel>`. Work queued under 0.2.0's task names would never
-   run. Before deploying 0.3.0, stop writing commands and let pending reactions and process manager work finish
+   run. Before deploying 0.3.1, stop writing commands and let pending reactions and process manager work finish
    (or cancel what you no longer need). Any rows left under the old task names are never run, and can be deleted
    from `scheduled_tasks`.
 2. **`AggregateKind` gains the event type and its serialization.** It is now
@@ -1858,7 +1877,7 @@ compiled; the [quickstart](#4-react-to-events) and the guides show compiled code
        AggregateType("Order"), OrderCommand.serializer(), OrderRejection.serializer(),
    )
 
-   // 0.3.0
+   // 0.3.1
    object Orders : AggregateKind<OrderCommand, OrderEvent, OrderRejection>(
        type = AggregateType("Order"),
        commandSerializer = OrderCommand.serializer(),
@@ -1867,11 +1886,11 @@ compiled; the [quickstart](#4-react-to-events) and the guides show compiled code
    )
    ```
 
-3. **An executor, an outbox and `eventToReactions` become a use case and the reactor.** Move `eventToReactions`
-   into the use case's `on(kind)` block (no more filtering by aggregate type, deserializing, or building reaction
+3. **An executor, an outbox and `eventToReactions` become an event policy and the reactor.** Move `eventToReactions`
+   into the event policy's `on(kind)` block (no more filtering by aggregate type, deserializing, or building reaction
    ids: call `trigger(t)`), `execute` into `handle`, the retry handlers into `onFailure` (returning `Retry(delay)`
    or `GiveUp`; a timeout arrives as a `ReactionTimeoutException`) and `onCompletion` into `onCompletion`.
-   Register every use case on one `EventReactor` per context. Its `name` (default `reactor`) names its saved
+   Register every event policy on one `EventReactor` per context. Its `name` (default `reactor`) names its saved
    position, and `isLeader` replaces the outbox's `isLeader`.
 
    <!-- not-compiled -->
@@ -1887,8 +1906,8 @@ compiled; the [quickstart](#4-react-to-events) and the guides show compiled code
    }
    val outbox = AggregateEventOutbox(backend, executor, eventToReactions, getPosition, savePosition, isLeader)
 
-   // 0.3.0
-   class OrderNotifications : Reactions<SendOrderConfirmation>("order-notifications", SendOrderConfirmation.serializer()) {
+   // 0.3.1
+   class OrderNotifications : EventPolicy<SendOrderConfirmation>("order-notifications", SendOrderConfirmation.serializer()) {
        init {
            on(Orders) { event, metadata ->
                if (event is OrderPlaced) trigger(SendOrderConfirmation(metadata.aggregateId.value))
@@ -1903,19 +1922,19 @@ compiled; the [quickstart](#4-react-to-events) and the guides show compiled code
    reactor.start()
    ```
 
-   `execute` could return `EventReactionCancelled` to finish without doing anything. A use case's `handle` does
+   `execute` could return `EventReactionCancelled` to finish without doing anything. An event policy's `handle` does
    that by returning normally; `onCompletion` then sees `ReactionResult.Completed`, not a cancellation.
 
-4. **Triggers are plain data.** In use cases, drop `: EventReactionTrigger`, the `timeout` field (override the use case's
+4. **Triggers are plain data.** In event policies, drop `: EventReactionTrigger`, the `timeout` field (override the policy's
    `timeout`, 60 seconds by default) and your `EventReactionTriggerSerializer` object (pass
    `triggers = X.serializer()`). A custom queue still uses `EventReactionTrigger` and
    `EventReactionTriggerSerializer`, as part of its sink and source interfaces. A trigger's `notBefore` moves to
    `trigger(t, notBefore = …)`. Ordering moves from
-   the outbox's `ordering` to the use case's `ordering` property (see [Ordered use cases](#ordered-use-cases)).
+   the outbox's `ordering` to the policy's `ordering` property (see [Ordered event policies](#ordered-event-policies)).
 5. **Contract subscriptions become `on(contract)`.** Replace `contract.subscribe(executor) { envelope -> … }` with
-   a use case whose `init` block calls `on(contract) { event, metadata -> … }`. The event is typed, and `metadata`
+   an event policy whose `init` block calls `on(contract) { event, metadata -> … }`. The event is typed, and `metadata`
    replaces the envelope's. The contract must read the same database as the reactor and must be started, and
-   the use case must be registered before the contract starts. See
+   the policy must be registered before the contract starts. See
    [Consuming another context's events](#consuming-another-contexts-events).
 
    <!-- not-compiled -->
@@ -1925,8 +1944,8 @@ compiled; the [quickstart](#4-react-to-events) and the guides show compiled code
        listOf(EventReaction(EventReactionId("status-${envelope.metadata.eventId.value}"), UpdateStatus(envelope.event.orderId)))
    }
 
-   // 0.3.0
-   class StatusUpdates : Reactions<UpdateStatus>("status-updates", UpdateStatus.serializer()) {
+   // 0.3.1
+   class StatusUpdates : EventPolicy<UpdateStatus>("status-updates", UpdateStatus.serializer()) {
        init {
            on(contract) { event, metadata -> trigger(UpdateStatus(event.orderId)) }
        }
@@ -1936,7 +1955,7 @@ compiled; the [quickstart](#4-react-to-events) and the guides show compiled code
    ```
 
 6. **db-scheduler.** Replace every `DbSchedulerEventReactions` and `DbSchedulerProcessManagerQueues` with one
-   `DbSchedulerQueues(jdbc)`. Read `queues.tasks` only after registering every use case and building every process
+   `DbSchedulerQueues(jdbc)`. Read `queues.tasks` only after registering every event policy and building every process
    manager, pass it to your `Scheduler`, and call `queues.bind(scheduler)` before starting the reactor or process
    managers. The operator helpers are keyed by queue name:
    `queues.blockedReactions(scheduler, "order-status-projection")`, `queues.retryBlocked(scheduler, name, id)` and
@@ -1944,7 +1963,7 @@ compiled; the [quickstart](#4-react-to-events) and the guides show compiled code
 
    <!-- not-compiled -->
    ```kotlin
-   // 0.3.0
+   // 0.3.1
    val queues = DbSchedulerQueues(jdbc)
    val reactor = EventReactor(jdbc, queues, isLeader = { election.isLeader() })
    reactor.register(OrderNotifications())
@@ -1975,7 +1994,7 @@ compiled; the [quickstart](#4-react-to-events) and the guides show compiled code
    LIMIT 1;
    ```
 
-   With several outboxes this takes the one furthest behind, so use cases that came from the others may see some
+   With several outboxes this takes the one furthest behind, so event policies that came from the others may see some
    events again (with new ids, so `handle` must be idempotent). Once the reactor is running, you can delete the
    old rows from `ddd_consumer_offset`.
 10. **Deduplication only while queued.** A reaction's id is deduplicated only while it is still in the queue; once
@@ -1983,8 +2002,8 @@ compiled; the [quickstart](#4-react-to-events) and the guides show compiled code
     idempotency key of external calls.
 11. **Removed from the public API:** `EventReactionExecutor`, `AggregateEventOutbox`, `EventReaction`,
     `PublicEventContract.subscribe`, `DbSchedulerEventReactions`, `DbSchedulerProcessManagerQueues`,
-    `EventReactionExecutionResult`, `EventReactionCompletionResult`, `RetrySignal` and `BackoffStrategy`. Use a use
-    case's `onFailure`, `onCompletion` and `backoff(attempt)` instead.
+    `EventReactionExecutionResult`, `EventReactionCompletionResult`, `RetrySignal` and `BackoffStrategy`. Use an event
+    policy's `onFailure`, `onCompletion` and `backoff(attempt)` instead.
 
 ## Upgrading from 0.1.0
 

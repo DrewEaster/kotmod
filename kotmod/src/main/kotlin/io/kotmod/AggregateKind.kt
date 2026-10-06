@@ -5,7 +5,7 @@ import kotlinx.serialization.json.Json
 
 /**
  * Names one kind of aggregate, such as orders, together with how its commands, events and rejections are serialized.
- * Build an [AggregateManager] from it, and let use cases react to its events with `on(kind)`. Declare one per
+ * Build an [AggregateManager] from it, and let event policies react to its events with `on(kind)`. Declare one per
  * aggregate type, usually as an `object`:
  *
  * ```
@@ -19,7 +19,7 @@ import kotlinx.serialization.json.Json
  *
  * @param type the aggregate type its events and commands are recorded under.
  * @param commandSerializer serializes its commands, so other parts of the app can request them as data.
- * @param eventSerialization reads and writes its events; use cases listening to the kind get them typed.
+ * @param eventSerialization reads and writes its events; event policies listening to the kind get them typed.
  * @param rejectionSerializer serializes its rejections, which are recorded so a repeated command id gets the
  *   same answer.
  */

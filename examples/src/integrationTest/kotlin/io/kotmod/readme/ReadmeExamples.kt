@@ -40,7 +40,7 @@ import io.kotmod.process.target
 import io.kotmod.process.transition
 import io.kotmod.reaction.EventReactor
 import io.kotmod.reaction.ReactionContext
-import io.kotmod.reaction.Reactions
+import io.kotmod.reaction.EventPolicy
 import io.kotmod.serialization.jsonDataSerializationContext
 import io.kotmod.serialization.toEventSerializer
 import kotlinx.serialization.Serializable
@@ -145,7 +145,7 @@ val orderEventSerialization =
         }
     }
 
-// Guide: Use cases
+// Guide: Event policies
 
 // Not shown in the README: a minimal customer aggregate kind for the SalesFeed example.
 
@@ -198,7 +198,7 @@ data class NewOrder(
 
 class SalesFeed(
     private val post: suspend (message: String) -> Unit,
-) : Reactions<SalesFeedPost>(
+) : EventPolicy<SalesFeedPost>(
         name = "sales-feed",
         triggers = SalesFeedPost.serializer(),
     ) {
@@ -228,7 +228,7 @@ data class SendReviewReminder(
 )
 
 class ReviewReminders :
-    Reactions<SendReviewReminder>(
+    EventPolicy<SendReviewReminder>(
         name = "review-reminders",
         triggers = SendReviewReminder.serializer(),
     ) {
@@ -248,7 +248,7 @@ class ReviewReminders :
     }
 }
 
-// Guide: Running use cases on db-scheduler
+// Guide: Running event policies on db-scheduler
 
 fun startReactions(
     dataSource: DataSource,
@@ -279,7 +279,7 @@ fun cancelPendingConfirmation(
     scheduler.cancel(TaskInstanceId.of("order-notifications", "order-notifications/${eventId.value}/0"))
 }
 
-// Guide: Ordered use cases
+// Guide: Ordered event policies
 
 @Serializable
 sealed interface OrderStatusChange
@@ -292,7 +292,7 @@ data class StatusChanged(
 
 class OrderStatusProjection(
     private val jdbc: JdbcContext,
-) : Reactions<OrderStatusChange>(
+) : EventPolicy<OrderStatusChange>(
         name = "order-status-projection",
         triggers = OrderStatusChange.serializer(),
     ) {
@@ -394,7 +394,7 @@ interface PaymentGateway {
 class CustomerBilling(
     orderEvents: PublicEventContract<*, OrderPublicEvent>,
     private val gateway: PaymentGateway,
-) : Reactions<BillingTrigger>(
+) : EventPolicy<BillingTrigger>(
         name = "customer-billing",
         triggers = BillingTrigger.serializer(),
     ) {

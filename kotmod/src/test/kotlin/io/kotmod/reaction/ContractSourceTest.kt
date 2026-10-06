@@ -22,7 +22,7 @@ class ContractSourceTest {
     private var position = EventLogPosition.START
     private val payments = paymentContract(log)
 
-    private fun reactor(vararg useCases: Reactions<Notice>) =
+    private fun reactor(vararg policies: EventPolicy<Notice>) =
         EventReactor(
             queues = queues,
             polling = log,
@@ -35,16 +35,16 @@ class ContractSourceTest {
             batchSize = 100,
             clock = { Instant.parse("2026-10-06T10:00:00Z") },
         ).also { reactor ->
-            useCases.forEach { reactor.register(it) }
-            reactor.startUseCasesForTest()
+            policies.forEach { reactor.register(it) }
+            reactor.startPoliciesForTest()
         }
 
-    /** An ordered use case over orders (a Confirm per placed order) and payments (a Flag per declined payment). */
+    /** An ordered event policy over orders (a Confirm per placed order) and payments (a Flag per declined payment). */
     private fun fraudChecks(mapping: TriggerScope<Notice>.(PaymentDeclined, EventMetadata) -> Unit = { event, _ -> trigger(Flag(event.customerId)) }) =
-        RecordingUseCase(name = "fraud-checks", ordering = ReactionOrdering.PerAggregate()).apply { listenTo(payments, mapping) }
+        RecordingPolicy(name = "fraud-checks", ordering = ReactionOrdering.PerAggregate()).apply { listenTo(payments, mapping) }
 
     @Test
-    fun `a use case with a local and a contract source gets typed events from both, and their ordering keys never mix`() =
+    fun `an event policy with a local and a contract source gets typed events from both, and their ordering keys never mix`() =
         runBlocking {
             val fraud = fraudChecks()
             val reactor = reactor(fraud)
@@ -62,9 +62,9 @@ class ContractSourceTest {
         }
 
     @Test
-    fun `a public event reaches a use case that only listens to the contract, through the contract's own reader`() =
+    fun `a public event reaches an event policy that only listens to the contract, through the contract's own reader`() =
         runBlocking {
-            val chargebacks = RecordingUseCase(name = "chargebacks", kind = null).apply { listenTo(payments) { event, _ -> trigger(Flag(event.customerId)) } }
+            val chargebacks = RecordingPolicy(name = "chargebacks", kind = null).apply { listenTo(payments) { event, _ -> trigger(Flag(event.customerId)) } }
             val reactor = reactor(chargebacks)
             log.add(paymentEvent("c-1", eventId = "p-1"))
 
@@ -87,7 +87,7 @@ class ContractSourceTest {
         }
 
     @Test
-    fun `a use case's contract block that throws is parked, the contract's reader moves on, and the fix runs it through the contract`() =
+    fun `an event policy's contract block that throws is parked, the contract's reader moves on, and the fix runs it through the contract`() =
         runBlocking {
             var brokenFor = 1
             val fraud =
@@ -111,7 +111,7 @@ class ContractSourceTest {
         }
 
     @Test
-    fun `registering a use case after its contract started is refused`() =
+    fun `registering an event policy after its contract started is refused`() =
         runBlocking<Unit> {
             payments.start()
             try {
@@ -125,7 +125,7 @@ class ContractSourceTest {
     fun `a refused registration changes nothing, so an earlier contract gets no listener and no queue is created`() =
         runBlocking<Unit> {
             val other = paymentContract(log, setOf(io.kotmod.AggregateType("Refund")))
-            val twoContracts = RecordingUseCase(name = "two", kind = null).apply {
+            val twoContracts = RecordingPolicy(name = "two", kind = null).apply {
                 listenTo(payments) { event, _ -> trigger(Flag(event.customerId)) }
                 listenTo(other) { event, _ -> trigger(Flag(event.customerId)) }
             }
@@ -146,7 +146,7 @@ class ContractSourceTest {
         }
 
     @Test
-    fun `a conversion failure inside the contract stops its reader and parks nothing in the use case`() =
+    fun `a conversion failure inside the contract stops its reader and parks nothing in the event policy`() =
         runBlocking<Unit> {
             reactor(fraudChecks())
             log.add(paymentEvent("c-1", eventId = "p-1").let { it.copy(serialized = it.serialized.copy(payload = "garbage")) })

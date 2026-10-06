@@ -23,7 +23,7 @@ import io.kotmod.reaction.EventReactor
 import io.kotmod.reaction.FailureDecision
 import io.kotmod.reaction.ReactionContext
 import io.kotmod.reaction.ReactionResult
-import io.kotmod.reaction.Reactions
+import io.kotmod.reaction.EventPolicy
 import io.kotmod.reaction.Retry
 import io.kotmod.reaction.TriggerScope
 import io.kotmod.serialization.jsonDataSerializationContext
@@ -61,7 +61,7 @@ data class Flag(
     val customerId: String,
 ) : Work
 
-/** What a use case saw, across threads. [handled] records triggers whose `handle` returned normally, in order. */
+/** What an event policy saw, across threads. [handled] records triggers whose `handle` returned normally, in order. */
 class Seen {
     val handled = CopyOnWriteArrayList<Work>()
     val contexts = CopyOnWriteArrayList<ReactionContext>()
@@ -70,8 +70,8 @@ class Seen {
 }
 
 /**
- * A use case over test orders for end-to-end tests. [mapping] is its `on(kind)` block (by default a [Confirm] for every
- * event), [work] runs inside `handle`, and [decide] is its failure policy (by default, retry after 100ms).
+ * An event policy over test orders for end-to-end tests. [mapping] is its `on(kind)` block (by default a [Confirm] for every
+ * event), [work] runs inside `handle`, and [decide] is its failure handling (by default, retry after 100ms).
  */
 class OrderWork(
     name: String,
@@ -84,7 +84,7 @@ class OrderWork(
     },
     private val work: suspend (Work, ReactionContext) -> Unit = { _, _ -> },
     private val decide: (Work, Int, Throwable) -> FailureDecision = { _, _, _ -> Retry(100.milliseconds) },
-) : Reactions<Work>(name, Work.serializer()) {
+) : EventPolicy<Work>(name, Work.serializer()) {
     init {
         if (kind != null) on(kind) { event, metadata -> mapping(this, event, metadata) }
     }
@@ -195,19 +195,19 @@ fun paymentContract(jdbc: JdbcContext): PublicEventContract<PaymentEvent, Custom
 }
 
 /**
- * Registers [useCases] on one reactor and one scheduler, starts them in the documented order (reactor, contract,
+ * Registers [policies] on one reactor and one scheduler, starts them in the documented order (reactor, contract,
  * scheduler), runs [block], then stops them in reverse. Events appended inside [block] are seen; earlier ones are not.
  */
 suspend fun runningReactor(
     dataSource: DataSource,
     jdbc: JdbcContext,
-    useCases: List<OrderWork>,
+    policies: List<OrderWork>,
     contract: PublicEventContract<*, *>? = null,
     block: suspend (scheduler: Scheduler, queues: DbSchedulerQueues) -> Unit,
 ) {
     val queues = DbSchedulerQueues(jdbc, orderedRecheckDelay = 200.milliseconds)
     val reactor = EventReactor(jdbc, queues, isLeader = { true }, pollInterval = 50.milliseconds)
-    useCases.forEach { reactor.register(it) }
+    policies.forEach { reactor.register(it) }
     val scheduler = testScheduler(dataSource, *queues.tasks.toTypedArray())
     queues.bind(scheduler)
     reactor.start()
@@ -223,13 +223,13 @@ suspend fun runningReactor(
 }
 
 /**
- * The stored data (as JSON, since the task-data class is internal to the module) of [useCase]'s parked mapping of
+ * The stored data (as JSON, since the task-data class is internal to the module) of [policy]'s parked mapping of
  * [eventId], while it is still queued.
  */
 fun Scheduler.parkedMapping(
-    useCase: String,
+    policy: String,
     eventId: String,
 ): JsonObject? =
-    getScheduledExecutionsForTask(useCase, String::class.java)
-        .firstOrNull { it.taskInstance.id.endsWith("$useCase/$eventId/mapping") }
+    getScheduledExecutionsForTask(policy, String::class.java)
+        .firstOrNull { it.taskInstance.id.endsWith("$policy/$eventId/mapping") }
         ?.let { Json.parseToJsonElement(it.data as String).jsonObject }

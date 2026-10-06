@@ -120,11 +120,11 @@ internal class InMemoryLog : DomainEventPollingBackend {
 }
 
 /**
- * A use case over test orders that records what happens to it. [mapping] is its `on(kind)` block (by default a
+ * An event policy over test orders that records what happens to it. [mapping] is its `on(kind)` block (by default a
  * [Confirm] for each placed order); [failWith], [decide], [work] and [onCompleted] script `handle`, `onFailure` and
  * `onCompletion`.
  */
-internal class RecordingUseCase(
+internal class RecordingPolicy(
     name: String = "confirmations",
     override val ordering: ReactionOrdering = ReactionOrdering.Unordered,
     override val timeout: Duration = 60.seconds,
@@ -132,7 +132,7 @@ internal class RecordingUseCase(
     private val mapping: TriggerScope<Notice>.(OrderEvent, EventMetadata) -> Unit = { event, metadata ->
         if (event is OrderPlaced) trigger(Confirm(metadata.aggregateId.value))
     },
-) : Reactions<Notice>(name, Notice.serializer()) {
+) : EventPolicy<Notice>(name, Notice.serializer()) {
     val handled = mutableListOf<Pair<Notice, ReactionContext>>()
     val completions = mutableListOf<Pair<Notice, ReactionResult>>()
     val failures = mutableListOf<Pair<Int, Throwable>>()
@@ -140,7 +140,7 @@ internal class RecordingUseCase(
     /** The exception `handle` throws for a trigger and context, or `null` to succeed. */
     var failWith: (Notice, ReactionContext) -> Throwable? = { _, _ -> null }
 
-    /** The failure policy. */
+    /** The failure handling. */
     var decide: (Notice, Int, Throwable) -> FailureDecision = { _, attempt, _ -> Retry(backoff(attempt)) }
 
     /** Runs inside `handle`, before [failWith]. */

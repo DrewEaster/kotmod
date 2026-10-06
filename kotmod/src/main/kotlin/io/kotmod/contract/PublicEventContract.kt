@@ -24,7 +24,7 @@ import kotlin.time.Duration.Companion.milliseconds
  * Publishes a bounded context's internal domain events to other contexts as public events.
  *
  * While running, it polls the event log, deserializes each event with [serialization], maps it with
- * [internalToPublic] (returning `null` keeps an event private) and hands the public event to the use cases listening
+ * [internalToPublic] (returning `null` keeps an event private) and hands the public event to the event policies listening
  * to it (`on(contract)`) and to process managers subscribed with `subscribeTo`. Register those before [start].
  * Positions, leadership and redelivery work as for the reactor.
  *
@@ -77,13 +77,13 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
     private val log = LoggerFactory.getLogger(PublicEventContract::class.java)
     private val subscriptions = mutableListOf<Subscription<*, E>>()
     private var started = false
-    /** Throws if this contract has started, so a use case can check every contract before attaching to any. */
-    internal fun ensureCanListen() = check(!started) { "A use case must be registered before the contract it listens to starts" }
+    /** Throws if this contract has started, so an event policy can check every contract before attaching to any. */
+    internal fun ensureCanListen() = check(!started) { "An event policy must be registered before the contract it listens to starts" }
 
     private val listeners = mutableListOf<suspend (PublicEventEnvelope<E>) -> Unit>()
 
     /**
-     * Feeds each public event to [listener] (a use case listening to this contract with `on(contract)`), after the
+     * Feeds each public event to [listener] (an event policy listening to this contract with `on(contract)`), after the
      * subscriptions. Must be called before [start].
      */
     internal fun listen(listener: suspend (PublicEventEnvelope<E>) -> Unit) {

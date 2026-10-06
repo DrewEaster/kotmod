@@ -17,14 +17,14 @@ import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 
 /**
- * Runs a context's use cases and process managers on db-scheduler: each queue — one per use case, named after it, and
- * one per process manager channel, named `<process type>-<channel>` — is one db-scheduler task of the same name, and
- * each reaction an instance of it. The app owns the `Scheduler` and its `scheduled_tasks` table:
+ * Runs a context's event policies and process managers on db-scheduler: each queue — one per policy, named after it,
+ * and one per process manager channel, named `<process type>-<channel>` — is one db-scheduler task of the same name,
+ * and each reaction an instance of it. The app owns the `Scheduler` and its `scheduled_tasks` table:
  *
  * ```
  * val queues = DbSchedulerQueues(jdbc)
  * val reactor = EventReactor(jdbc, queues, isLeader = { election.isLeader() })
- * reactor.register(FraudChecks(fraud))                       // every use case
+ * reactor.register(FraudChecks(fraud))                       // every event policy
  * // build every process manager here too, passing it queues, before reading tasks
  * val scheduler = Scheduler.create(dataSource, *queues.tasks.toTypedArray()).enableImmediateExecution().build()
  * queues.bind(scheduler)
@@ -34,14 +34,14 @@ import kotlin.time.Instant
  *
  * Use one instance per context. Ordered reactions are checked against [tableName] through [jdbc]: an ordered reaction
  * runs only once no earlier reaction of its aggregate is pending in its queue, rechecking after [orderedRecheckDelay]
- * (doubling up to a minute). Every queue can run ordered reactions, so ones left queued by a use case that was ordered
+ * (doubling up to a minute). Every queue can run ordered reactions, so ones left queued by a policy that was ordered
  * when they were queued still run in order after it becomes unordered. A reaction delivered while nothing is
  * subscribed is pushed back [unsubscribedRetryDelay] without counting a retry. An ordered reaction that gives up with
  * [OnGiveUp.BlockAggregate] holds back its aggregate until [retryBlocked] or [skipBlocked] (see [blockedReactions]). A
- * use case's mapping that keeps failing stays parked until it succeeds or [skipParked] drops it (see [parkedMappings]).
+ * policy's mapping that keeps failing stays parked until it succeeds or [skipParked] drops it (see [parkedMappings]).
  *
- * The operator helpers take a `SchedulerClient` (usually the app's `Scheduler`) and a queue name: a use case's name,
- * or a process manager channel's `<process type>-<channel>`.
+ * The operator helpers take a `SchedulerClient` (usually the app's `Scheduler`) and a queue name: a policy's name, or
+ * a process manager channel's `<process type>-<channel>`.
  */
 class DbSchedulerQueues(
     private val jdbc: JdbcContext,
@@ -56,7 +56,7 @@ class DbSchedulerQueues(
     private var client: SchedulerClient? = null
 
     /**
-     * The tasks to register with the app's `Scheduler`: read it after registering every use case and building every
+     * The tasks to register with the app's `Scheduler`: read it after registering every event policy and building every
      * process manager (and their `subscribeTo` calls). No queue can be added afterwards.
      */
     val tasks: List<Task<*>>
@@ -77,13 +77,13 @@ class DbSchedulerQueues(
     ): ReactionChannel<T> {
         check(!tasksRead) {
             "Queue $name was asked for after DbSchedulerQueues.tasks was read, so its task would never be registered: read tasks " +
-                "after registering every use case and building every process manager"
+                "after registering every event policy and building every process manager"
         }
         require(name !in queues) {
-            "DbSchedulerQueues already has a queue named $name: use-case names and process manager channels must be unique"
+            "DbSchedulerQueues already has a queue named $name: event policy names and process manager channels must be unique"
         }
-        // Every queue gets jdbc, so every queue supports ordering: the reactor never refuses an ordered use case after
-        // its queue (and so its task) was created here, and ordered rows left by a use case that has since become
+        // Every queue gets jdbc, so every queue supports ordering: the reactor never refuses an ordered policy after
+        // its queue (and so its task) was created here, and ordered rows left by a policy that has since become
         // unordered still run (in order) instead of failing for want of a JdbcContext.
         val reactions =
             DbSchedulerEventReactions(
@@ -113,50 +113,50 @@ class DbSchedulerQueues(
     }
 
     /**
-     * The ordered reactions of queue [useCase] (a use case's name, or a process manager channel's) that gave up with
+     * The ordered reactions of queue [policy] (a policy's name, or a process manager channel's) that gave up with
      * [OnGiveUp.BlockAggregate] and hold back their aggregate.
      */
     fun blockedReactions(
         client: SchedulerClient,
-        useCase: String,
-    ): List<BlockedReaction> = queue(useCase).blockedReactions(client)
+        policy: String,
+    ): List<BlockedReaction> = queue(policy).blockedReactions(client)
 
-    /** Runs blocked reaction [id] of queue [useCase] (a use case's name, or a process manager channel's) again now, with its retry count reset. */
+    /** Runs blocked reaction [id] of queue [policy] (a policy's name, or a process manager channel's) again now, with its retry count reset. */
     fun retryBlocked(
         client: SchedulerClient,
-        useCase: String,
+        policy: String,
         id: EventReactionId,
-    ) = queue(useCase).retryBlocked(client, id)
+    ) = queue(policy).retryBlocked(client, id)
 
     /**
-     * Drops blocked reaction [id] of queue [useCase] (a use case's name, or a process manager channel's) without
+     * Drops blocked reaction [id] of queue [policy] (a policy's name, or a process manager channel's) without
      * running it again, so its aggregate's next reaction can run.
      */
     fun skipBlocked(
         client: SchedulerClient,
-        useCase: String,
+        policy: String,
         id: EventReactionId,
-    ) = queue(useCase).skipBlocked(client, id)
+    ) = queue(policy).skipBlocked(client, id)
 
     /**
-     * The events [useCase] couldn't map to triggers, parked in its queue as `<useCase>/<eventId>/mapping` and retried
+     * The events [policy] couldn't map to triggers, parked in its queue as `<policy>/<eventId>/mapping` and retried
      * until the mapping succeeds.
      */
     fun parkedMappings(
         client: SchedulerClient,
-        useCase: String,
-    ): List<ParkedMapping> = queue(useCase).parkedMappings(client, useCase)
+        policy: String,
+    ): List<ParkedMapping> = queue(policy).parkedMappings(client, policy)
 
     /**
-     * Drops [useCase]'s parked mapping of event [eventId] without retrying it, for an event that will never map: the
-     * event's work in this use case never runs, and with ordering its aggregate's next work can run. Fails if there
+     * Drops [policy]'s parked mapping of event [eventId] without retrying it, for an event that will never map: the
+     * event's work in this policy never runs, and with ordering its aggregate's next work can run. Fails if there
      * is no such parked mapping, or if it is running at that moment (call it again).
      */
     fun skipParked(
         client: SchedulerClient,
-        useCase: String,
+        policy: String,
         eventId: EventId,
-    ) = queue(useCase).skipParked(client, useCase, eventId)
+    ) = queue(policy).skipParked(client, policy, eventId)
 
     private fun queue(name: String): DbSchedulerEventReactions<*> = requireNotNull(queues[name]) { "DbSchedulerQueues has no queue named $name" }
 }
@@ -169,8 +169,8 @@ data class BlockedReaction(
 )
 
 /**
- * A use case's mapping of event [eventId] that failed and is parked in its queue as [reactionId], after [retryCount]
- * retries.
+ * An event policy's mapping of event [eventId] that failed and is parked in its queue as [reactionId], after
+ * [retryCount] retries.
  */
 data class ParkedMapping(
     val eventId: EventId,

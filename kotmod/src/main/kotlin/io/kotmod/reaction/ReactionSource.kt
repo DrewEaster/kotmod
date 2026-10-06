@@ -9,7 +9,7 @@ import io.kotmod.PublicDomainEvent
 import io.kotmod.PublicEventEnvelope
 import io.kotmod.contract.PublicEventContract
 
-/** Where a use case's events come from: one of this context's aggregate kinds, or another context's contract. */
+/** Where an event policy's events come from: one of this context's aggregate kinds, or another context's contract. */
 internal sealed class ReactionSource<T : Any> {
     /** The aggregate types whose events this source delivers; `null` means every type. */
     abstract val aggregateTypes: Set<AggregateType>?
@@ -25,7 +25,7 @@ internal sealed class ReactionSource<T : Any> {
         return mine.any { it in theirs }
     }
 
-    /** Reads [event] as this source delivers it and runs the use case's block for it; throws if either fails. */
+    /** Reads [event] as this source delivers it and runs the event policy's block for it; throws if either fails. */
     abstract fun map(event: PersistedEvent): List<ProducedTrigger<T>>
 }
 
@@ -55,11 +55,11 @@ internal class ContractSource<T : Any, P : PublicDomainEvent>(
 
     override fun map(event: PersistedEvent): List<ProducedTrigger<T>> = contract.toPublic(event)?.let(::mapPublic) ?: emptyList()
 
-    /** Throws if the contract has already started, so it can no longer feed a use case. */
+    /** Throws if the contract has already started, so it can no longer feed an event policy. */
     fun ensureCanFeed() = contract.ensureCanListen()
 
     /** Has the contract's reader map each of its public events with this source and queue the result on [runtime]. */
-    fun feed(runtime: UseCaseRuntime<T>) {
+    fun feed(runtime: PolicyRuntime<T>) {
         contract.listen { envelope -> runtime.mapAndPublish(envelope.metadata, this) { mapPublic(envelope) } }
     }
 

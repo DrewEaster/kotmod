@@ -304,7 +304,7 @@ class PostgresDomainPollingBackend private constructor(
         }
 
     /**
-     * Returns the event with [eventId], or `null` if there is none. A parked use-case mapping reads its event again with
+     * Returns the event with [eventId], or `null` if there is none. A parked event policy mapping reads its event again with
      * it. kotmod's own internal events are never returned, unless this is a process manager's own backend.
      */
     internal fun readEvent(eventId: EventId): PersistedEvent? =

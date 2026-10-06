@@ -1,7 +1,7 @@
 package io.kotmod.event.reaction
 
 /**
- * Provides the queues kotmod runs reactions on: one per use case (named after it) and one per process manager channel.
+ * Provides the queues kotmod runs reactions on: one per event policy (named after it) and one per process manager channel.
  * Names are stable across restarts. `kotmod-db-scheduler` provides `DbSchedulerQueues`; any queue that implements an
  * [EventReactionTriggerSink] and an [EventReactionTriggerSource] works.
  */
