@@ -6,6 +6,7 @@ import com.github.kagkarlsson.scheduler.Scheduler
 import com.github.kagkarlsson.scheduler.task.TaskInstanceId
 import io.kotmod.AggregateAlreadyExistsException
 import io.kotmod.AggregateId
+import io.kotmod.AggregateKind
 import io.kotmod.AggregateManager
 import io.kotmod.AggregateType
 import io.kotmod.CommandAlreadyRecordedException
@@ -146,10 +147,90 @@ val orderEventSerialization =
 
 // Guide: Use cases
 
+// Not shown in the README: a minimal customer aggregate kind for the SalesFeed example.
+
+@Serializable
+sealed interface CustomerCommand
+
+@Serializable
+data class RegisterCustomer(
+    val email: String,
+) : CustomerCommand
+
+@Serializable
+sealed interface CustomerEvent : DomainEvent
+
+@Serializable
+data class CustomerRegistered(
+    val email: String,
+) : CustomerEvent
+
+@Serializable
+sealed interface CustomerRejection
+
+@Serializable
+data object CustomerAlreadyRegistered : CustomerRejection
+
+object Customers : AggregateKind<CustomerCommand, CustomerEvent, CustomerRejection>(
+    type = AggregateType("Customer"),
+    commandSerializer = CustomerCommand.serializer(),
+    eventSerialization =
+        jsonDataSerializationContext<CustomerEvent> {
+            +CustomerRegistered.serializer().toEventSerializer()
+        },
+    rejectionSerializer = CustomerRejection.serializer(),
+)
+
+@Serializable
+sealed interface SalesFeedPost
+
+@Serializable
+data class NewCustomer(
+    val customerId: String,
+    val email: String,
+) : SalesFeedPost
+
+@Serializable
+data class NewOrder(
+    val orderId: String,
+    val item: String,
+) : SalesFeedPost
+
+class SalesFeed(
+    private val post: suspend (message: String) -> Unit,
+) : Reactions<SalesFeedPost>(
+        name = "sales-feed",
+        triggers = SalesFeedPost.serializer(),
+    ) {
+    init {
+        on(Customers) { event, metadata ->
+            when (event) {
+                is CustomerRegistered -> trigger(NewCustomer(metadata.aggregateId.value, event.email))
+            }
+        }
+        on(Orders) { event, metadata ->
+            if (event is OrderPlaced) trigger(NewOrder(metadata.aggregateId.value, event.item))
+        }
+    }
+
+    override suspend fun handle(
+        trigger: SalesFeedPost,
+        context: ReactionContext,
+    ) = when (trigger) {
+        is NewCustomer -> post("New customer: ${trigger.email}")
+        is NewOrder -> post("New order ${trigger.orderId}: ${trigger.item}")
+    }
+}
+
+@Serializable
+data class SendReviewReminder(
+    val orderId: String,
+)
+
 class ReviewReminders :
-    Reactions<OrderNotification>(
+    Reactions<SendReviewReminder>(
         name = "review-reminders",
-        triggers = OrderNotification.serializer(),
+        triggers = SendReviewReminder.serializer(),
     ) {
     init {
         on(Orders) { event, metadata ->
@@ -160,10 +241,10 @@ class ReviewReminders :
     }
 
     override suspend fun handle(
-        trigger: OrderNotification,
+        trigger: SendReviewReminder,
         context: ReactionContext,
     ) {
-        println("Asking for a review: $trigger")
+        println("Asking for a review of order ${trigger.orderId}")
     }
 }
 

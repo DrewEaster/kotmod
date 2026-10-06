@@ -187,24 +187,18 @@ class OrderRepository(
     }
 }
 
-@Serializable
-sealed interface OrderNotification
-
+// This use case does one kind of work. One that does several makes its trigger type a sealed interface, with one
+// class per kind of work (see "Use cases" in the guides).
 @Serializable
 data class SendOrderConfirmation(
     val orderId: String,
-) : OrderNotification
-
-@Serializable
-data class SendReviewReminder(
-    val orderId: String,
-) : OrderNotification
+)
 
 class OrderNotifications(
     private val confirm: (orderId: String) -> Unit,
-) : Reactions<OrderNotification>(
+) : Reactions<SendOrderConfirmation>(
         name = "order-notifications",
-        triggers = OrderNotification.serializer(),
+        triggers = SendOrderConfirmation.serializer(),
     ) {
     init {
         on(Orders) { event, metadata ->
@@ -216,21 +210,18 @@ class OrderNotifications(
     }
 
     override suspend fun handle(
-        trigger: OrderNotification,
+        trigger: SendOrderConfirmation,
         context: ReactionContext,
-    ) = when (trigger) {
-        is SendOrderConfirmation -> confirm(trigger.orderId)
-        is SendReviewReminder -> println("Asking for a review of order ${trigger.orderId}")
-    }
+    ) = confirm(trigger.orderId)
 
     override fun onFailure(
-        trigger: OrderNotification,
+        trigger: SendOrderConfirmation,
         attempt: Int,
         error: Throwable,
     ): FailureDecision = if (attempt < 5) Retry(backoff(attempt)) else GiveUp
 
     override suspend fun onCompletion(
-        trigger: OrderNotification,
+        trigger: SendOrderConfirmation,
         result: ReactionResult,
     ) {
         println("$trigger finished: $result")

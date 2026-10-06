@@ -336,24 +336,18 @@ reacts to, what work they trigger, and how that work is done. A **trigger** is s
 must be serializable:
 
 ```kotlin
-@Serializable
-sealed interface OrderNotification
-
+// This use case does one kind of work. One that does several makes its trigger type a sealed interface, with one
+// class per kind of work (see "Use cases" in the guides).
 @Serializable
 data class SendOrderConfirmation(
     val orderId: String,
-) : OrderNotification
-
-@Serializable
-data class SendReviewReminder(
-    val orderId: String,
-) : OrderNotification
+)
 
 class OrderNotifications(
     private val confirm: (orderId: String) -> Unit,
-) : Reactions<OrderNotification>(
+) : Reactions<SendOrderConfirmation>(
         name = "order-notifications",
-        triggers = OrderNotification.serializer(),
+        triggers = SendOrderConfirmation.serializer(),
     ) {
     init {
         on(Orders) { event, metadata ->
@@ -365,21 +359,18 @@ class OrderNotifications(
     }
 
     override suspend fun handle(
-        trigger: OrderNotification,
+        trigger: SendOrderConfirmation,
         context: ReactionContext,
-    ) = when (trigger) {
-        is SendOrderConfirmation -> confirm(trigger.orderId)
-        is SendReviewReminder -> println("Asking for a review of order ${trigger.orderId}")
-    }
+    ) = confirm(trigger.orderId)
 
     override fun onFailure(
-        trigger: OrderNotification,
+        trigger: SendOrderConfirmation,
         attempt: Int,
         error: Throwable,
     ): FailureDecision = if (attempt < 5) Retry(backoff(attempt)) else GiveUp
 
     override suspend fun onCompletion(
-        trigger: OrderNotification,
+        trigger: SendOrderConfirmation,
         result: ReactionResult,
     ) {
         println("$trigger finished: $result")
@@ -780,16 +771,77 @@ It owns the whole reaction, like `OrderNotifications` in [the quickstart](#4-rea
 Each use case has its own queue, so its ordering, timeout and failure policy are its own, and a slow or failing
 use case never holds up another. Delivery is at least once: make `handle` idempotent.
 
+#### Several sources and kinds of work
+
+A use case can listen to several aggregates, and do several kinds of work. Make its trigger type a sealed
+interface, with one class per kind of work, and call `on(...)` once per source. This one posts to a sales channel
+when a customer registers and when an order is placed (`Customers` is the customer aggregate's kind, defined like
+`Orders`):
+
+```kotlin
+@Serializable
+sealed interface SalesFeedPost
+
+@Serializable
+data class NewCustomer(
+    val customerId: String,
+    val email: String,
+) : SalesFeedPost
+
+@Serializable
+data class NewOrder(
+    val orderId: String,
+    val item: String,
+) : SalesFeedPost
+
+class SalesFeed(
+    private val post: suspend (message: String) -> Unit,
+) : Reactions<SalesFeedPost>(
+        name = "sales-feed",
+        triggers = SalesFeedPost.serializer(),
+    ) {
+    init {
+        on(Customers) { event, metadata ->
+            when (event) {
+                is CustomerRegistered -> trigger(NewCustomer(metadata.aggregateId.value, event.email))
+            }
+        }
+        on(Orders) { event, metadata ->
+            if (event is OrderPlaced) trigger(NewOrder(metadata.aggregateId.value, event.item))
+        }
+    }
+
+    override suspend fun handle(
+        trigger: SalesFeedPost,
+        context: ReactionContext,
+    ) = when (trigger) {
+        is NewCustomer -> post("New customer: ${trigger.email}")
+        is NewOrder -> post("New order ${trigger.orderId}: ${trigger.item}")
+    }
+}
+```
+
+- Each `on(...)` block gets its own aggregate's events, typed, so `when (event)` covers that aggregate's events
+  only.
+- `handle` gets every trigger, from either source, and `when (trigger)` covers each kind of work.
+- With [ordering](#ordered-use-cases), each aggregate instance's work runs in order: a customer's and an order's
+  work are ordered separately, and never wait for each other.
+
 #### Delayed triggers
 
 Give a trigger a `notBefore` and it doesn't run before that time. For example, ask for a review a week after an
 order ships:
 
 ```kotlin
+@Serializable
+data class SendReviewReminder(
+    val orderId: String,
+)
+
 class ReviewReminders :
-    Reactions<OrderNotification>(
+    Reactions<SendReviewReminder>(
         name = "review-reminders",
-        triggers = OrderNotification.serializer(),
+        triggers = SendReviewReminder.serializer(),
     ) {
     init {
         on(Orders) { event, metadata ->
@@ -800,10 +852,10 @@ class ReviewReminders :
     }
 
     override suspend fun handle(
-        trigger: OrderNotification,
+        trigger: SendReviewReminder,
         context: ReactionContext,
     ) {
-        println("Asking for a review: $trigger")
+        println("Asking for a review of order ${trigger.orderId}")
     }
 }
 ```
@@ -1836,14 +1888,14 @@ compiled; the [quickstart](#4-react-to-events) and the guides show compiled code
    val outbox = AggregateEventOutbox(backend, executor, eventToReactions, getPosition, savePosition, isLeader)
 
    // 0.3.0
-   class OrderNotifications : Reactions<OrderNotification>("order-notifications", OrderNotification.serializer()) {
+   class OrderNotifications : Reactions<SendOrderConfirmation>("order-notifications", SendOrderConfirmation.serializer()) {
        init {
            on(Orders) { event, metadata ->
                if (event is OrderPlaced) trigger(SendOrderConfirmation(metadata.aggregateId.value))
            }
        }
 
-       override suspend fun handle(trigger: OrderNotification, context: ReactionContext) { /* … */ }
+       override suspend fun handle(trigger: SendOrderConfirmation, context: ReactionContext) { /* … */ }
    }
 
    val reactor = EventReactor(jdbc, queues, isLeader = { election.isLeader() })
