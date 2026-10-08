@@ -9,14 +9,7 @@ import io.kotmod.outbox.DomainEventPoller
 import io.kotmod.DomainEventPollingBackend
 import io.kotmod.EventLogPosition
 import io.kotmod.PersistedEvent
-import io.kotmod.event.reaction.EventReaction
-import io.kotmod.event.reaction.EventReactionExecutor
-import io.kotmod.event.reaction.EventReactionTrigger
-import io.kotmod.event.reaction.ReactionOrdering
-import io.kotmod.event.reaction.stampFor
 import io.kotmod.process.ProcessEventSerialization
-import org.slf4j.Logger
-import org.slf4j.LoggerFactory
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 
@@ -24,9 +17,10 @@ import kotlin.time.Duration.Companion.milliseconds
  * Publishes a bounded context's internal domain events to other contexts as public events.
  *
  * While running, it polls the event log, deserializes each event with [serialization], maps it with
- * [internalToPublic] (returning `null` keeps an event private) and hands the public event to the event policies listening
- * to it (`on(contract)`) and to process managers subscribed with `subscribeTo`. Register those before [start].
- * Positions, leadership and redelivery work as for the reactor.
+ * [internalToPublic] (returning `null` keeps an event private) and hands the public event to its listeners, in the
+ * order they registered: event policies listening with `on(contract)` and process managers subscribed with
+ * `subscribeTo`. Each listener queues its own work in its own queue. Register them all before [start]. Positions,
+ * leadership and redelivery work as for the reactor.
  *
  * The event log holds every aggregate's events, process managers' facts included. kotmod's own internal events are
  * always skipped, but without [aggregateTypes] [serialization] must be able to read every other event type in the log.
@@ -48,67 +42,21 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
     pollInterval: Duration = 500.milliseconds,
     batchSize: Int = 100,
 ) {
-    private data class Subscription<T : EventReactionTrigger, E : PublicDomainEvent>(
-        val executor: EventReactionExecutor<T, *>,
-        val ordering: ReactionOrdering,
-        val block: (PublicEventEnvelope<E>) -> List<EventReaction<T>>,
-    ) {
-        /** Dispatches this subscription's reactions, numbering them from [firstOrdinal]; returns the next ordinal. */
-        suspend fun fanOut(
-            envelope: PublicEventEnvelope<E>,
-            position: EventLogPosition,
-            firstOrdinal: Int,
-            log: Logger,
-        ): Int {
-            val reactions = block(envelope)
-            reactions.forEachIndexed { index, reaction ->
-                log.debug(
-                    "Dispatching event reaction {} for DDD event {} [position={}]",
-                    reaction.id.value,
-                    envelope.metadata.eventId.value,
-                    position,
-                )
-                executor.dispatch(reaction.id, reaction.trigger, ordering.stampFor(envelope.metadata, firstOrdinal + index), reaction.notBefore)
-            }
-            return firstOrdinal + reactions.size
-        }
-    }
-
-    private val log = LoggerFactory.getLogger(PublicEventContract::class.java)
-    private val subscriptions = mutableListOf<Subscription<*, E>>()
     private var started = false
-    /** Throws if this contract has started, so an event policy can check every contract before attaching to any. */
-    internal fun ensureCanListen() = check(!started) { "An event policy must be registered before the contract it listens to starts" }
+
+    /** Throws if this contract has started, so a listener can check every contract before attaching to any. */
+    internal fun ensureCanListen() =
+        check(!started) { "An event policy or process manager must be registered before the contract it listens to starts" }
 
     private val listeners = mutableListOf<suspend (PublicEventEnvelope<E>) -> Unit>()
 
     /**
-     * Feeds each public event to [listener] (an event policy listening to this contract with `on(contract)`), after the
-     * subscriptions. Must be called before [start].
+     * Feeds each public event to [listener] (an event policy's `on(contract)` source, or a process manager's
+     * `subscribeTo`), after the listeners registered before it. Must be called before [start].
      */
     internal fun listen(listener: suspend (PublicEventEnvelope<E>) -> Unit) {
         ensureCanListen()
         listeners += listener
-    }
-
-    /**
-     * Registers a process manager's subscriber: [block] maps each public event to reactions dispatched to [executor].
-     * Reactions are stamped per [ordering]; ordered subscriptions need an executor whose sink supports
-     * ordering. Ordered subscriptions of this contract may share an executor and then share ordering for an
-     * aggregate, but that executor may not be fed ordered reactions by any other contract. Must be
-     * called before [start].
-     */
-    internal fun <T : EventReactionTrigger> subscribe(
-        executor: EventReactionExecutor<T, *>,
-        ordering: ReactionOrdering = ReactionOrdering.Unordered,
-        block: (PublicEventEnvelope<E>) -> List<EventReaction<T>>,
-    ) {
-        check(!started) { "subscribe() must be called before start()" }
-        require(ordering == ReactionOrdering.Unordered || executor.supportsOrdering) {
-            "An ordered subscription needs an executor whose sink supports ordering"
-        }
-        if (ordering != ReactionOrdering.Unordered) executor.claimOrderedSource(this)
-        subscriptions += Subscription(executor, ordering, block)
     }
 
     private val poller =
@@ -123,7 +71,7 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
             handleEvent = ::handleEvent,
         )
 
-    /** Starts polling in the background. No further subscribers can be added afterwards. */
+    /** Starts polling in the background. No further listeners can be added afterwards. */
     fun start() {
         started = true
         poller.start()
@@ -151,12 +99,6 @@ class PublicEventContract<I : DomainEvent, E : PublicDomainEvent>(
 
     private suspend fun handleEvent(envelope: PersistedEvent) {
         val publicEnvelope = toPublic(envelope) ?: return
-        // One ordinal counter across all subscriptions: ordered subscriptions sharing an executor share ordering
-        // for an aggregate, so anything dispatched later for this event must sort later.
-        var ordinal = 0
-        for (subscription in subscriptions) {
-            ordinal = subscription.fanOut(publicEnvelope, envelope.position, ordinal, log)
-        }
         // A listener's publish failure makes the poller read the whole event again; safe, as trigger ids are deterministic.
         for (listener in listeners) listener(publicEnvelope)
     }

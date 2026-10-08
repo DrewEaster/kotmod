@@ -11,15 +11,11 @@ import io.kotmod.PendingEvent
 import io.kotmod.PublicDomainEvent
 import io.kotmod.PublicEventEnvelope
 import io.kotmod.SerializedEvent
-import io.kotmod.event.reaction.EventReaction
-import io.kotmod.event.reaction.EventReactionId
-import io.kotmod.event.reaction.EventReactionTrigger
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.PostgresDomainPollingBackend
 import io.kotmod.postgres.PostgresOffsetManager
 import io.kotmod.postgres.StartFrom
 import io.kotmod.postgres.support.IntegrationTest
-import io.kotmod.postgres.support.recordingExecutor
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -27,7 +23,6 @@ import org.junit.jupiter.api.BeforeEach
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
@@ -80,12 +75,6 @@ class PublicEventContractIntegrationTest : IntegrationTest() {
         }
     }
 
-    private data class FakeTrigger(
-        val eventId: String,
-        val subscriberName: String,
-        override val timeout: Duration? = null,
-    ) : EventReactionTrigger
-
     private lateinit var backend: PostgresDomainPersistenceBackend<TestInternalEvent>
     private lateinit var offsets: PostgresOffsetManager
 
@@ -121,14 +110,13 @@ class PublicEventContractIntegrationTest : IntegrationTest() {
     }
 
     @Test
-    fun `contract fans out public events to two subscribers and filters internal-only events`() =
+    fun `contract hands public events to two listeners and filters internal-only events`() =
         runBlocking {
             seed("e-1", "o-1", TestInternalEvent.OrderOpened("o-1"))
             seed("e-2", "o-2", TestInternalEvent.OrderClosed("o-2"))
             seed("e-3", "o-3", TestInternalEvent.InternalNote("private")) // filtered
 
-            val capturedA = CopyOnWriteArrayList<Pair<EventReactionId, FakeTrigger>>()
-            val capturedB = CopyOnWriteArrayList<Pair<EventReactionId, FakeTrigger>>()
+            val heard = CopyOnWriteArrayList<Pair<String, PublicEventEnvelope<TestPublicEvent>>>()
 
             val contract =
                 PublicEventContract(
@@ -148,18 +136,8 @@ class PublicEventContractIntegrationTest : IntegrationTest() {
                     batchSize = 10,
                 )
 
-            fun reactionsFor(
-                subscriberName: String,
-                envelope: PublicEventEnvelope<TestPublicEvent>,
-            ) = listOf(
-                EventReaction(
-                    id = EventReactionId("$subscriberName-${envelope.metadata.eventId.value}"),
-                    trigger = FakeTrigger(eventId = envelope.metadata.eventId.value, subscriberName = subscriberName),
-                ),
-            )
-
-            contract.subscribe(recordingExecutor<FakeTrigger> { id, trigger -> capturedA += id to trigger }) { reactionsFor("A", it) }
-            contract.subscribe(recordingExecutor<FakeTrigger> { id, trigger -> capturedB += id to trigger }) { reactionsFor("B", it) }
+            contract.listen { heard += "A" to it }
+            contract.listen { heard += "B" to it }
 
             contract.start()
             try {
@@ -173,17 +151,12 @@ class PublicEventContractIntegrationTest : IntegrationTest() {
 
             assertEquals(
                 listOf(
-                    EventReactionId("A-e-1") to FakeTrigger("e-1", "A"),
-                    EventReactionId("A-e-2") to FakeTrigger("e-2", "A"),
+                    "A" to "e-1" to TestPublicEvent.OrderOpenedPublic("o-1"),
+                    "B" to "e-1" to TestPublicEvent.OrderOpenedPublic("o-1"),
+                    "A" to "e-2" to TestPublicEvent.OrderClosedPublic("o-2"),
+                    "B" to "e-2" to TestPublicEvent.OrderClosedPublic("o-2"),
                 ),
-                capturedA.toList(),
-            )
-            assertEquals(
-                listOf(
-                    EventReactionId("B-e-1") to FakeTrigger("e-1", "B"),
-                    EventReactionId("B-e-2") to FakeTrigger("e-2", "B"),
-                ),
-                capturedB.toList(),
+                heard.map { (listener, envelope) -> listener to envelope.metadata.eventId.value to envelope.event },
             )
         }
 

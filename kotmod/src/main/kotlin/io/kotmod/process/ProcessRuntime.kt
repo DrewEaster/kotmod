@@ -7,20 +7,20 @@ import io.kotmod.CommandId
 import io.kotmod.CommandResult
 import io.kotmod.CorrelationId
 import io.kotmod.event.reaction.BackoffStrategy
-import io.kotmod.event.reaction.EventReactionExecutionResult
-import io.kotmod.event.reaction.EventReactionExecutor
-import io.kotmod.event.reaction.EventReactionTrigger
-import io.kotmod.event.reaction.EventReactionTriggerSerializer
-import io.kotmod.event.reaction.EventReactionTriggerSink
-import io.kotmod.event.reaction.EventReactionTriggerSource
-import io.kotmod.event.reaction.ReactionChannel
-import io.kotmod.event.reaction.RetrySignal
+import io.kotmod.event.reaction.ItemResult
+import io.kotmod.event.reaction.LEASE_MARGIN
+import io.kotmod.event.reaction.ReactionQueue
+import io.kotmod.event.reaction.ReactionRows
+import io.kotmod.event.reaction.rethrowIfCancelled
+import io.kotmod.scheduling.TaskScheduler
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.Transient
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 
 /** Delivers [input] (JSON) to process [processId], recognised by [inputId] if delivered again. */
@@ -29,8 +29,7 @@ internal data class InputTrigger(
     val processId: String,
     val input: String,
     val inputId: String,
-    @Transient override val timeout: Duration? = null,
-) : EventReactionTrigger
+)
 
 /** Runs [command] (JSON) against aggregate [targetType]/[targetId] with command id [commandId], for process [processId]. */
 @Serializable
@@ -40,16 +39,7 @@ internal data class CommandTrigger(
     val targetId: String,
     val command: String,
     val commandId: String,
-    @Transient override val timeout: Duration? = null,
-) : EventReactionTrigger
-
-internal class JsonTriggerSerializer<T : EventReactionTrigger>(
-    private val serializer: KSerializer<T>,
-) : EventReactionTriggerSerializer<T> {
-    override suspend fun serialize(trigger: T): String = Json.encodeToString(serializer, trigger)
-
-    override suspend fun deserialize(serializedTrigger: String): T = Json.decodeFromString(serializer, serializedTrigger)
-}
+)
 
 /** An aggregate a process manager may send commands to, with how its rejections come back as inputs. Build it with [target]. */
 class ProcessTarget<out I : Any> internal constructor(
@@ -76,31 +66,38 @@ fun <C : Any, R : Any, I : Any> target(
 
 private val log = LoggerFactory.getLogger("io.kotmod.process.ProcessManager")
 
+/** How long one process manager input or command may run before it is retried. */
+internal val PROCESS_TIMEOUT: Duration = 60.seconds
+
 /**
- * An executor for one process manager channel: [run] does the work; any exception, and any timeout (60 seconds unless
- * the trigger sets one), is retried with capped backoff and never given up, so an input or command is never silently
- * dropped.
+ * One process manager queue, [name], on the [scheduler]'s queue of that name. An ordered item is leased for
+ * [PROCESS_TIMEOUT] plus [LEASE_MARGIN].
  */
-internal fun <T : EventReactionTrigger> processExecutor(
-    channel: ReactionChannel<T>,
+internal fun <T : Any> processQueue(
+    name: String,
+    serializer: KSerializer<T>,
+    scheduler: TaskScheduler,
+    rows: ReactionRows,
     clock: () -> Instant,
-    run: suspend (T) -> Unit,
-): EventReactionExecutor<T, Unit> {
+): ReactionQueue<T> = ReactionQueue(name, serializer, scheduler.queue(name), rows, PROCESS_TIMEOUT + LEASE_MARGIN, clock)
+
+/**
+ * Starts running [run] for each item; any failure, and any run longer than [PROCESS_TIMEOUT], is retried with capped
+ * backoff and never given up, so an input or command is never silently dropped.
+ */
+internal fun <T : Any> ReactionQueue<T>.startProcess(run: suspend (T) -> Unit) {
     val backoff = BackoffStrategy()
-    return EventReactionExecutor(
-        sink = channel.sink,
-        source = channel.source,
-        createExecutionContext = { _, _ -> },
-        execute = { _, _, trigger, _, _ ->
-            run(trigger)
-            EventReactionExecutionResult.EventReactionExecutionCompleted
-        },
-        failureRetryHandler = { id, _, _, retryCount, _, ex ->
-            log.error("Process manager reaction ${id.value} failed and will be retried [ totalRetries=$retryCount ]", ex)
-            RetrySignal.Retry(backoff.calculateBackoff(retryCount))
-        },
-        timeoutRetryHandler = { _, _, _, retryCount, _ -> RetrySignal.Retry(backoff.calculateBackoff(retryCount)) },
-        onCompletion = { _, _, _, _, _, _ -> },
-        clock = clock,
-    )
+    start { delivery ->
+        try {
+            withTimeout(PROCESS_TIMEOUT) { run(delivery.item) }
+            ItemResult.Completed
+        } catch (e: TimeoutCancellationException) {
+            log.error("Process manager reaction {} timed out and will be retried [attempt={}]", delivery.id.value, delivery.attempt)
+            ItemResult.Retry(backoff.calculateBackoff(delivery.attempt))
+        } catch (e: Throwable) {
+            rethrowIfCancelled(e)
+            log.error("Process manager reaction {} failed and will be retried [attempt={}]", delivery.id.value, delivery.attempt, e)
+            ItemResult.Retry(backoff.calculateBackoff(delivery.attempt))
+        }
+    }
 }

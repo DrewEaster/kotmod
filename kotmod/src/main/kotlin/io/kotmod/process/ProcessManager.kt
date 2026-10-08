@@ -9,26 +9,33 @@ import io.kotmod.DomainEvent
 import io.kotmod.DomainEventPollingBackend
 import io.kotmod.DomainPersistenceBackend
 import io.kotmod.EventLogPosition
+import io.kotmod.EventMetadata
 import io.kotmod.PersistedEvent
 import io.kotmod.PublicDomainEvent
 import io.kotmod.PublicEventEnvelope
 import io.kotmod.Repository
 import io.kotmod.contract.PublicEventContract
-import io.kotmod.event.reaction.EventReaction
-import io.kotmod.event.reaction.EventReactionExecutor
 import io.kotmod.event.reaction.EventReactionId
+import io.kotmod.event.reaction.OrderedItem
+import io.kotmod.event.reaction.Produced
 import io.kotmod.event.reaction.ReactionOrdering
-import io.kotmod.event.reaction.ReactionQueues
-import io.kotmod.event.reaction.stampFor
+import io.kotmod.event.reaction.ReactionQueue
+import io.kotmod.event.reaction.ReactionRows
+import io.kotmod.event.reaction.lineKey
+import io.kotmod.event.reaction.rethrowIfCancelled
 import io.kotmod.jdbc.JdbcContext
 import io.kotmod.outbox.DomainEventPoller
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.PostgresDomainPollingBackend
+import io.kotmod.postgres.PostgresReactionRows
+import io.kotmod.scheduling.TaskScheduler
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.Json
+import org.slf4j.LoggerFactory
 import kotlin.time.Clock
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Instant
 
 /**
@@ -45,14 +52,19 @@ import kotlin.time.Instant
  *   input, via the target's mapping.
  * - Scheduled inputs (timeouts) are delivered at their time.
  *
- * It reads the event log with its own poller (only while [isLeader]), and runs its work on channels from [queues]:
+ * It reads the event log with its own poller (only while [isLeader]), and runs its work on queues from [scheduler]:
  * `<type>-inputs`, `<type>-internal` (scheduled inputs and rejection feedback), `<type>-commands`, and
- * `<type>-contract-<name>` per [subscribeTo]. Failures are retried with capped backoff and never given up. Start it
- * before the queue's scheduler, and stop it after.
+ * `<type>-contract-<name>` per [subscribeTo]. Each input or command may run for 60 seconds; failures and timeouts are
+ * retried with capped backoff and never given up. Ordered inputs wait in their source aggregate's line in kotmod's
+ * `ddd_reaction_row` table (one line per queue, so inputs from its own reader and from each contract are ordered
+ * separately). On the leader, on its first read and then about every 10 minutes, a repair sweep schedules again any
+ * line front that has sat idle for 30 minutes, in case the scheduler lost its task. Start it before the scheduler, and
+ * stop it after.
  *
  * @param type the process manager's aggregate type; its instances and events are recorded under it.
  * @param repository stores each instance's state, in the same transaction as its events.
- * @param inputOrdering whether inputs from one source aggregate are delivered in that aggregate's order.
+ * @param inputOrdering whether inputs from one source aggregate are delivered in that aggregate's order. Inputs are
+ *   retried until they succeed, so `onGiveUp` never applies.
  */
 class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> internal constructor(
     private val type: AggregateType,
@@ -64,13 +76,16 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
     eventSerialization: DataSerializationContext<E>,
     private val translate: (PersistedEvent) -> Pair<AggregateId, I>?,
     targets: List<ProcessTarget<I>>,
-    private val queues: ReactionQueues,
-    private val inputOrdering: ReactionOrdering = ReactionOrdering.Unordered,
+    private val scheduler: TaskScheduler,
+    private val rows: ReactionRows,
+    inputOrdering: ReactionOrdering = ReactionOrdering.Unordered,
     getPosition: () -> EventLogPosition,
     savePosition: (EventLogPosition) -> Unit,
     isLeader: () -> Boolean,
     pollInterval: Duration = 500.milliseconds,
     batchSize: Int = 100,
+    private val sweepEvery: Duration = 10.minutes,
+    private val sweepIdle: Duration = 30.minutes,
     private val clock: () -> Instant = { Clock.System.now() },
 ) {
     constructor(
@@ -82,7 +97,7 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
         eventSerialization: DataSerializationContext<E>,
         translate: (PersistedEvent) -> Pair<AggregateId, I>?,
         targets: List<ProcessTarget<I>>,
-        queues: ReactionQueues,
+        scheduler: TaskScheduler,
         inputOrdering: ReactionOrdering = ReactionOrdering.Unordered,
         getPosition: () -> EventLogPosition,
         savePosition: (EventLogPosition) -> Unit,
@@ -100,14 +115,15 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
         eventSerialization,
         translate,
         targets,
-        queues,
+        scheduler,
+        PostgresReactionRows(jdbc, clock),
         inputOrdering,
         getPosition,
         savePosition,
         isLeader,
         pollInterval,
         batchSize,
-        clock,
+        clock = clock,
     )
 
     private val targetsByType: Map<AggregateType, ProcessTarget<I>> =
@@ -117,25 +133,19 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
 
     private val streamSerialization = ProcessEventSerialization(eventSerialization)
     private val instances = ProcessInstances(type, repository, persistence, streamSerialization, initial, inputSerializer, targetsByType.keys)
-    private val inputTriggers = JsonTriggerSerializer(InputTrigger.serializer())
-    private val ordered = inputOrdering != ReactionOrdering.Unordered
+    private val ordered = inputOrdering is ReactionOrdering.PerAggregate
 
-    private val inputs = processExecutor(queues.channel("${type.value}-inputs", inputTriggers, ordered), clock, ::deliverInput)
-    private val internal = processExecutor(queues.channel("${type.value}-internal", inputTriggers, ordered = false), clock, ::deliverInput)
-    private val commands =
-        processExecutor(
-            queues.channel("${type.value}-commands", JsonTriggerSerializer(CommandTrigger.serializer()), ordered = false),
-            clock,
-            ::runCommand,
-        )
-    private val contractExecutors = mutableListOf<EventReactionExecutor<InputTrigger, Unit>>()
+    private val inputs = processQueue("${type.value}-inputs", InputTrigger.serializer(), scheduler, rows, clock)
+    private val internal = processQueue("${type.value}-internal", InputTrigger.serializer(), scheduler, rows, clock)
+    private val commands = processQueue("${type.value}-commands", CommandTrigger.serializer(), scheduler, rows, clock)
+    private val contractQueues = mutableListOf<ReactionQueue<InputTrigger>>()
     private val subscriptionNames = mutableSetOf<String>()
     private var started = false
 
-    init {
-        require(!ordered || inputs.supportsOrdering) { "Ordered process inputs need a queue that supports ordering" }
-        if (ordered) inputs.claimOrderedSource(this)
-    }
+    /** When the last repair sweep started; touched only by the poller's loop. */
+    private var lastSweep: Instant? = null
+
+    private val log = LoggerFactory.getLogger("ProcessManager(${type.value})")
 
     private val poller =
         DomainEventPoller(
@@ -147,12 +157,14 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
             batchSize = batchSize,
             loggerName = "ProcessManager(${type.value})",
             handleEvent = ::route,
+            afterTick = ::sweepIfDue,
         )
 
     /**
      * Delivers another context's public events to this process manager: [translate] turns each one into the process id
-     * and input it is for, or `null` to ignore it. [name] names the channel (`<type>-contract-<name>`), must be unique within this process manager
-     * and must stay the same across restarts. Must be called before [start].
+     * and input it is for, or `null` to ignore it. [name] names the queue (`<type>-contract-<name>`), must be unique within
+     * this process manager and must stay the same across restarts. Must be called before [start] and before [contract]
+     * starts.
      */
     fun <P : PublicDomainEvent> subscribeTo(
         name: String,
@@ -161,32 +173,76 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
     ) {
         check(!started) { "subscribeTo() must be called before start()" }
         require(name !in subscriptionNames) { "This process manager already subscribes to a contract named $name" }
-        val executor = processExecutor(queues.channel("${type.value}-contract-$name", inputTriggers, ordered), clock, ::deliverInput)
-        contract.subscribe(executor, inputOrdering) { envelope ->
-            val (processId, input) = translate(envelope) ?: return@subscribe emptyList()
+        // Check the contract first, so a refused subscription creates no queue.
+        contract.ensureCanListen()
+        val queue = processQueue("${type.value}-contract-$name", InputTrigger.serializer(), scheduler, rows, clock)
+        contract.listen { envelope ->
+            val (processId, input) = translate(envelope) ?: return@listen
             val inputId = "in-${envelope.metadata.eventId.value}"
-            listOf(EventReaction(EventReactionId(inputId), InputTrigger(processId.value, encode(input), inputId)))
+            queue.queueInput(envelope.metadata, InputTrigger(processId.value, encode(input), inputId))
         }
         subscriptionNames += name
-        contractExecutors += executor
+        contractQueues += queue
     }
 
-    /** Starts its channels and the poller. Does nothing if already started. */
+    /** Starts handling its queues, then the poller. Does nothing if already started. */
     fun start() {
         if (started) return
-        startExecutorsForTest()
+        startQueuesForTest()
         poller.start()
     }
 
-    /** Stops the poller, then its channels. */
+    /** Stops the poller, then stops handling its queues. */
     suspend fun stop() {
         poller.stop()
-        (listOf(inputs, internal, commands) + contractExecutors).forEach { it.stop() }
+        allQueues().forEach { it.stop() }
     }
 
-    internal fun startExecutorsForTest() {
+    internal fun startQueuesForTest() {
         started = true
-        (listOf(inputs, internal, commands) + contractExecutors).forEach { it.start() }
+        inputs.startProcess(::deliverInput)
+        internal.startProcess(::deliverInput)
+        commands.startProcess(::runCommand)
+        contractQueues.forEach { it.startProcess(::deliverInput) }
+    }
+
+    /**
+     * Schedules again every line front of its queues idle for [idleFor] (a task the scheduler lost). A queue whose
+     * sweep fails is logged and doesn't stop the others.
+     */
+    internal suspend fun sweep(idleFor: Duration) {
+        allQueues().forEach { queue ->
+            try {
+                queue.sweep(idleFor)
+            } catch (e: Exception) {
+                rethrowIfCancelled(e)
+                log.warn("Repair sweep of queue {} failed; trying again next time", queue.name, e)
+            }
+        }
+    }
+
+    /** Runs the repair sweep on the first tick, then at most every [sweepEvery]. */
+    private suspend fun sweepIfDue() {
+        val now = clock()
+        val last = lastSweep
+        if (last != null && now - last < sweepEvery) return
+        lastSweep = now
+        sweep(sweepIdle)
+    }
+
+    private fun allQueues(): List<ReactionQueue<*>> = listOf(inputs, internal, commands) + contractQueues
+
+    /** Queues [trigger], caused by the event described by [metadata]: in that event's aggregate's line if ordered. */
+    private suspend fun ReactionQueue<InputTrigger>.queueInput(
+        metadata: EventMetadata,
+        trigger: InputTrigger,
+    ) {
+        val id = EventReactionId(trigger.inputId)
+        if (ordered) {
+            publishOrdered(listOf(OrderedItem(id, lineKey(metadata), metadata.sequence, 0, trigger)))
+        } else {
+            publish(Produced(id, trigger))
+        }
     }
 
     internal suspend fun tickForTest() = poller.tickForTest()
@@ -200,15 +256,17 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
             when (event.serialized.type) {
                 ProcessEventSerialization.COMMAND_REQUESTED -> {
                     val requested = streamSerialization.deserialize(event.serialized) as CommandRequested
-                    commands.dispatch(
-                        EventReactionId("cmd-$eventId"),
-                        CommandTrigger(processId, requested.targetType, requested.targetId, requested.command, "${type.value}-$eventId"),
+                    commands.publish(
+                        Produced(
+                            EventReactionId("cmd-$eventId"),
+                            CommandTrigger(processId, requested.targetType, requested.targetId, requested.command, "${type.value}-$eventId"),
+                        ),
                     )
                 }
                 ProcessEventSerialization.INPUT_SCHEDULED -> {
                     val scheduled = streamSerialization.deserialize(event.serialized) as InputScheduled
                     val inputId = "sched-$eventId"
-                    internal.dispatch(EventReactionId(inputId), InputTrigger(processId, scheduled.input, inputId), notBefore = Instant.parse(scheduled.at))
+                    internal.publish(Produced(EventReactionId(inputId), InputTrigger(processId, scheduled.input, inputId), Instant.parse(scheduled.at)))
                 }
                 else -> Unit // the process's own facts are never fed back to it
             }
@@ -218,7 +276,7 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
         if (ProcessEventSerialization.isEnvelope(event.serialized.type)) return
         val (processId, input) = translate(event) ?: return
         val inputId = "in-$eventId"
-        inputs.dispatch(EventReactionId(inputId), InputTrigger(processId.value, encode(input), inputId), inputOrdering.stampFor(event.metadata, 0))
+        inputs.queueInput(event.metadata, InputTrigger(processId.value, encode(input), inputId))
     }
 
     private suspend fun deliverInput(trigger: InputTrigger) {
@@ -238,6 +296,6 @@ class ProcessManager<S : ProcessState<S, I, E>, I : Any, E : DomainEvent> intern
                 CorrelationId("${type.value}/${trigger.processId}"),
             ) ?: return
         val inputId = "rejected-${trigger.commandId}"
-        internal.dispatch(EventReactionId(inputId), InputTrigger(trigger.processId, encode(feedback), inputId))
+        internal.publish(Produced(EventReactionId(inputId), InputTrigger(trigger.processId, encode(feedback), inputId)))
     }
 }

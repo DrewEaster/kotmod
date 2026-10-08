@@ -9,19 +9,9 @@ import io.kotmod.SerializedEvent
 import io.kotmod.DomainEventPollingBackend
 import io.kotmod.PersistedEvent
 import io.kotmod.SequenceCheck
-import io.kotmod.event.reaction.DispatchOrdering
-import io.kotmod.event.reaction.EventReaction
-import io.kotmod.event.reaction.EventReactionExecutor
-import io.kotmod.event.reaction.EventReactionId
-import io.kotmod.event.reaction.EventReactionTrigger
-import io.kotmod.event.reaction.OnGiveUp
-import io.kotmod.event.reaction.ReactionOrdering
+import io.kotmod.PublicEventEnvelope
 import io.kotmod.support.RecordingOffsets
 import io.kotmod.support.persistedEvent
-import io.mockk.coEvery
-import io.mockk.coVerify
-import io.mockk.coVerifyOrder
-import io.mockk.coVerifySequence
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
@@ -29,7 +19,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
-import kotlin.time.Duration
+import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
 
 class PublicEventContractTest {
@@ -59,11 +49,6 @@ class PublicEventContractTest {
         ) : TestPublicEvent
     }
 
-    private data class FakeTrigger(
-        val name: String,
-        override val timeout: Duration? = null,
-    ) : EventReactionTrigger
-
     /** Serializer whose deserialize() is counted so fan-out can assert "once per event". */
     private class CountingSerialization : DataSerializationContext<TestInternalEvent> {
         var deserializeCalls: Int = 0
@@ -86,8 +71,9 @@ class PublicEventContractTest {
     }
 
     private val backend: DomainEventPollingBackend = mockk()
-    private val executorA: EventReactionExecutor<FakeTrigger, Any> = mockk(relaxed = true)
-    private val executorB: EventReactionExecutor<FakeTrigger, Any> = mockk(relaxed = true)
+
+    /** What the listeners saw, in order: each listener's name and the event id. */
+    private val heard = mutableListOf<Pair<String, String>>()
     private val offsets = RecordingOffsets(initial = EventLogPosition(1, 9))
 
     private fun givenEvents(vararg events: PersistedEvent) {
@@ -118,21 +104,30 @@ class PublicEventContractTest {
         batchSize = 100,
     )
 
+    /** Registers a listener named [name] that records each envelope it hears, then runs [then]. */
+    private fun PublicEventContract<TestInternalEvent, TestPublicEvent>.recording(
+        name: String,
+        then: (PublicEventEnvelope<TestPublicEvent>) -> Unit = {},
+    ) = listen { envelope ->
+        heard += name to envelope.metadata.eventId.value
+        then(envelope)
+    }
+
     // ---- Tests ----------------------------------------------------------
 
     @Test
     fun `tick is a no-op when isLeader returns false`() {
         val contract = newContract(isLeader = { false })
-        contract.subscribe(executorA) { error("should not be invoked") }
+        contract.recording("A")
 
         kotlinx.coroutines.runBlocking { contract.tickForTest() }
 
         verify(exactly = 0) { backend.readEventsAfter(any(), any()) }
-        coVerify(exactly = 0) { executorA.dispatch(any(), any(), any()) }
+        assertTrue(heard.isEmpty())
     }
 
     @Test
-    fun `single subscriber receives typed public event and its reactions are dispatched`() {
+    fun `a listener receives the typed public event in its envelope`() {
         givenEvents(
             persistedEvent(
                 globalOffset = 10,
@@ -143,77 +138,33 @@ class PublicEventContractTest {
         )
 
         val contract = newContract()
-        val seen = mutableListOf<TestPublicEvent>()
-        contract.subscribe(executorA) { envelope ->
-            seen += envelope.event
-            listOf(
-                EventReaction(EventReactionId("reaction-${envelope.metadata.eventId.value}-a"), FakeTrigger("a")),
-                EventReaction(EventReactionId("reaction-${envelope.metadata.eventId.value}-b"), FakeTrigger("b")),
-            )
-        }
+        val seen = mutableListOf<PublicEventEnvelope<TestPublicEvent>>()
+        contract.listen { seen += it }
         kotlinx.coroutines.runBlocking { contract.tickForTest() }
 
-        assertEquals<List<TestPublicEvent>>(listOf(TestPublicEvent.OpenedPublic("doc-1")), seen)
-        coVerifySequence {
-            executorA.dispatch(EventReactionId("reaction-e-10-a"), FakeTrigger("a"), null)
-            executorA.dispatch(EventReactionId("reaction-e-10-b"), FakeTrigger("b"), null)
-        }
+        assertEquals(listOf<TestPublicEvent>(TestPublicEvent.OpenedPublic("doc-1")), seen.map { it.event })
+        assertEquals("e-10", seen.single().metadata.eventId.value)
         assertEquals(listOf(10L), offsets.saved.map { it.globalOffset })
     }
 
     @Test
-    fun `multi-subscriber fan-out invokes each subscriber once per event`() {
-        givenEvents(
-            persistedEvent(
-                globalOffset = 10,
-                eventId = "e-10",
-                eventType = "Opened",
-                eventPayload = "Opened(id=doc-1)",
-            ),
-        )
-
-        val contract = newContract()
-        contract.subscribe(executorA) {
-            listOf(
-                EventReaction(EventReactionId("A-${it.metadata.eventId.value}-1"), FakeTrigger("A1")),
-                EventReaction(EventReactionId("A-${it.metadata.eventId.value}-2"), FakeTrigger("A2")),
-            )
-        }
-        contract.subscribe(executorB) {
-            listOf(
-                EventReaction(EventReactionId("B-${it.metadata.eventId.value}-1"), FakeTrigger("B1")),
-                EventReaction(EventReactionId("B-${it.metadata.eventId.value}-2"), FakeTrigger("B2")),
-            )
-        }
-        kotlinx.coroutines.runBlocking { contract.tickForTest() }
-
-        coVerifySequence {
-            executorA.dispatch(EventReactionId("A-e-10-1"), FakeTrigger("A1"), null)
-            executorA.dispatch(EventReactionId("A-e-10-2"), FakeTrigger("A2"), null)
-        }
-        coVerifySequence {
-            executorB.dispatch(EventReactionId("B-e-10-1"), FakeTrigger("B1"), null)
-            executorB.dispatch(EventReactionId("B-e-10-2"), FakeTrigger("B2"), null)
-        }
-        assertEquals(listOf(10L), offsets.saved.map { it.globalOffset })
-    }
-
-    @Test
-    fun `subscriber block returning an empty list is valid and cursor advances`() {
+    fun `every listener hears each event once, in registration order`() {
         givenEvents(
             persistedEvent(globalOffset = 10, eventId = "e-10", eventType = "Opened", eventPayload = "Opened(id=doc-1)"),
+            persistedEvent(globalOffset = 11, eventId = "e-11", eventType = "Closed", eventPayload = "Closed(id=doc-1)"),
         )
 
         val contract = newContract()
-        contract.subscribe(executorA) { emptyList() }
+        contract.recording("A")
+        contract.recording("B")
         kotlinx.coroutines.runBlocking { contract.tickForTest() }
 
-        coVerify(exactly = 0) { executorA.dispatch(any(), any(), any()) }
-        assertEquals(listOf(10L), offsets.saved.map { it.globalOffset })
+        assertEquals(listOf("A" to "e-10", "B" to "e-10", "A" to "e-11", "B" to "e-11"), heard)
+        assertEquals(listOf(10L, 11L), offsets.saved.map { it.globalOffset })
     }
 
     @Test
-    fun `internalToPublic returning null filters the event — no dispatch, cursor advances`() {
+    fun `internalToPublic returning null filters the event — no listener hears it, cursor advances`() {
         givenEvents(
             persistedEvent(
                 globalOffset = 10,
@@ -224,10 +175,10 @@ class PublicEventContractTest {
         )
 
         val contract = newContract()
-        contract.subscribe(executorA) { error("should not be invoked — event filtered out") }
+        contract.recording("A")
         kotlinx.coroutines.runBlocking { contract.tickForTest() }
 
-        coVerify(exactly = 0) { executorA.dispatch(any(), any(), any()) }
+        assertTrue(heard.isEmpty())
         assertEquals(listOf(10L), offsets.saved.map { it.globalOffset })
     }
 
@@ -240,11 +191,11 @@ class PublicEventContractTest {
 
         val counting = CountingSerialization()
         val contract = newContract(serialization = counting)
-        contract.subscribe(executorA) { error("should not be invoked — envelope events are skipped") }
+        contract.recording("A")
         kotlinx.coroutines.runBlocking { contract.tickForTest() }
 
         assertEquals(0, counting.deserializeCalls)
-        coVerify(exactly = 0) { executorA.dispatch(any(), any(), any()) }
+        assertTrue(heard.isEmpty())
         assertEquals(listOf(10L, 11L), offsets.saved.map { it.globalOffset })
     }
 
@@ -258,10 +209,7 @@ class PublicEventContractTest {
         val counting = CountingSerialization()
         val contract = newContract(serialization = counting, aggregateTypes = setOf(AggregateType("Document")))
         val seen = mutableListOf<TestPublicEvent>()
-        contract.subscribe(executorA) { envelope ->
-            seen += envelope.event
-            emptyList()
-        }
+        contract.listen { seen += it.event }
         kotlinx.coroutines.runBlocking { contract.tickForTest() }
 
         assertEquals(1, counting.deserializeCalls)
@@ -278,101 +226,76 @@ class PublicEventContractTest {
 
         val contract = newContract()
         val seen = mutableListOf<TestPublicEvent>()
-        contract.subscribe(executorA) { envelope ->
-            seen += envelope.event
-            emptyList()
-        }
+        contract.listen { seen += it.event }
         kotlinx.coroutines.runBlocking { contract.tickForTest() }
 
         assertEquals(listOf<TestPublicEvent>(TestPublicEvent.OpenedPublic("s-1"), TestPublicEvent.OpenedPublic("doc-1")), seen)
     }
 
     @Test
-    fun `subscriber block that throws halts the batch — cursor does not advance`() {
+    fun `a listener that throws halts the batch — cursor does not advance`() {
         givenEvents(
             persistedEvent(globalOffset = 10, eventId = "e-10", eventType = "Opened", eventPayload = "Opened(id=doc-1)"),
             persistedEvent(globalOffset = 11, eventId = "e-11", eventType = "Opened", eventPayload = "Opened(id=doc-2)"),
         )
 
         val contract = newContract()
-        contract.subscribe(executorA) { error("simulated mapping failure") }
+        contract.recording("A") { error("simulated mapping failure") }
         val caught = runCatching { kotlinx.coroutines.runBlocking { contract.tickForTest() } }
         assertFalse(caught.isSuccess)
 
-        coVerify(exactly = 0) { executorA.dispatch(any(), any(), any()) }
+        assertEquals(listOf("A" to "e-10"), heard)
         assertEquals(emptyList(), offsets.saved.map { it.globalOffset })
     }
 
     @Test
-    fun `dispatch failure on the second subscriber for one event halts before cursor advance`() {
+    fun `a failure in the second listener re-reads the whole event, so the first hears it again`() {
         givenEvents(
             persistedEvent(globalOffset = 10, eventId = "e-10", eventType = "Opened", eventPayload = "Opened(id=doc-1)"),
         )
 
-        coEvery { executorA.dispatch(any(), any(), any()) } returns Unit
-        coEvery { executorB.dispatch(any(), any(), any()) } throws RuntimeException("sink offline")
-
+        var failures = 1
         val contract = newContract()
-        contract.subscribe(executorA) { listOf(EventReaction(EventReactionId("A"), FakeTrigger("A"))) }
-        contract.subscribe(executorB) { listOf(EventReaction(EventReactionId("B"), FakeTrigger("B"))) }
+        contract.recording("A")
+        contract.recording("B") {
+            if (failures > 0) {
+                failures--
+                throw RuntimeException("queue offline")
+            }
+        }
         val caught = runCatching { kotlinx.coroutines.runBlocking { contract.tickForTest() } }
         assertFalse(caught.isSuccess)
-
-        coVerify(exactly = 1) { executorA.dispatch(EventReactionId("A"), FakeTrigger("A"), null) }
-        coVerify(exactly = 1) { executorB.dispatch(EventReactionId("B"), FakeTrigger("B"), null) }
         assertEquals(emptyList(), offsets.saved.map { it.globalOffset })
+
+        kotlinx.coroutines.runBlocking { contract.tickForTest() }
+
+        assertEquals(listOf("A" to "e-10", "B" to "e-10", "A" to "e-10", "B" to "e-10"), heard)
+        assertEquals(listOf(10L), offsets.saved.map { it.globalOffset })
     }
 
     @Test
-    fun `subscribe after start throws IllegalStateException`() {
+    fun `listen after start throws IllegalStateException`() {
         val contract = newContract()
         contract.start()
 
         assertFailsWith<IllegalStateException> {
-            contract.subscribe(executorA) { emptyList() }
+            contract.listen { }
         }
+        kotlinx.coroutines.runBlocking { contract.stop() }
     }
 
     @Test
-    fun `deserialization happens once per event regardless of subscriber count`() {
+    fun `deserialization happens once per event regardless of listener count`() {
         givenEvents(
             persistedEvent(globalOffset = 10, eventId = "e-10", eventType = "Opened", eventPayload = "Opened(id=doc-1)"),
         )
 
         val counting = CountingSerialization()
         val contract = newContract(serialization = counting)
-        contract.subscribe(executorA) { listOf(EventReaction(EventReactionId("A"), FakeTrigger("A"))) }
-        contract.subscribe(executorB) { listOf(EventReaction(EventReactionId("B"), FakeTrigger("B"))) }
+        contract.recording("A")
+        contract.recording("B")
         kotlinx.coroutines.runBlocking { contract.tickForTest() }
 
         assertEquals(1, counting.deserializeCalls)
-    }
-
-    @Test
-    fun `a contract stamps only its ordered subscriptions`() {
-        every { executorA.supportsOrdering } returns true
-        givenEvents(persistedEvent(globalOffset = 10, aggregateId = "o-1", sequence = 2, eventType = "Opened", eventPayload = "Opened(id=doc-1)"))
-        val contract = newContract()
-        contract.subscribe(executorA, ordering = ReactionOrdering.PerAggregate()) { listOf(EventReaction(EventReactionId("A"), FakeTrigger("A"))) }
-        contract.subscribe(executorB) { listOf(EventReaction(EventReactionId("B"), FakeTrigger("B"))) }
-        kotlinx.coroutines.runBlocking { contract.tickForTest() }
-
-        coVerify { executorA.dispatch(EventReactionId("A"), FakeTrigger("A"), DispatchOrdering("Order/o-1", 2, 0, OnGiveUp.ContinueWithNext)) }
-        coVerify { executorB.dispatch(EventReactionId("B"), FakeTrigger("B"), null) }
-    }
-
-    @Test
-    fun `ordinals run on across ordered subscriptions so a later dispatch for an event always sorts later`() {
-        every { executorA.supportsOrdering } returns true
-        givenEvents(persistedEvent(globalOffset = 10, aggregateId = "o-1", sequence = 5, eventType = "Opened", eventPayload = "Opened(id=doc-1)"))
-        val contract = newContract()
-        contract.subscribe(executorA, ordering = ReactionOrdering.PerAggregate()) { listOf(EventReaction(EventReactionId("zz"), FakeTrigger("S1"))) }
-        contract.subscribe(executorA, ordering = ReactionOrdering.PerAggregate()) { listOf(EventReaction(EventReactionId("aa"), FakeTrigger("S2"))) }
-        kotlinx.coroutines.runBlocking { contract.tickForTest() }
-
-        coVerifyOrder {
-            executorA.dispatch(EventReactionId("zz"), FakeTrigger("S1"), DispatchOrdering("Order/o-1", 5, 0, OnGiveUp.ContinueWithNext))
-            executorA.dispatch(EventReactionId("aa"), FakeTrigger("S2"), DispatchOrdering("Order/o-1", 5, 1, OnGiveUp.ContinueWithNext))
-        }
     }
 }

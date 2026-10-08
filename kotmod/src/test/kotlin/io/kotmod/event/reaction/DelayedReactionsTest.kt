@@ -1,14 +1,5 @@
 package io.kotmod.event.reaction
 
-import io.kotmod.DataSerializationContext
-import io.kotmod.DomainEvent
-import io.kotmod.DomainEventPollingBackend
-import io.kotmod.EventLogPosition
-import io.kotmod.PersistedEvent
-import io.kotmod.PublicDomainEvent
-import io.kotmod.SerializedEvent
-import io.kotmod.contract.PublicEventContract
-import io.kotmod.support.persistedEvent
 import kotlinx.coroutines.runBlocking
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
@@ -72,15 +63,6 @@ class DelayedReactionsTest {
             clock = { now },
         )
 
-    private class OneEventBackend(
-        private val event: PersistedEvent,
-    ) : DomainEventPollingBackend {
-        override fun readEventsAfter(
-            position: EventLogPosition,
-            limit: Int,
-        ): List<PersistedEvent> = if (position == EventLogPosition.START) listOf(event) else emptyList()
-    }
-
     @Test
     fun `dispatch hands notBefore to the sink`() =
         runBlocking {
@@ -128,37 +110,5 @@ class DelayedReactionsTest {
                 deliver(EventReactionId("r-1"), EventReactionExecutionId("x-1"), FakeTrigger(), 0, now),
             )
             assertEquals(1, executions.get())
-        }
-
-    private data class Internal(
-        val id: String,
-    ) : DomainEvent
-
-    private data class Public(
-        val id: String,
-    ) : PublicDomainEvent
-
-    @Test
-    fun `a contract subscription passes a reaction's notBefore to dispatch`() =
-        runBlocking {
-            val contract =
-                PublicEventContract<Internal, Public>(
-                    backend = OneEventBackend(persistedEvent(globalOffset = 1)),
-                    serialization =
-                        object : DataSerializationContext<Internal> {
-                            override fun serialize(event: Internal) = SerializedEvent("Internal", 1, event.id)
-
-                            override fun deserialize(serialized: SerializedEvent) = Internal(serialized.payload)
-                        },
-                    internalToPublic = { Public(it.id) },
-                    getPosition = { EventLogPosition.START },
-                    savePosition = {},
-                    isLeader = { true },
-                )
-            contract.subscribe(executor()) { listOf(EventReaction(EventReactionId("later"), FakeTrigger(), notBefore = now + 3.seconds)) }
-
-            contract.tickForTest()
-
-            assertEquals(listOf(Published(EventReactionId("later"), null, now + 3.seconds)), published)
         }
 }

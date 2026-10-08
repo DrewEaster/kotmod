@@ -18,7 +18,7 @@ import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
-/** kotmod's own events in a process manager's stream: its intents, carried out later by its channels. */
+/** kotmod's own events in a process manager's stream: its intents, carried out later by its queues. */
 internal sealed interface ProcessEnvelope : DomainEvent
 
 /** The process asked for [command] (JSON) to be run against aggregate [targetType]/[targetId]. */
