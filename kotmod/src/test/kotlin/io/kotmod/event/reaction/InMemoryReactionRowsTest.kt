@@ -10,7 +10,7 @@ import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 
 class InMemoryReactionRowsTest {
-    private val now = Instant.parse("2026-10-08T10:00:00Z")
+    private var now = Instant.parse("2026-10-08T10:00:00Z")
     private val rows = InMemoryReactionRows { now }
 
     private fun ordered(
@@ -86,6 +86,50 @@ class InMemoryReactionRowsTest {
         assertEquals(setOf("a1", "k"), stale.toSet())
         assertEquals(2, stale.size)
         assertTrue(rows.stale("q", now, now - 1.seconds).isEmpty())
+    }
+
+    @Test
+    fun `sequence is compared before ordinal for the front and for stale`() {
+        rows.inLine("q", "Order/o-1") {
+            insert(ordered("late", seq = 6, ord = 0))
+            insert(ordered("early", seq = 5, ord = 1))
+        }
+        assertEquals("early", rows.inLine("q", "Order/o-1") { front() }?.reactionId)
+        assertEquals(listOf("early"), rows.stale("q", now, now + 1.seconds).map { it.reactionId })
+    }
+
+    @Test
+    fun `stale includes a lease that ends now, excludes one still running, and cuts off strictly`() {
+        rows.inQueue("q") {
+            insert(ordered("expired", key = "A", seq = 1).copy(leaseUntil = now))
+            insert(ordered("running", key = "B", seq = 1).copy(leaseUntil = now + 1.seconds))
+        }
+        assertEquals(listOf("expired"), rows.stale("q", now, now + 1.seconds).map { it.reactionId })
+        assertTrue(rows.stale("q", now, now).isEmpty())
+    }
+
+    @Test
+    fun `a blocked front and the row behind it are not stale`() {
+        rows.inQueue("q") {
+            insert(ordered("b1", key = "B", seq = 1).copy(blocked = true))
+            insert(ordered("b2", key = "B", seq = 2))
+        }
+        assertTrue(rows.stale("q", now, now + 1.seconds).isEmpty())
+    }
+
+    @Test
+    fun `update touches the update time`() {
+        rows.inQueue("q") { insert(ordered("a", seq = 1)) }
+        now += 10.seconds
+        rows.inQueue("q") { update(checkNotNull(get("a")).copy(attempts = 1)) }
+        assertTrue(rows.stale("q", now, now - 5.seconds).isEmpty())
+        assertEquals(listOf("a"), rows.stale("q", now, now + 1.seconds).map { it.reactionId })
+    }
+
+    @Test
+    fun `nested calls fail fast`() {
+        val error = assertFailsWith<IllegalStateException> { rows.inLine("q", "k") { rows.inQueue("q") { get("a") } } }
+        assertEquals("ReactionRows calls must not be nested", error.message)
     }
 
     @Test

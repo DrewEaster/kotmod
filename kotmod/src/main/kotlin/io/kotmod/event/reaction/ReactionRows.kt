@@ -42,7 +42,11 @@ internal interface LineTx : RowTx {
     fun front(): ReactionRow?
 }
 
-/** Where kotmod keeps ordered work and kept items. Calls block the thread (JDBC). */
+/**
+ * Where kotmod keeps ordered work and kept items. Calls block the thread (JDBC).
+ *
+ * Don't call it from inside another transaction: a line's lock is held until the transaction ends.
+ */
 internal interface ReactionRows {
     /** Runs [block] in one transaction that holds the lock on line ([queue], [key]). */
     fun <R> inLine(

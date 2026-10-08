@@ -68,13 +68,15 @@ internal class InMemoryReactionRows(
                 .thenBy { it.row.reactionId },
         )
 
-    private fun <R> transact(block: (Work) -> R): R =
-        lock.withLock {
+    private fun <R> transact(block: (Work) -> R): R {
+        check(!lock.isHeldByCurrentThread) { "ReactionRows calls must not be nested" }
+        return lock.withLock {
             val work = Work(stored.toMutableList())
             val result = block(work)
             stored = work.list
             result
         }
+    }
 
     private class Work(
         val list: MutableList<Stored>,
