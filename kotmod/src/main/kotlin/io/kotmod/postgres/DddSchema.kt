@@ -56,5 +56,21 @@ object DddSchema {
             last_offset         BIGINT       NOT NULL,
             updated_at          TIMESTAMPTZ  NOT NULL
         );
+
+        CREATE TABLE ddd_reaction_row (
+            queue_name    TEXT        NOT NULL,
+            reaction_id   TEXT        NOT NULL,
+            kind          TEXT        NOT NULL,
+            line_key      TEXT,
+            line_sequence BIGINT,
+            line_ordinal  INT,
+            item          TEXT        NOT NULL,
+            attempts      INT         NOT NULL DEFAULT 0,
+            blocked       BOOLEAN     NOT NULL DEFAULT FALSE,
+            lease_until   TIMESTAMPTZ,
+            updated_at    TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (queue_name, reaction_id)
+        );
+        CREATE UNIQUE INDEX ddd_reaction_row_line ON ddd_reaction_row (queue_name, line_key, line_sequence, line_ordinal);
         """.trimIndent()
 }

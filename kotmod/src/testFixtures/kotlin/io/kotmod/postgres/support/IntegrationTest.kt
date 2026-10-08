@@ -23,7 +23,7 @@ abstract class IntegrationTest {
         dataSource.connection.use { conn ->
             conn.createStatement().use { stmt ->
                 stmt.execute(
-                    "TRUNCATE ddd_aggregate_root, ddd_domain_event, ddd_command_history, ddd_consumer_offset, " +
+                    "TRUNCATE ddd_aggregate_root, ddd_domain_event, ddd_command_history, ddd_consumer_offset, ddd_reaction_row, " +
                         "scheduled_tasks RESTART IDENTITY",
                 )
             }
