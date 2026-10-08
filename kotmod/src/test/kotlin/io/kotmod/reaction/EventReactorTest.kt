@@ -1,16 +1,14 @@
 package io.kotmod.reaction
 
 import io.kotmod.EventLogPosition
-import io.kotmod.event.reaction.DispatchOrdering
-import io.kotmod.event.reaction.EventReactionId
-import io.kotmod.event.reaction.EventReactionTrigger
-import io.kotmod.event.reaction.EventReactionTriggerSerializer
-import io.kotmod.event.reaction.EventReactionTriggerSink
-import io.kotmod.event.reaction.ReactionChannel
+import io.kotmod.event.reaction.InMemoryReactionRows
 import io.kotmod.event.reaction.ReactionOrdering
-import io.kotmod.event.reaction.ReactionQueues
-import io.kotmod.process.ManualQueues
+import io.kotmod.event.reaction.ReactionRow
+import io.kotmod.event.reaction.ReactionRows
+import io.kotmod.event.reaction.ReactionTasks
+import io.kotmod.event.reaction.RowKind
 import io.kotmod.process.ProcessEventSerialization
+import io.kotmod.scheduling.ManualTaskScheduler
 import io.kotmod.support.OrderPlaced
 import io.kotmod.support.OrderShipped
 import io.kotmod.support.persistedEvent
@@ -21,11 +19,14 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Instant
 
 class EventReactorTest {
+    private var now = Instant.parse("2026-10-06T10:00:00Z")
     private val log = InMemoryLog()
-    private val queues = ManualQueues(enforceOrdering = true)
+    private val scheduler = ManualTaskScheduler()
+    private val rows = InMemoryReactionRows { now }
     private var position = EventLogPosition.START
     private val saves = mutableListOf<EventLogPosition>()
     private var leader = true
@@ -34,9 +35,10 @@ class EventReactorTest {
 
     private fun reactor(
         vararg policies: EventPolicy<Notice>,
-        queues: ReactionQueues = this.queues,
+        rows: ReactionRows = this.rows,
     ) = EventReactor(
-        queues = queues,
+        scheduler = scheduler,
+        rows = rows,
         polling = log,
         readEvent = log::readEvent,
         getPosition = {
@@ -55,8 +57,12 @@ class EventReactorTest {
         name = "reactor",
         pollInterval = 50.milliseconds,
         batchSize = 100,
-        clock = { Instant.parse("2026-10-06T10:00:00Z") },
+        sweepEvery = 10.minutes,
+        sweepIdle = 30.minutes,
+        clock = { now },
     ).also { reactor -> policies.forEach { reactor.register(it) } }
+
+    private fun queue(name: String) = scheduler.queue(name)
 
     /** Every trigger appends `<orderId>#<sequence>`. */
     private fun everyEvent(
@@ -64,46 +70,12 @@ class EventReactorTest {
         ordering: ReactionOrdering = ReactionOrdering.Unordered,
     ) = RecordingPolicy(name = name, ordering = ordering, mapping = { _, m -> trigger(Confirm("${m.aggregateId.value}#${m.sequence}")) })
 
-    /**
-     * A queue factory whose sinks fail once when [failNext] is set (or, with [failNextOn], only the named channel's sink),
-     * as a queue that is down would.
-     */
-    private class FlakyQueues(
-        private val delegate: ManualQueues,
-    ) : ReactionQueues {
-        var failNext = false
-        var failNextOn: String? = null
-
-        override fun <T : EventReactionTrigger> channel(
-            name: String,
-            triggerSerializer: EventReactionTriggerSerializer<T>,
-            ordered: Boolean,
-        ): ReactionChannel<T> {
-            val channel = delegate.channel(name, triggerSerializer, ordered)
-            val sink =
-                object : EventReactionTriggerSink<T> {
-                    override val supportsOrdering = channel.sink.supportsOrdering
-
-                    override suspend fun publish(
-                        id: EventReactionId,
-                        trigger: T,
-                        ordering: DispatchOrdering?,
-                        notBefore: Instant?,
-                    ) {
-                        if (failNext) {
-                            failNext = false
-                            error("queue unavailable")
-                        }
-                        if (failNextOn == name) {
-                            failNextOn = null
-                            error("queue $name unavailable")
-                        }
-                        channel.sink.publish(id, trigger, ordering, notBefore)
-                    }
-                }
-            return ReactionChannel(sink, channel.source)
-        }
-    }
+    /** Puts [notice] at the front of [key]'s line in [policy]'s rows, with no task: as if its backend lost the task. */
+    private fun lostFront(
+        policy: String,
+        key: String,
+        notice: Notice,
+    ) = rows.inLine(policy, key) { insert(ReactionRow(policy, "$policy/lost", RowKind.ORDERED, key, 1, 0, storedTrigger(notice))) }
 
     @Test
     fun `several event policies each get their own triggers for one event in their own queues, and one listening to other types gets nothing`() =
@@ -118,9 +90,9 @@ class EventReactorTest {
 
             reactor.tickForTest()
 
-            assertEquals(listOf("confirmations/e-1/0"), queues.pending("confirmations").map { it.id.value })
-            assertEquals(listOf<Notice>(Confirm("o-1#1")), queues.pending("audits").map { it.notice() })
-            assertTrue(queues.pending("invoices").isEmpty())
+            assertEquals(listOf("confirmations/e-1/0"), queue("confirmations").names())
+            assertEquals(listOf<Notice>(Confirm("o-1#1")), queue("audits").unordered().map { policyItem(it.item).notice() })
+            assertTrue(queue("invoices").pending.isEmpty())
             assertEquals(log.events.single().position, position)
         }
 
@@ -133,8 +105,9 @@ class EventReactorTest {
 
             reactor.tickForTest()
 
-            assertEquals(listOf("confirmations/e-1/0", "confirmations/e-2/0"), queues.pending("confirmations").map { it.id.value })
-            assertEquals(listOf("broken/e-1/mapping", "broken/e-2/mapping"), queues.pending("broken").map { it.id.value })
+            assertEquals(listOf("confirmations/e-1/0", "confirmations/e-2/0"), queue("confirmations").names())
+            assertEquals(listOf("broken/e-1/mapping", "broken/e-2/mapping"), rows.rows("broken").map { it.reactionId })
+            assertTrue(rows.rows("confirmations").isEmpty())
             assertEquals(log.events.last().position, position)
         }
 
@@ -142,6 +115,8 @@ class EventReactorTest {
     fun `a crash between queueing triggers and saving the position loses nothing and duplicates nothing`() =
         runBlocking {
             val policy = RecordingPolicy()
+            val scheduled = mutableListOf<String>()
+            queue("confirmations").beforeSchedule = { scheduled += it }
             val reactor = reactor(policy).also { it.startPoliciesForTest() }
             log.add(orderEvent(OrderPlaced("book")))
             failSaves = 1
@@ -149,15 +124,15 @@ class EventReactorTest {
             assertFailsWith<IllegalStateException> { reactor.tickForTest() }
             assertEquals(EventLogPosition.START, position)
             reactor.tickForTest()
-            queues.deliver("confirmations")
+            queue("confirmations").deliverAll()
 
-            assertEquals(2, queues.published.count { it.id.value == "confirmations/e-1/0" })
+            assertEquals(listOf("confirmations/e-1/0", "confirmations/e-1/0"), scheduled)
             assertEquals(listOf(ReactionContext("confirmations/e-1/0", 0)), policy.handled.map { it.second })
             assertEquals(log.events.single().position, position)
         }
 
     @Test
-    fun `replaying from an earlier position queues the same ids, which the queue absorbs while pending`() =
+    fun `replaying from an earlier position queues the same ids, which the scheduler absorbs while pending`() =
         runBlocking {
             val policy = RecordingPolicy()
             val reactor = reactor(policy).also { it.startPoliciesForTest() }
@@ -166,9 +141,26 @@ class EventReactorTest {
             reactor.tickForTest()
             position = EventLogPosition.START
             reactor.tickForTest()
-            queues.deliver("confirmations")
+            queue("confirmations").deliverAll()
 
             assertEquals(listOf(ReactionContext("confirmations/e-1/0", 0)), policy.handled.map { it.second })
+        }
+
+    @Test
+    fun `replaying an ordered event policy's events adds nothing to its lines`() =
+        runBlocking {
+            val policy = everyEvent("projection", ReactionOrdering.PerAggregate())
+            val reactor = reactor(policy).also { it.startPoliciesForTest() }
+            log.add(orderEvent(OrderPlaced("a"), eventId = "e-1", sequence = 1))
+            log.add(orderEvent(OrderShipped("a"), eventId = "e-2", sequence = 2))
+
+            reactor.tickForTest()
+            position = EventLogPosition.START
+            reactor.tickForTest()
+
+            assertEquals(listOf("projection/e-1/0", "projection/e-2/0"), rows.rows("projection").map { it.reactionId })
+            queue("projection").deliverAll()
+            assertEquals(listOf<Notice>(Confirm("o-1#1"), Confirm("o-1#2")), policy.handled.map { it.first })
         }
 
     @Test
@@ -181,11 +173,11 @@ class EventReactorTest {
             log.add(orderEvent(OrderShipped("a"), eventId = "e-2", sequence = 2))
 
             reactor.tickForTest()
-            queues.deliver("projection")
-            queues.deliver("emails")
+            queue("projection").deliverNext()
+            queue("emails").deliverAll()
 
-            assertEquals(listOf("projection" to true, "emails" to false), queues.channels)
-            assertEquals(listOf("Order/o-1", "Order/o-1"), queues.pending("projection").map { it.ordering?.key })
+            assertEquals(listOf("Order/o-1", "Order/o-1"), rows.rows("projection").map { it.key })
+            assertTrue(rows.rows("emails").isEmpty())
             assertEquals(listOf<Notice>(Confirm("o-1#1")), projection.handled.map { it.first })
             assertEquals(listOf<Notice>(Confirm("o-1#1"), Confirm("o-1#2")), emails.handled.map { it.first })
         }
@@ -231,7 +223,7 @@ class EventReactorTest {
 
             restarted.tickForTest()
 
-            assertEquals(listOf("newcomer/e-2/0"), queues.pending("newcomer").map { it.id.value })
+            assertEquals(listOf("newcomer/e-2/0"), queue("newcomer").names())
         }
 
     @Test
@@ -243,7 +235,7 @@ class EventReactorTest {
 
             reactor.tickForTest()
 
-            assertTrue(queues.published.isEmpty())
+            assertTrue(queue("confirmations").pending.isEmpty())
             assertEquals(EventLogPosition.START, position)
         }
 
@@ -260,35 +252,37 @@ class EventReactorTest {
         }
 
     @Test
-    fun `a queue that fails to publish stops the batch, parking nothing and saving no position`() =
+    fun `a scheduler that fails to schedule stops the batch, parking nothing and saving no position`() =
         runBlocking {
-            val flaky = FlakyQueues(queues)
-            val reactor = reactor(RecordingPolicy(), queues = flaky)
+            val reactor = reactor(RecordingPolicy())
             log.add(orderEvent(OrderPlaced("a")))
-            flaky.failNext = true
+            queue("confirmations").failNextSchedules = 1
 
             assertFailsWith<IllegalStateException> { reactor.tickForTest() }
-            assertTrue(queues.published.isEmpty())
+            assertTrue(queue("confirmations").pending.isEmpty())
+            assertTrue(rows.rows("confirmations").isEmpty())
             assertEquals(EventLogPosition.START, position)
             reactor.tickForTest()
-            assertEquals(listOf("confirmations/e-1/0"), queues.pending("confirmations").map { it.id.value })
+            assertEquals(listOf("confirmations/e-1/0"), queue("confirmations").names())
         }
 
     @Test
     fun `when one event policy's queue fails, the event is read again and the other event policy's trigger is queued again under the same id`() =
         runBlocking {
-            val flaky = FlakyQueues(queues)
-            val reactor = reactor(RecordingPolicy(name = "a"), RecordingPolicy(name = "b"), queues = flaky)
+            val scheduled = mutableListOf<String>()
+            queue("a").beforeSchedule = { scheduled += it }
+            val reactor = reactor(RecordingPolicy(name = "a"), RecordingPolicy(name = "b"))
             log.add(orderEvent(OrderPlaced("book")))
-            flaky.failNextOn = "b"
+            queue("b").failNextSchedules = 1
 
             assertFailsWith<IllegalStateException> { reactor.tickForTest() }
-            assertEquals(listOf("a/e-1/0"), queues.published.map { it.id.value })
+            assertEquals(listOf("a/e-1/0"), scheduled)
             assertEquals(EventLogPosition.START, position)
             reactor.tickForTest()
 
-            assertEquals(listOf("a/e-1/0", "a/e-1/0", "b/e-1/0"), queues.published.map { it.id.value })
-            assertEquals(listOf("a/e-1/0"), queues.pending("a").map { it.id.value })
+            assertEquals(listOf("a/e-1/0", "a/e-1/0"), scheduled)
+            assertEquals(listOf("a/e-1/0"), queue("a").names())
+            assertEquals(listOf("b/e-1/0"), queue("b").names())
             assertEquals(log.events.single().position, position)
         }
 
@@ -300,7 +294,63 @@ class EventReactorTest {
 
             reactor.tickForTest()
 
-            assertTrue(queues.published.isEmpty())
+            assertTrue(queue("confirmations").pending.isEmpty())
+            assertTrue(rows.rows("confirmations").isEmpty())
+        }
+
+    @Test
+    fun `the first tick sweeps, then at most every sweepEvery`() =
+        runBlocking {
+            val policy = everyEvent("projection", ReactionOrdering.PerAggregate())
+            val reactor = reactor(policy).also { it.startPoliciesForTest() }
+            val lost = ReactionTasks.frontName("Order/o-1", "projection/lost")
+            lostFront("projection", "Order/o-1", Confirm("lost"))
+            now += 31.minutes
+
+            leader = false
+            reactor.tickForTest()
+            assertTrue(queue("projection").pending.isEmpty(), "only the leader sweeps")
+
+            leader = true
+            reactor.tickForTest()
+            assertEquals(listOf(lost), queue("projection").names(), "the first tick sweeps")
+
+            queue("projection").lose(lost)
+            now += 9.minutes
+            reactor.tickForTest()
+            assertTrue(queue("projection").pending.isEmpty(), "no sweep before sweepEvery")
+
+            now += 1.minutes
+            reactor.tickForTest()
+            assertEquals(listOf(lost), queue("projection").names(), "a sweep once sweepEvery has passed")
+            queue("projection").deliverAll()
+            assertEquals(listOf<Notice>(Confirm("lost")), policy.handled.map { it.first })
+        }
+
+    @Test
+    fun `a sweep failure doesn't stop reading`() =
+        runBlocking {
+            val failing =
+                object : ReactionRows by rows {
+                    override fun stale(
+                        queue: String,
+                        now: Instant,
+                        before: Instant,
+                    ): List<ReactionRow> = if (queue == "a") error("database down") else rows.stale(queue, now, before)
+                }
+            val reactor = reactor(everyEvent("a"), everyEvent("b", ReactionOrdering.PerAggregate()), rows = failing)
+            lostFront("b", "Order/o-9", Confirm("lost"))
+            now += 31.minutes
+            log.add(orderEvent(OrderPlaced("book")))
+
+            reactor.tickForTest()
+
+            assertEquals(log.events.single().position, position)
+            assertEquals(listOf("a/e-1/0"), queue("a").names())
+            assertEquals(
+                setOf(ReactionTasks.frontName("Order/o-9", "b/lost"), ReactionTasks.frontName("Order/o-1", "b/e-1/0")),
+                queue("b").names().toSet(),
+            )
         }
 
     @Test

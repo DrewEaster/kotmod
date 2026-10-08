@@ -2,15 +2,18 @@ package io.kotmod.reaction
 
 import io.kotmod.EventLogPosition
 import io.kotmod.EventMetadata
+import io.kotmod.event.reaction.InMemoryReactionRows
 import io.kotmod.event.reaction.ReactionOrdering
-import io.kotmod.process.ManualQueues
 import io.kotmod.process.ProcessEventSerialization
-import io.kotmod.support.persistedEvent
-import kotlin.test.assertFails
+import io.kotmod.scheduling.ManualTaskScheduler
+import io.kotmod.scheduling.TaskQueue
+import io.kotmod.scheduling.TaskScheduler
 import io.kotmod.support.OrderPlaced
+import io.kotmod.support.persistedEvent
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFails
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
@@ -18,13 +21,17 @@ import kotlin.time.Instant
 
 class ContractSourceTest {
     private val log = InMemoryLog()
-    private val queues = ManualQueues(enforceOrdering = true)
+    private val now = Instant.parse("2026-10-06T10:00:00Z")
+    private val scheduler = ManualTaskScheduler()
+    private val rows = InMemoryReactionRows { now }
+    private val queue = scheduler.queue("fraud-checks")
     private var position = EventLogPosition.START
     private val payments = paymentContract(log)
 
     private fun reactor(vararg policies: EventPolicy<Notice>) =
         EventReactor(
-            queues = queues,
+            scheduler = scheduler,
+            rows = rows,
             polling = log,
             readEvent = log::readEvent,
             getPosition = { position },
@@ -33,7 +40,7 @@ class ContractSourceTest {
             name = "reactor",
             pollInterval = 50.milliseconds,
             batchSize = 100,
-            clock = { Instant.parse("2026-10-06T10:00:00Z") },
+            clock = { now },
         ).also { reactor ->
             policies.forEach { reactor.register(it) }
             reactor.startPoliciesForTest()
@@ -54,10 +61,10 @@ class ContractSourceTest {
             reactor.tickForTest()
             payments.tickForTest()
 
-            val pending = queues.pending("fraud-checks")
-            assertEquals(listOf("fraud-checks/e-1/0", "fraud-checks/p-1/0"), pending.map { it.id.value })
-            assertEquals(listOf("Order/o-1", "Payment/c-1"), pending.map { it.ordering?.key })
-            queues.deliver("fraud-checks")
+            val lines = rows.rows("fraud-checks")
+            assertEquals(listOf("fraud-checks/e-1/0", "fraud-checks/p-1/0"), lines.map { it.reactionId })
+            assertEquals(listOf("Order/o-1", "Payment/c-1"), lines.map { it.key })
+            queue.deliverAll()
             assertEquals(listOf<Notice>(Confirm("o-1"), Flag("c-1")), fraud.handled.map { it.first })
         }
 
@@ -69,10 +76,10 @@ class ContractSourceTest {
             log.add(paymentEvent("c-1", eventId = "p-1"))
 
             reactor.tickForTest()
-            assertTrue(queues.pending("chargebacks").isEmpty())
+            assertTrue(scheduler.queue("chargebacks").pending.isEmpty())
             payments.tickForTest()
 
-            assertEquals(listOf("chargebacks/p-1/0"), queues.pending("chargebacks").map { it.id.value })
+            assertEquals(listOf("chargebacks/p-1/0"), scheduler.queue("chargebacks").names())
         }
 
     @Test
@@ -83,7 +90,8 @@ class ContractSourceTest {
 
             payments.tickForTest()
 
-            assertTrue(queues.published.isEmpty())
+            assertTrue(queue.pending.isEmpty())
+            assertTrue(rows.rows("fraud-checks").isEmpty())
         }
 
     @Test
@@ -101,13 +109,14 @@ class ContractSourceTest {
 
             payments.tickForTest()
 
-            assertEquals(listOf("fraud-checks/p-1/mapping", "fraud-checks/p-2/0"), queues.pending("fraud-checks").map { it.id.value })
-            repeat(4) { queues.deliver("fraud-checks") }
+            assertEquals(listOf("fraud-checks/p-1/mapping", "fraud-checks/p-2/0"), rows.rows("fraud-checks").map { it.reactionId })
+            queue.deliverNext() // the fixed mapping, re-run through the contract
+            // The re-run queues what the inline path would have: same id, in the same place in the same line.
+            val rerun = rows.rows("fraud-checks").first()
+            assertEquals(listOf("fraud-checks/p-1/0", "Payment/c-1", 1L, 0), listOf(rerun.reactionId, rerun.key, rerun.sequence, rerun.ordinal))
+            assertEquals(Flag("c-1"), rerun.policyItem.notice())
+            queue.deliverAll()
             assertEquals(listOf<Notice>(Flag("c-2"), Flag("c-1")), fraud.handled.map { it.first })
-            // The re-run publishes what the inline path would have: same id and ordering key.
-            val rerun = queues.published.single { it.id.value == "fraud-checks/p-1/0" }
-            assertEquals("Payment/c-1", rerun.ordering?.key)
-            assertEquals(Flag("c-1"), rerun.notice())
         }
 
     @Test
@@ -131,15 +140,17 @@ class ContractSourceTest {
             }
             other.start()
             try {
-                val reactor =
-                    EventReactor(queues, log, log::readEvent, { position }, { position = it }, { true }, "reactor", 50.milliseconds, 100) {
-                        Instant.parse("2026-10-06T10:00:00Z")
+                val asked = mutableListOf<String>()
+                val watching =
+                    object : TaskScheduler {
+                        override fun queue(name: String): TaskQueue = scheduler.queue(name).also { asked += name }
                     }
+                val reactor = EventReactor(watching, rows, log, log::readEvent, { position }, { position = it }, { true }, "reactor", 50.milliseconds, 100) { now }
                 assertFailsWith<IllegalStateException> { reactor.register(twoContracts) }
                 log.add(paymentEvent("c-1", eventId = "p-1"))
                 payments.tickForTest()
-                assertTrue(queues.published.isEmpty())
-                assertTrue(queues.channels.isEmpty())
+                assertTrue(scheduler.queue("two").pending.isEmpty())
+                assertTrue(asked.isEmpty())
             } finally {
                 other.stop()
             }
@@ -153,7 +164,8 @@ class ContractSourceTest {
 
             assertFails { payments.tickForTest() }
 
-            assertTrue(queues.published.isEmpty())
+            assertTrue(queue.pending.isEmpty())
+            assertTrue(rows.rows("fraud-checks").isEmpty())
         }
 
     @Test
@@ -165,6 +177,6 @@ class ContractSourceTest {
 
             payments.tickForTest()
 
-            assertTrue(!called && queues.published.isEmpty())
+            assertTrue(!called && queue.pending.isEmpty() && rows.rows("fraud-checks").isEmpty())
         }
 }

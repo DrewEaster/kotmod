@@ -28,8 +28,9 @@ import kotlin.time.Instant
  * idempotent; [ReactionContext.reactionId] is a stable idempotency key.
  *
  * @param T the trigger type: plain `@Serializable` data.
- * @param name names the policy's queue, so keep it stable across releases. Unique within a reactor.
- * @param triggers serializes the triggers while they wait in the queue.
+ * @param name names the policy's queue and its rows in kotmod's reaction table, so keep it stable across releases.
+ *   Unique within a reactor.
+ * @param triggers serializes the triggers while they wait to run.
  */
 abstract class EventPolicy<T : Any>(
     val name: String,
@@ -144,10 +145,3 @@ internal data class ProducedTrigger<out T : Any>(
     val notBefore: Instant?,
 )
 
-/** The name [EventPolicy] had before 0.3.1. */
-@Deprecated("Renamed to EventPolicy", ReplaceWith("EventPolicy<T>", "io.kotmod.reaction.EventPolicy"))
-typealias Reactions<T> = EventPolicy<T>
-
-/** The name [EventPolicyDsl] had before 0.3.1. */
-@Deprecated("Renamed to EventPolicyDsl", ReplaceWith("EventPolicyDsl", "io.kotmod.reaction.EventPolicyDsl"))
-typealias ReactionsDsl = EventPolicyDsl

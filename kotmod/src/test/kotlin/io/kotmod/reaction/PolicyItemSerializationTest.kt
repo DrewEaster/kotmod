@@ -21,7 +21,7 @@ class PolicyItemSerializationTest {
     fun `a parked mapping queued by 0_3_0 decodes and encodes unchanged`() {
         val item = Json.decodeFromString(PolicyItem.serializer(), parked030)
 
-        assertEquals(ParkedMapping("e-1", "Order", "o-1", "aggregate kind Order"), item)
+        assertEquals(ParkedItem("e-1", "Order", "o-1", "aggregate kind Order"), item)
         assertEquals(parked030, Json.encodeToString(PolicyItem.serializer(), item))
     }
 }

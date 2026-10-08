@@ -22,6 +22,7 @@ import kotlin.time.Duration
  * reads events after the saved position, hands each one to [handleEvent], and saves the position after each
  * event. It delivers each aggregate's events in sequence order (pulling an earlier event forward when the log
  * has it later, and skipping it when reached). An exception stops the current batch; the next poll resumes from the last saved position.
+ * After each leader tick's batch it runs [afterTick] (an exception there ends the tick like any other).
  */
 internal class DomainEventPoller(
     private val backend: DomainEventPollingBackend,
@@ -32,6 +33,7 @@ internal class DomainEventPoller(
     private val batchSize: Int,
     private val loggerName: String,
     private val handleEvent: suspend (PersistedEvent) -> Unit,
+    private val afterTick: suspend () -> Unit = {},
 ) {
     private val log = LoggerFactory.getLogger(loggerName)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -67,7 +69,11 @@ internal class DomainEventPoller(
 
     private suspend fun tick() {
         if (!isLeader()) return
+        readBatch()
+        afterTick()
+    }
 
+    private suspend fun readBatch() {
         var position = withContext(Dispatchers.IO) { getPosition() }
         val rows = withContext(Dispatchers.IO) { backend.readEventsAfter(position, batchSize) }
 

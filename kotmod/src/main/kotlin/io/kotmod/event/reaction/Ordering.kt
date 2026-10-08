@@ -59,5 +59,8 @@ internal fun ReactionOrdering.stampFor(
     when (this) {
         ReactionOrdering.Unordered -> null
         is ReactionOrdering.PerAggregate ->
-            DispatchOrdering("${metadata.aggregateType.value}/${metadata.aggregateId.value}", metadata.sequence, ordinal, onGiveUp)
+            DispatchOrdering(lineKey(metadata), metadata.sequence, ordinal, onGiveUp)
     }
+
+/** The line an ordered reaction to the event described by [metadata] joins: its aggregate's. */
+internal fun lineKey(metadata: EventMetadata): String = "${metadata.aggregateType.value}/${metadata.aggregateId.value}"

@@ -4,32 +4,40 @@ import io.kotmod.DomainEventPollingBackend
 import io.kotmod.EventId
 import io.kotmod.EventLogPosition
 import io.kotmod.PersistedEvent
-import io.kotmod.event.reaction.ReactionQueues
+import io.kotmod.event.reaction.ReactionRows
 import io.kotmod.jdbc.JdbcContext
 import io.kotmod.outbox.DomainEventPoller
 import io.kotmod.postgres.PostgresDomainPollingBackend
 import io.kotmod.postgres.PostgresOffsetManager
+import io.kotmod.postgres.PostgresReactionRows
 import io.kotmod.process.ProcessEventSerialization
+import io.kotmod.scheduling.TaskScheduler
+import org.slf4j.LoggerFactory
 import kotlin.time.Clock
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Instant
 
 /**
  * Runs a context's event policies. It reads the event log once, after one saved position, and hands each event to
  * every registered policy that listens to its aggregate type with `on(kind)`. It queues each policy's triggers on that
- * policy's own queue from [queues] (named after the policy). Policies listening to another context's contract with
- * `on(contract)` are fed by that contract's own reader instead.
+ * policy's queue from [scheduler] (named after the policy). An ordered policy keeps each aggregate's work in a line in
+ * kotmod's `ddd_reaction_row` table, and only the front of each line is scheduled. Policies listening to another
+ * context's contract with `on(contract)` are fed by that contract's own reader instead.
  *
  * - If a policy can't map an event (its block throws, the event can't be deserialized, or an ordered policy produces
- *   a delayed trigger), the event is parked in that policy's queue and the reactor moves on. Other policies still
- *   get their triggers for the event.
+ *   a delayed trigger), the event is parked in that policy's rows (for an ordered policy, in the event's place in its
+ *   aggregate's line) and the reactor moves on. Other policies still get their triggers for the event.
  * - The position is saved after each event, once every policy's triggers for it are queued. After a crash the event
- *   is read again and queued with the same ids, which a queue recognises while the work is pending.
+ *   is read again and queued with the same ids, which are recognised while the work is pending.
  * - It reads only while [isLeader]; run one active reactor per context. kotmod's internal events never reach an
  *   event policy.
+ * - On the leader, on its first read and then about every 10 minutes, a repair sweep schedules again any line front or
+ *   parked mapping that has sat idle for a while, in case the scheduler lost its task. A failed sweep is logged and
+ *   tried again next time; it never stops the reading.
  *
- * Register every event policy, then start the reactor before the queue's scheduler, and stop it after. A new reactor
+ * Register every event policy, then start the reactor before the scheduler, and stop it after. A new reactor
  * starts at the head of the event log as of its first [start]: it sees events written from then on, not history.
  * [register], [start] and [stop] are meant to be called from one thread, at startup and shutdown; they are not
  * safe to call concurrently.
@@ -37,7 +45,8 @@ import kotlin.time.Instant
  * @param name the consumer name its position is saved under.
  */
 class EventReactor internal constructor(
-    private val queues: ReactionQueues,
+    private val scheduler: TaskScheduler,
+    private val rows: ReactionRows,
     polling: DomainEventPollingBackend,
     private val readEvent: (EventId) -> PersistedEvent?,
     private val getPosition: () -> EventLogPosition,
@@ -46,17 +55,20 @@ class EventReactor internal constructor(
     val name: String,
     pollInterval: Duration,
     batchSize: Int,
+    private val sweepEvery: Duration = 10.minutes,
+    private val sweepIdle: Duration = 30.minutes,
     private val clock: () -> Instant,
 ) {
     constructor(
         jdbc: JdbcContext,
-        queues: ReactionQueues,
+        scheduler: TaskScheduler,
         isLeader: () -> Boolean,
         name: String = "reactor",
         pollInterval: Duration = 500.milliseconds,
         batchSize: Int = 100,
     ) : this(
-        queues = queues,
+        scheduler = scheduler,
+        rows = PostgresReactionRows(jdbc),
         polling = PostgresDomainPollingBackend(jdbc),
         readEvent = PostgresDomainPollingBackend(jdbc)::readEvent,
         getPosition = { PostgresOffsetManager(jdbc).getPosition(name) },
@@ -67,6 +79,8 @@ class EventReactor internal constructor(
         batchSize = batchSize,
         clock = { Clock.System.now() },
     )
+
+    private val log = LoggerFactory.getLogger("EventReactor($name)")
 
     private val runtimes = mutableListOf<PolicyRuntime<*>>()
 
@@ -88,11 +102,16 @@ class EventReactor internal constructor(
             batchSize = batchSize,
             loggerName = "EventReactor($name)",
             handleEvent = ::route,
+            afterTick = ::sweepIfDue,
         )
 
+    /** When the last repair sweep started; touched only by the reader's loop. */
+    private var lastSweep: Instant? = null
+
     /**
-     * Registers [policy]: it gets its own queue, named after it, and its `on(contract)` sources start listening to their
-     * contracts. Must be called before [start], before reading the queues' tasks, and before those contracts start.
+     * Registers [policy]: it gets its own queue from the scheduler, named after it, and its `on(contract)` sources start
+     * listening to their contracts. Must be called before [start], before the scheduler runs tasks, and before those
+     * contracts start.
      * Each such contract must read the same event log (database) as this reactor, because a parked mapping re-reads its
      * event through the reactor, and a contract that is never started delivers nothing to its event policies.
      */
@@ -103,7 +122,7 @@ class EventReactor internal constructor(
         // Check every contract first, so a refused registration attaches nothing and creates no queue.
         val contractSources = policy.sources.filterIsInstance<ContractSource<T, *>>()
         contractSources.forEach { it.ensureCanFeed() }
-        val runtime = PolicyRuntime(policy, queues, readEvent, clock)
+        val runtime = PolicyRuntime(policy, scheduler, rows, readEvent, clock)
         contractSources.forEach { it.feed(runtime) }
         runtimes += runtime
         policy.registered = true
@@ -142,5 +161,20 @@ class EventReactor internal constructor(
         // A process manager's internal envelopes are only for that process manager.
         if (ProcessEventSerialization.isEnvelope(event.serialized.type)) return
         for (runtime in runtimes) runtime.routeLocal(event)
+    }
+
+    /** Runs the repair sweep on the first tick, then at most every [sweepEvery]. */
+    private suspend fun sweepIfDue() {
+        val now = clock()
+        val last = lastSweep
+        if (last != null && now - last < sweepEvery) return
+        lastSweep = now
+        runtimes.forEach { runtime ->
+            try {
+                runtime.sweep(sweepIdle)
+            } catch (e: Exception) {
+                log.warn("Repair sweep of event policy {} failed; trying again next time", runtime.policy.name, e)
+            }
+        }
     }
 }

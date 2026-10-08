@@ -12,9 +12,13 @@ import io.kotmod.PersistedEvent
 import io.kotmod.PublicDomainEvent
 import io.kotmod.SerializedEvent
 import io.kotmod.contract.PublicEventContract
+import io.kotmod.scheduling.ManualTaskScheduler
+import io.kotmod.scheduling.TaskOutcome
 import io.kotmod.event.reaction.ReactionOrdering
+import io.kotmod.event.reaction.ReactionRow
+import io.kotmod.event.reaction.ReactionTasks
+import io.kotmod.event.reaction.TaskPayload
 import io.kotmod.postgres.support.orderEventSerialization
-import io.kotmod.process.ManualQueues
 import io.kotmod.support.OrderEvent
 import io.kotmod.support.OrderPlaced
 import io.kotmod.support.persistedEvent
@@ -23,6 +27,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.Instant
 
 @Serializable
 sealed interface Notice
@@ -186,5 +191,30 @@ internal class RecordingPolicy(
     }
 }
 
-/** The trigger a queued item carries, read back as a [Notice]. */
-internal fun ManualQueues.Published.notice(): Notice = Json.decodeFromString(Notice.serializer(), (trigger as TriggerItem).trigger)
+/** A policy item as a task or row stores it. */
+internal fun policyItem(json: String): PolicyItem = Json.decodeFromString(PolicyItem.serializer(), json)
+
+/** The trigger an item carries, read back as a [Notice]. */
+internal fun PolicyItem.notice(): Notice = Json.decodeFromString(Notice.serializer(), (this as TriggerItem).trigger)
+
+/** [notice] as a policy item stores it. */
+internal fun storedTrigger(notice: Notice): String =
+    Json.encodeToString(PolicyItem.serializer(), TriggerItem(Json.encodeToString(Notice.serializer(), notice)))
+
+/** The item a row holds. */
+internal val ReactionRow.policyItem: PolicyItem get() = policyItem(item)
+
+/** The unordered work pending in this queue, each task carrying its item. */
+internal fun ManualTaskScheduler.Queue.unordered(): List<TaskPayload.Unordered> =
+    pending.mapNotNull { ReactionTasks.decode(it.payload) as? TaskPayload.Unordered }
+
+/** The names of the tasks pending in this queue, in delivery order. */
+internal fun ManualTaskScheduler.Queue.names(): List<String> = pending.map { it.name }
+
+/** How long after [now] this outcome runs the task again; `null` when it is done. */
+internal fun TaskOutcome?.againAfter(now: Instant): Duration? =
+    when (this) {
+        is TaskOutcome.RunAgain -> at - now
+        TaskOutcome.Done -> null
+        null -> error("Nothing was delivered")
+    }
