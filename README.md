@@ -978,6 +978,7 @@ sealed interface OrderStatusChange
 data class StatusChanged(
     val orderId: String,
     val status: String,
+    val sequence: Long,
 ) : OrderStatusChange
 
 class OrderStatusProjection(
@@ -994,7 +995,7 @@ class OrderStatusProjection(
                     is OrderShipped -> "shipped"
                     is OrderCancelled -> "cancelled"
                 }
-            trigger(StatusChanged(metadata.aggregateId.value, status))
+            trigger(StatusChanged(metadata.aggregateId.value, status, metadata.sequence))
         }
     }
 
@@ -1004,21 +1005,21 @@ class OrderStatusProjection(
         trigger: OrderStatusChange,
         context: ReactionContext,
     ) = when (trigger) {
-        is StatusChanged -> saveStatus(trigger.orderId, trigger.status)
+        is StatusChanged -> saveStatus(trigger)
     }
 
-    private fun saveStatus(
-        orderId: String,
-        status: String,
-    ) {
+    // Writes only if the stored status came from an earlier event, so a stale re-run can't overwrite a newer one.
+    private fun saveStatus(change: StatusChanged) {
         jdbc.withConnection { conn ->
             conn
                 .prepareStatement(
-                    "INSERT INTO order_status (id, status) VALUES (?, ?) " +
-                        "ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status",
+                    "INSERT INTO order_status (id, status, sequence) VALUES (?, ?, ?) " +
+                        "ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, sequence = EXCLUDED.sequence " +
+                        "WHERE order_status.sequence < EXCLUDED.sequence",
                 ).use { ps ->
-                    ps.setString(1, orderId)
-                    ps.setString(2, status)
+                    ps.setString(1, change.orderId)
+                    ps.setString(2, change.status)
+                    ps.setLong(3, change.sequence)
                     ps.executeUpdate()
                 }
         }
@@ -1093,10 +1094,14 @@ nothing when no task was lost. The sweep runs after a successful read, so it doe
 on an event that keeps failing (say, while the scheduler is down). Process managers sweep their own queues the same
 way.
 
-**Delivery is still at least once.** In one rare case, ordering can briefly be broken: if the reactor crashes
-after queueing several triggers from the same event but before saving its position, an earlier one that had
-already completed is added to its line again, and can run at the same time as a later one. Keep ordered work
-idempotent too.
+**Delivery is still at least once, and a re-run can be out of order.** Work queued again after it finished runs
+again, and it can run after (or at the same time as) the aggregate's later work: once work has finished its row is
+gone, so its line no longer knows where it belonged. This happens if the reactor crashes after queueing work but
+before saving its position, if two nodes briefly both poll (see
+[Running in production](#running-in-production)), or if you move the reactor's position back. Idempotency alone
+doesn't prevent the damage: re-applying an old status after a newer one is idempotent, and still overwrites the
+newer status. Make ordered work that writes state guard on the event's sequence, as `OrderStatusProjection` does:
+carry `metadata.sequence` in the trigger, and write only if the stored sequence is lower.
 
 ### Using another scheduler
 
@@ -1667,8 +1672,10 @@ fun reactorWithLeaderElection(
 - **Brief overlap.** If Postgres ends the leader's session first (a failover, `pg_terminate_backend`), another
   node can take over before the old leader notices. Pollers check `isLeader()` only at the start of each
   poll, so two nodes may poll for up to about two `checkInterval`s plus one poll batch. That can queue the same
-  work twice; deterministic reaction ids absorb it while the work is still pending, and an idempotent `handle`
-  covers the rest.
+  work twice. Deterministic reaction ids absorb it while the work is still pending; work queued again after it
+  finished runs again, and for an ordered event policy possibly after the aggregate's later work. An idempotent
+  `handle` covers unordered work; ordered work that writes state should also guard on the event's sequence (see
+  [Ordered event policies](#ordered-event-policies)).
 - **Shutdown.** Stop the contracts, then the `Scheduler`, then the reactor and process managers, as described
   above, and call `election.stop()` last. It releases the lock, so another node takes over straight away.
 
@@ -1721,7 +1728,9 @@ failure in a specific spot to show up.
 
 - **Replays repeat finished work.** A scheduler recognises a reaction id only while its work is pending. Moving the
   reactor's position back, or a crash between queueing work and saving the position after the work has already
-  run, runs it again. `handle` must be idempotent.
+  run, runs it again. `handle` must be idempotent. In an ordered event policy the re-run can come after the
+  aggregate's later work, so ordered work that writes state should also guard on the event's sequence (see
+  [Ordered event policies](#ordered-event-policies)).
 - **An event policy's blocks must be deterministic.** Reaction ids number an event's triggers by their position in the
   block's output, so a re-read event is only recognised if the block returns the same triggers, in the same
   order.

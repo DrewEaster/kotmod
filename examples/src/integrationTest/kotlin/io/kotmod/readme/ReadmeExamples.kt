@@ -290,6 +290,7 @@ sealed interface OrderStatusChange
 data class StatusChanged(
     val orderId: String,
     val status: String,
+    val sequence: Long,
 ) : OrderStatusChange
 
 class OrderStatusProjection(
@@ -306,7 +307,7 @@ class OrderStatusProjection(
                     is OrderShipped -> "shipped"
                     is OrderCancelled -> "cancelled"
                 }
-            trigger(StatusChanged(metadata.aggregateId.value, status))
+            trigger(StatusChanged(metadata.aggregateId.value, status, metadata.sequence))
         }
     }
 
@@ -316,21 +317,21 @@ class OrderStatusProjection(
         trigger: OrderStatusChange,
         context: ReactionContext,
     ) = when (trigger) {
-        is StatusChanged -> saveStatus(trigger.orderId, trigger.status)
+        is StatusChanged -> saveStatus(trigger)
     }
 
-    private fun saveStatus(
-        orderId: String,
-        status: String,
-    ) {
+    // Writes only if the stored status came from an earlier event, so a stale re-run can't overwrite a newer one.
+    private fun saveStatus(change: StatusChanged) {
         jdbc.withConnection { conn ->
             conn
                 .prepareStatement(
-                    "INSERT INTO order_status (id, status) VALUES (?, ?) " +
-                        "ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status",
+                    "INSERT INTO order_status (id, status, sequence) VALUES (?, ?, ?) " +
+                        "ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, sequence = EXCLUDED.sequence " +
+                        "WHERE order_status.sequence < EXCLUDED.sequence",
                 ).use { ps ->
-                    ps.setString(1, orderId)
-                    ps.setString(2, status)
+                    ps.setString(1, change.orderId)
+                    ps.setString(2, change.status)
+                    ps.setLong(3, change.sequence)
                     ps.executeUpdate()
                 }
         }
