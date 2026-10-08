@@ -35,7 +35,6 @@ import io.kotmod.support.OrderPlaced
 import io.kotmod.support.testOrders
 import kotlinx.serialization.Serializable
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.withTimeout
 import java.util.concurrent.CopyOnWriteArrayList
 import javax.sql.DataSource
 import kotlin.time.Clock
@@ -251,17 +250,17 @@ fun JdbcContext.reactionRowIds(queue: String): List<String> =
 
 /**
  * Runs [change] (an operator tool), trying again while it is refused because the work is running at that moment, as
- * an operator would.
+ * an operator would. Any other failure is rethrown; so is the last refusal if it is still refused after 10 seconds.
  */
 suspend fun retryWhileRunning(change: suspend () -> Unit) {
-    withTimeout(10.seconds) {
-        while (true) {
-            try {
-                change()
-                return@withTimeout
-            } catch (e: IllegalStateException) {
-                delay(100)
-            }
+    val until = Clock.System.now() + 10.seconds
+    while (true) {
+        try {
+            change()
+            return
+        } catch (e: IllegalStateException) {
+            if (e.message?.contains("is running") != true || Clock.System.now() >= until) throw e
+            delay(100)
         }
     }
 }

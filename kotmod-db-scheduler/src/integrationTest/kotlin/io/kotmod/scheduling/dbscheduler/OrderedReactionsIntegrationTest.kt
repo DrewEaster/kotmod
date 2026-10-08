@@ -14,6 +14,7 @@ import io.kotmod.reaction.Retry
 import io.kotmod.support.OrderShipped
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -281,9 +282,11 @@ class OrderedReactionsIntegrationTest : IntegrationTest() {
                 (1..10L).forEach { jdbc.appendOrderEvent("e-$it", "a", it) }
                 // Sample while the line drains: a row db-scheduler hasn't picked is the line's front, waiting to run. (The
                 // running front's own picked row is removed just after it schedules its successor.)
-                while (log.ends() < 10) {
-                    waitingRows += scheduler.lineInstances("ordered", "Order/a").size
-                    delay(10)
+                withTimeout(20.seconds) {
+                    while (log.ends() < 10) {
+                        waitingRows += scheduler.lineInstances("ordered", "Order/a").size
+                        delay(10)
+                    }
                 }
             }
 
@@ -320,6 +323,7 @@ class OrderedReactionsIntegrationTest : IntegrationTest() {
                 eventually { failures.get() >= 2 && listOf("ordered/e-1/mapping", "ordered/e-2/0", "ordered/e-3/0") == jdbc.reactionRowIds("ordered") }
                 delay(500)
                 assertTrue(log.events.isEmpty(), "the aggregate's later work waits behind its parked mapping")
+                // An empty list is accepted on purpose: the front may be picked (running) as we sample, and picked rows aren\'t listed.
                 assertTrue(
                     scheduler.lineInstances("ordered", "Order/a").all { it == "line/Order/a/ordered/e-1/mapping" },
                     "only the front, the parked mapping, is scheduled",
