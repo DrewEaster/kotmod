@@ -304,6 +304,40 @@ class ReactionQueueOrderedTest {
         }
 
     @Test
+    fun `the reactor adding work while the front runs never strands the line`(): Unit =
+        runBlocking {
+            val queue = queue().started()
+            queue.publishOrdered(listOf(item("e5", 5)))
+            val started = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            behaviour["e5"] = {
+                started.complete(Unit)
+                release.await()
+                ItemResult.Completed
+            }
+            val scheduled = mutableListOf<String>()
+            tasks.beforeSchedule = { scheduled += it }
+            val delivery = async { tasks.deliverNext() }
+            started.await()
+
+            // The reactor adds e6 while e5 runs: it sees e5 as the front, and its schedule of e5's name is ignored
+            // because e5's task is still pending.
+            queue.publishOrdered(listOf(item("e6", 6)))
+            assertEquals(listOf(front("e5")), scheduled)
+            assertEquals(listOf(front("e5")), tasks.pending.map { it.name })
+
+            // e5 finishes: its locked step must find e6 and schedule it, or nothing ever would.
+            release.complete(Unit)
+            assertEquals(TaskOutcome.Done, delivery.await())
+            assertEquals(listOf(front("e6")), tasks.pending.map { it.name })
+
+            tasks.deliverAll()
+            assertEquals(listOf("e5", "e6"), handled())
+            assertTrue(tasks.pending.isEmpty())
+            assertTrue(rows.rows("q").isEmpty())
+        }
+
+    @Test
     fun `a line's front task still runs after its policy stops being ordered`(): Unit =
         runBlocking {
             queue().publishOrdered(listOf(item("e5", 5)))
