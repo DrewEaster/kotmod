@@ -97,7 +97,7 @@ class EventPolicyFailuresIntegrationTest : IntegrationTest() {
                 eventually { "projection/e-2/0" in jdbc.reactionRowIds("projection") }
                 delay(1_000)
                 assertTrue(projection.seen.forOrder("o-1").isEmpty(), "o-1 waits behind its parked event")
-                // An empty list is accepted on purpose: the front may be picked (running) as we sample, and picked rows aren\'t listed.
+                // An empty list is accepted on purpose: the front may be picked (running) as we sample, and picked rows aren't listed.
                 assertTrue(
                     scheduler.lineInstances("projection", "Order/o-1").all { it == "line/Order/o-1/projection/e-1/mapping" },
                     "only o-1's front, its parked mapping, is scheduled",
@@ -191,7 +191,7 @@ class EventPolicyFailuresIntegrationTest : IntegrationTest() {
                 eventually { projection.seen.handled.contains(Confirm("o-2", 1)) && projection.seen.failures.isNotEmpty() }
                 eventually { "projection/e-2/0" in jdbc.reactionRowIds("projection") }
                 assertEquals(listOf<Work>(Confirm("o-2", 1)), projection.seen.handled.toList(), "o-1's second event waits behind the failing first")
-                // An empty list is accepted on purpose: the front may be picked (running) as we sample, and picked rows aren\'t listed.
+                // An empty list is accepted on purpose: the front may be picked (running) as we sample, and picked rows aren't listed.
                 assertTrue(
                     scheduler.lineInstances("projection", "Order/o-1").all { it == "line/Order/o-1/projection/e-1/0" },
                     "only o-1's front, the failing first, is scheduled",
@@ -335,7 +335,7 @@ class EventPolicyFailuresIntegrationTest : IntegrationTest() {
                 // Wait for the parked mapping's third attempt, so the next one is 4s away.
                 eventually(15.seconds) { (operations.parkedMappings("projection").singleOrNull()?.attempts ?: 0) >= 3 }
                 assertTrue(projection.seen.handled.isEmpty(), "o-1's second event waits behind the parked first")
-                // An empty list is accepted on purpose: the front may be picked (running) as we sample, and picked rows aren\'t listed.
+                // An empty list is accepted on purpose: the front may be picked (running) as we sample, and picked rows aren't listed.
                 assertTrue(
                     scheduler.lineInstances("projection", "Order/o-1").all { it == "line/Order/o-1/projection/e-1/mapping" },
                     "only o-1's front, its parked mapping, is scheduled",

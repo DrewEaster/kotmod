@@ -20,7 +20,12 @@ interface TaskScheduler {
 interface TaskQueue {
     /**
      * Runs [payload] as task [name] at [at] or later, unless a task named [name] is already pending in this queue (then
-     * it does nothing). A backend may also refuse a name that finished recently; kotmod never reuses a finished name.
+     * it does nothing).
+     *
+     * kotmod sometimes schedules a name again after its earlier task finished: an operator's
+     * `ReactionOperations.retryBlocked` and the repair sweep schedule a line's front under its usual name. A backend
+     * must accept that (db-scheduler does). A backend that refuses recently finished names (such as Cloud Tasks) must
+     * still make such a schedule succeed, for example by deriving a unique name.
      */
     suspend fun schedule(
         name: String,

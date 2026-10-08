@@ -323,7 +323,7 @@ class OrderedReactionsIntegrationTest : IntegrationTest() {
                 eventually { failures.get() >= 2 && listOf("ordered/e-1/mapping", "ordered/e-2/0", "ordered/e-3/0") == jdbc.reactionRowIds("ordered") }
                 delay(500)
                 assertTrue(log.events.isEmpty(), "the aggregate's later work waits behind its parked mapping")
-                // An empty list is accepted on purpose: the front may be picked (running) as we sample, and picked rows aren\'t listed.
+                // An empty list is accepted on purpose: the front may be picked (running) as we sample, and picked rows aren't listed.
                 assertTrue(
                     scheduler.lineInstances("ordered", "Order/a").all { it == "line/Order/a/ordered/e-1/mapping" },
                     "only the front, the parked mapping, is scheduled",
