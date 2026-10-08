@@ -1,4 +1,4 @@
-package io.kotmod.event.reaction.dbscheduler
+package io.kotmod.scheduling.dbscheduler
 
 import io.kotmod.EventLogPosition
 import io.kotmod.event.reaction.ReactionOrdering
@@ -137,7 +137,7 @@ class EventPolicyReactionsIntegrationTest : IntegrationTest() {
             runningReactor(dataSource, jdbc, listOf(reminders)) { scheduler, _ ->
                 jdbc.appendOrderEvent("e-1", "o-1", 1)
                 eventually { mappingFailed.get() } // the mapping really failed first, so it was parked
-                eventually { scheduler.getScheduledExecutionsForTask("reminders", String::class.java).any { it.taskInstance.id == "reminders/e-1/0" } }
+                eventually { "reminders/e-1/0" in scheduler.instanceIds("reminders") }
                 assertTrue(mappingCalls.get() >= 2, "the parked mapping was retried")
                 assertTrue(reminders.seen.contexts.isEmpty(), "ran before notBefore")
                 eventually(10.seconds) { reminders.seen.handled.isNotEmpty() }

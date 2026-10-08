@@ -1,4 +1,4 @@
-package io.kotmod.event.reaction.dbscheduler
+package io.kotmod.scheduling.dbscheduler
 
 import io.kotmod.AggregateId
 import io.kotmod.AggregateManager
@@ -194,7 +194,7 @@ class ProcessManagerIntegrationTest : IntegrationTest() {
         viaContract: Boolean = false,
         block: suspend () -> Unit,
     ) {
-        val queues = DbSchedulerQueues(jdbc)
+        val tasks = DbSchedulerTaskScheduler()
         val offsets = PostgresOffsetManager(jdbc)
         val windows =
             ProcessManager(
@@ -215,7 +215,7 @@ class ProcessManagerIntegrationTest : IntegrationTest() {
                     }
                 },
                 targets = listOf(target(orders) { _, rejection -> ReleaseBlocked(rejection) }),
-                queues = queues,
+                scheduler = tasks,
                 inputOrdering = ReactionOrdering.PerAggregate(),
                 getPosition = { offsets.getPosition("windows", StartFrom.Beginning) },
                 savePosition = { offsets.savePosition("windows", it) },
@@ -233,8 +233,8 @@ class ProcessManagerIntegrationTest : IntegrationTest() {
             } else {
                 null
             }
-        val scheduler = testScheduler(dataSource, *queues.tasks.toTypedArray())
-        queues.bind(scheduler)
+        val scheduler = testScheduler(dataSource, tasks.tasks)
+        tasks.bind(scheduler)
         windows.start()
         contract?.start()
         scheduler.start()

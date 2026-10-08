@@ -1,4 +1,4 @@
-package io.kotmod.event.reaction.dbscheduler
+package io.kotmod.scheduling.dbscheduler
 
 import com.github.kagkarlsson.scheduler.task.ExecutionComplete
 import com.github.kagkarlsson.scheduler.task.ExecutionOperations
@@ -8,8 +8,8 @@ import kotlin.time.Duration
 import kotlin.time.toJavaDuration
 
 /**
- * Retries task executions that failed outside the reaction handler (e.g. unreadable task data), doubling
- * the delay from [initialDelay] up to [maximumDelay] and never giving up.
+ * Retries task executions that threw (the subscribed handler failed, e.g. its database was down), doubling the delay
+ * from [initialDelay] up to [maximumDelay] and never giving up.
  */
 internal class CappedExponentialBackoffFailureHandler(
     private val initialDelay: Duration,
@@ -24,7 +24,7 @@ internal class CappedExponentialBackoffFailureHandler(
         val execution = executionComplete.execution
         val delay = delayFor(execution.consecutiveFailures)
         log.error(
-            "Event reaction task {} instance {} failed outside its handler; retrying in {} [consecutiveFailures={}]",
+            "Task {} instance {} failed; retrying in {} [consecutiveFailures={}]",
             execution.taskName,
             execution.id,
             delay,

@@ -1,6 +1,5 @@
-package io.kotmod.event.reaction.dbscheduler
+package io.kotmod.scheduling.dbscheduler
 
-import com.github.kagkarlsson.scheduler.Scheduler
 import io.kotmod.EventId
 import io.kotmod.EventLogPosition
 import io.kotmod.event.reaction.EventReactionId
@@ -16,8 +15,6 @@ import io.kotmod.reaction.Retry
 import io.kotmod.support.OrderShipped
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
-import kotlinx.serialization.json.int
-import kotlinx.serialization.json.jsonPrimitive
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
@@ -38,8 +35,6 @@ import kotlin.time.Duration.Companion.seconds
 class EventPolicyFailuresIntegrationTest : IntegrationTest() {
     private fun Seen.forOrder(orderId: String) = handled.filter { it is Confirm && it.orderId == orderId }
 
-    private fun Scheduler.instanceIds(policy: String) = getScheduledExecutionsForTask(policy, String::class.java).map { it.taskInstance.id }
-
     private fun reactorOffset() = PostgresOffsetManager(jdbc).getPosition("reactor").globalOffset
 
     @Test
@@ -57,18 +52,18 @@ class EventPolicyFailuresIntegrationTest : IntegrationTest() {
                     trigger(Confirm(m.aggregateId.value, m.sequence))
                 })
 
-            runningReactor(dataSource, jdbc, listOf(emails, audits)) { scheduler, _ ->
+            runningReactor(dataSource, jdbc, listOf(emails, audits)) { _, operations ->
                 jdbc.appendOrderEvent("e-1", "o-1", 1)
                 jdbc.appendOrderEvent("e-2", "o-2", 1)
                 eventually { emails.seen.handled.size == 2 && audits.seen.forOrder("o-2").isNotEmpty() && reactorOffset() == 2L }
                 eventually { failures.get() >= 2 } // the reader's attempt, then the parked mapping's own retry
-                assertNotNull(scheduler.parkedMapping("audits", "e-1"), "the failure is parked in audits")
-                assertNull(scheduler.parkedMapping("emails", "e-1"), "and only in audits")
+                assertNotNull(operations.parked("audits", "e-1"), "the failure is parked in audits")
+                assertNull(operations.parked("emails", "e-1"), "and only in audits")
                 assertTrue(audits.seen.forOrder("o-1").isEmpty())
 
                 fixed.set(true)
                 eventually(15.seconds) { audits.seen.forOrder("o-1").isNotEmpty() }
-                eventually { scheduler.parkedMapping("audits", "e-1") == null }
+                eventually { operations.parked("audits", "e-1") == null }
                 delay(500)
             }
 
@@ -92,16 +87,20 @@ class EventPolicyFailuresIntegrationTest : IntegrationTest() {
                     trigger(Confirm(m.aggregateId.value, m.sequence))
                 })
 
-            runningReactor(dataSource, jdbc, listOf(projection)) { scheduler, _ ->
+            runningReactor(dataSource, jdbc, listOf(projection)) { scheduler, operations ->
                 jdbc.appendOrderEvent("e-1", "o-1", 1)
                 jdbc.appendOrderEvent("e-2", "o-1", 2, OrderShipped("book"))
                 jdbc.appendOrderEvent("e-3", "o-2", 1)
                 eventually { projection.seen.forOrder("o-2").isNotEmpty() }
                 // e-1 is parked and e-2's trigger is queued behind it, still failing.
-                eventually { failures.get() >= 2 && scheduler.parkedMapping("projection", "e-1") != null }
-                eventually { scheduler.instanceIds("projection").any { it.endsWith("projection/e-2/0") } }
-                delay(1_000) // several rechecks of e-2's trigger
+                eventually { failures.get() >= 2 && operations.parked("projection", "e-1") != null }
+                eventually { "projection/e-2/0" in jdbc.reactionRowIds("projection") }
+                delay(1_000)
                 assertTrue(projection.seen.forOrder("o-1").isEmpty(), "o-1 waits behind its parked event")
+                assertTrue(
+                    scheduler.lineInstances("projection", "Order/o-1").all { it == "line/Order/o-1/projection/e-1/mapping" },
+                    "only o-1's front, its parked mapping, is scheduled",
+                )
 
                 fixed.set(true)
                 eventually(20.seconds) { projection.seen.forOrder("o-1").size == 2 }
@@ -122,17 +121,17 @@ class EventPolicyFailuresIntegrationTest : IntegrationTest() {
                 })
             val emails = OrderWork("emails")
 
-            runningReactor(dataSource, jdbc, listOf(broken, emails)) { scheduler, queues ->
+            runningReactor(dataSource, jdbc, listOf(broken, emails)) { _, operations ->
                 jdbc.appendOrderEvent("e-1", "o-1", 1)
-                eventually(15.seconds) { (scheduler.parkedMapping("broken", "e-1")?.get("retryCount")?.jsonPrimitive?.int ?: 0) >= 2 }
+                eventually(15.seconds) { (operations.parked("broken", "e-1")?.attempts ?: 0) >= 2 }
                 assertTrue(attempts.get() >= 3, "the reader's attempt and at least two retries of the parked mapping")
-                assertNotNull(scheduler.parkedMapping("broken", "e-1"), "still parked: never dropped")
+                assertNotNull(operations.parked("broken", "e-1"), "still parked: never dropped")
                 assertEquals(
                     listOf(EventId("e-1") to EventReactionId("broken/e-1/mapping")),
-                    queues.parkedMappings(scheduler, "broken").map { it.eventId to it.reactionId },
+                    operations.parkedMappings("broken").map { it.eventId to it.reactionId },
                 )
-                assertTrue(queues.parkedMappings(scheduler, "broken").single().retryCount >= 2)
-                assertTrue(queues.parkedMappings(scheduler, "emails").isEmpty())
+                assertTrue(operations.parkedMappings("broken").single().attempts >= 2)
+                assertTrue(operations.parkedMappings("emails").isEmpty())
                 assertEquals(1, emails.seen.handled.size)
             }
 
@@ -154,13 +153,14 @@ class EventPolicyFailuresIntegrationTest : IntegrationTest() {
                 })
             val offsets = PostgresOffsetManager(jdbc)
 
-            runningReactor(dataSource, jdbc, listOf(audits)) { scheduler, _ ->
+            runningReactor(dataSource, jdbc, listOf(audits)) { scheduler, operations ->
                 jdbc.appendOrderEvent("e-1", "o-1", 1)
-                eventually { scheduler.parkedMapping("audits", "e-1") != null && reactorOffset() == 1L }
+                eventually { operations.parked("audits", "e-1") != null && reactorOffset() == 1L }
                 val before = failures.get()
                 offsets.savePosition("reactor", EventLogPosition.START) // as if the reader crashed before saving its position
                 eventually { reactorOffset() == 1L && failures.get() > before } // the reader really read e-1 again
-                assertEquals(1, scheduler.instanceIds("audits").count { it.endsWith("audits/e-1/mapping") }, "parked once")
+                assertEquals(listOf("audits/e-1/mapping"), jdbc.reactionRowIds("audits"), "parked once")
+                assertTrue(scheduler.instanceIds("audits").count { it.endsWith("audits/e-1/mapping") } <= 1, "scheduled once")
 
                 fixed.set(true)
                 eventually(15.seconds) { audits.seen.handled.isNotEmpty() && scheduler.instanceIds("audits").isEmpty() }
@@ -188,8 +188,12 @@ class EventPolicyFailuresIntegrationTest : IntegrationTest() {
                 jdbc.appendOrderEvent("e-2", "o-1", 2, OrderShipped("book"))
                 jdbc.appendOrderEvent("e-3", "o-2", 1)
                 eventually { projection.seen.handled.contains(Confirm("o-2", 1)) && projection.seen.failures.isNotEmpty() }
-                eventually { scheduler.instanceIds("projection").any { it.endsWith("projection/e-2/0") } }
+                eventually { "projection/e-2/0" in jdbc.reactionRowIds("projection") }
                 assertEquals(listOf<Work>(Confirm("o-2", 1)), projection.seen.handled.toList(), "o-1's second event waits behind the failing first")
+                assertTrue(
+                    scheduler.lineInstances("projection", "Order/o-1").all { it == "line/Order/o-1/projection/e-1/0" },
+                    "only o-1's front, the failing first, is scheduled",
+                )
 
                 failing.set(false)
                 eventually(15.seconds) { projection.seen.handled.size == 3 && emails.seen.handled.size == 3 }
@@ -214,12 +218,13 @@ class EventPolicyFailuresIntegrationTest : IntegrationTest() {
                 })
             val emails = OrderWork("emails")
 
-            runningReactor(dataSource, jdbc, listOf(projection, emails)) { scheduler, _ ->
+            runningReactor(dataSource, jdbc, listOf(projection, emails)) { scheduler, operations ->
                 jdbc.appendOrderEvent("e-1", "o-1", 1)
                 jdbc.appendOrderEvent("e-2", "o-2", 1)
                 eventually { emails.seen.handled.size == 2 && reactorOffset() == 2L }
-                eventually { scheduler.parkedMapping("projection", "e-1") != null && scheduler.parkedMapping("projection", "e-2") != null }
+                eventually { operations.parked("projection", "e-1") != null && operations.parked("projection", "e-2") != null }
                 assertTrue(scheduler.instanceIds("projection").all { it.endsWith("/mapping") }, "no delayed trigger was queued")
+                assertTrue(jdbc.reactionRowIds("projection").all { it.endsWith("/mapping") }, "no delayed trigger was queued")
             }
 
             assertTrue(projection.seen.contexts.isEmpty())
@@ -261,21 +266,23 @@ class EventPolicyFailuresIntegrationTest : IntegrationTest() {
                     decide = { _, _, _ -> GiveUp },
                 )
 
-            runningReactor(dataSource, jdbc, listOf(projection)) { scheduler, queues ->
+            runningReactor(dataSource, jdbc, listOf(projection)) { scheduler, operations ->
                 jdbc.appendOrderEvent("e-1", "o-1", 1)
                 jdbc.appendOrderEvent("e-2", "o-1", 2, OrderShipped("book"))
                 jdbc.appendOrderEvent("e-3", "o-2", 1)
-                eventually { queues.blockedReactions(scheduler, "projection").isNotEmpty() }
+                eventually { operations.blockedReactions("projection").isNotEmpty() }
                 eventually { projection.seen.handled.contains(Confirm("o-2", 1)) } // another aggregate still flows
-                delay(1_000) // several rechecks of e-2's reaction
+                eventually { "projection/e-2/0" in jdbc.reactionRowIds("projection") }
+                delay(1_000)
                 assertEquals(listOf<Work>(Confirm("o-2", 1)), projection.seen.handled.toList(), "o-1's second event waits behind the blocked first")
-                assertEquals(listOf(EventReactionId("projection/e-1/0")), queues.blockedReactions(scheduler, "projection").map { it.reactionId })
+                assertEquals(emptyList(), scheduler.lineInstances("projection", "Order/o-1"), "a blocked line has nothing scheduled")
+                assertEquals(listOf(EventReactionId("projection/e-1/0")), operations.blockedReactions("projection").map { it.reactionId })
                 assertIs<ReactionResult.GaveUp>(projection.seen.completions.single { it.first == Confirm("o-1", 1) }.second)
 
                 failing.set(false)
-                queues.retryBlocked(scheduler, "projection", EventReactionId("projection/e-1/0"))
+                operations.retryBlocked("projection", EventReactionId("projection/e-1/0"))
                 eventually(10.seconds) { projection.seen.handled.size == 3 }
-                assertTrue(queues.blockedReactions(scheduler, "projection").isEmpty())
+                assertTrue(operations.blockedReactions("projection").isEmpty())
             }
 
             assertEquals(listOf<Work>(Confirm("o-1", 1), Confirm("o-1", 2)), projection.seen.forOrder("o-1"))
@@ -292,15 +299,16 @@ class EventPolicyFailuresIntegrationTest : IntegrationTest() {
                     decide = { _, _, _ -> GiveUp },
                 )
 
-            runningReactor(dataSource, jdbc, listOf(projection)) { scheduler, queues ->
+            runningReactor(dataSource, jdbc, listOf(projection)) { scheduler, operations ->
                 jdbc.appendOrderEvent("e-1", "o-1", 1)
                 jdbc.appendOrderEvent("e-2", "o-1", 2, OrderShipped("book"))
-                eventually { queues.blockedReactions(scheduler, "projection").isNotEmpty() }
-                eventually { scheduler.instanceIds("projection").any { it.endsWith("projection/e-2/0") } }
-                delay(1_000) // e-2's reaction is queued and rechecked, but held back
+                eventually { operations.blockedReactions("projection").isNotEmpty() }
+                eventually { "projection/e-2/0" in jdbc.reactionRowIds("projection") }
+                delay(1_000) // e-2's reaction is queued, but held back
                 assertTrue(projection.seen.handled.isEmpty(), "o-1's second event waits behind the blocked first")
+                assertEquals(emptyList(), scheduler.instanceIds("projection"), "a blocked line has nothing scheduled")
 
-                queues.skipBlocked(scheduler, "projection", EventReactionId("projection/e-1/0"))
+                operations.skipBlocked("projection", EventReactionId("projection/e-1/0"))
                 eventually(10.seconds) { projection.seen.handled.isNotEmpty() && scheduler.instanceIds("projection").isEmpty() }
                 delay(500)
             }
@@ -318,16 +326,21 @@ class EventPolicyFailuresIntegrationTest : IntegrationTest() {
                     trigger(Confirm(m.aggregateId.value, m.sequence))
                 })
 
-            runningReactor(dataSource, jdbc, listOf(projection)) { scheduler, queues ->
+            runningReactor(dataSource, jdbc, listOf(projection)) { scheduler, operations ->
                 jdbc.appendOrderEvent("e-1", "o-1", 1)
                 jdbc.appendOrderEvent("e-2", "o-1", 2, OrderShipped("book"))
-                eventually { scheduler.instanceIds("projection").any { it.endsWith("projection/e-2/0") } }
-                // Wait for the parked mapping's second retry, so the next one is 4s away and it isn't running when skipped.
-                eventually(15.seconds) { (queues.parkedMappings(scheduler, "projection").singleOrNull()?.retryCount ?: 0) >= 2 }
+                eventually { "projection/e-2/0" in jdbc.reactionRowIds("projection") }
+                // Wait for the parked mapping's third attempt, so the next one is 4s away.
+                eventually(15.seconds) { (operations.parkedMappings("projection").singleOrNull()?.attempts ?: 0) >= 3 }
                 assertTrue(projection.seen.handled.isEmpty(), "o-1's second event waits behind the parked first")
-                assertEquals(EventReactionId("projection/e-1/mapping"), queues.parkedMappings(scheduler, "projection").single().reactionId)
+                assertTrue(
+                    scheduler.lineInstances("projection", "Order/o-1").all { it == "line/Order/o-1/projection/e-1/mapping" },
+                    "only o-1's front, its parked mapping, is scheduled",
+                )
+                assertEquals(EventReactionId("projection/e-1/mapping"), operations.parkedMappings("projection").single().reactionId)
 
-                queues.skipParked(scheduler, "projection", EventId("e-1"))
+                // Refused while the third attempt is still running, so tried again as an operator would.
+                retryWhileRunning { operations.skipParked("projection", EventId("e-1")) }
                 eventually(10.seconds) { projection.seen.handled.isNotEmpty() && scheduler.instanceIds("projection").isEmpty() }
                 delay(500)
             }

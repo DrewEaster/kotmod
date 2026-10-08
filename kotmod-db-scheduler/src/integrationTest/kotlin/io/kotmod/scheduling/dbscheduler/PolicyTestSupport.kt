@@ -1,4 +1,4 @@
-package io.kotmod.event.reaction.dbscheduler
+package io.kotmod.scheduling.dbscheduler
 
 import com.github.kagkarlsson.scheduler.Scheduler
 import io.kotmod.AggregateId
@@ -20,6 +20,8 @@ import io.kotmod.postgres.PostgresOffsetManager
 import io.kotmod.postgres.StartFrom
 import io.kotmod.postgres.support.orderEventSerialization
 import io.kotmod.reaction.EventReactor
+import io.kotmod.reaction.ParkedMapping
+import io.kotmod.reaction.ReactionOperations
 import io.kotmod.reaction.FailureDecision
 import io.kotmod.reaction.ReactionContext
 import io.kotmod.reaction.ReactionResult
@@ -32,9 +34,8 @@ import io.kotmod.support.OrderEvent
 import io.kotmod.support.OrderPlaced
 import io.kotmod.support.testOrders
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.jsonObject
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
 import java.util.concurrent.CopyOnWriteArrayList
 import javax.sql.DataSource
 import kotlin.time.Clock
@@ -196,25 +197,26 @@ fun paymentContract(jdbc: JdbcContext): PublicEventContract<PaymentEvent, Custom
 
 /**
  * Registers [policies] on one reactor and one scheduler, starts them in the documented order (reactor, contract,
- * scheduler), runs [block], then stops them in reverse. Events appended inside [block] are seen; earlier ones are not.
+ * scheduler), runs [block] with the scheduler and the operator tools, then stops them in reverse. Events appended
+ * inside [block] are seen; earlier ones are not.
  */
 suspend fun runningReactor(
     dataSource: DataSource,
     jdbc: JdbcContext,
     policies: List<OrderWork>,
     contract: PublicEventContract<*, *>? = null,
-    block: suspend (scheduler: Scheduler, queues: DbSchedulerQueues) -> Unit,
+    block: suspend (scheduler: Scheduler, operations: ReactionOperations) -> Unit,
 ) {
-    val queues = DbSchedulerQueues(jdbc, orderedRecheckDelay = 200.milliseconds)
-    val reactor = EventReactor(jdbc, queues, isLeader = { true }, pollInterval = 50.milliseconds)
+    val tasks = DbSchedulerTaskScheduler()
+    val reactor = EventReactor(jdbc, tasks, isLeader = { true }, pollInterval = 50.milliseconds)
     policies.forEach { reactor.register(it) }
-    val scheduler = testScheduler(dataSource, *queues.tasks.toTypedArray())
-    queues.bind(scheduler)
+    val scheduler = testScheduler(dataSource, tasks.tasks)
+    tasks.bind(scheduler)
     reactor.start()
     contract?.start()
     scheduler.start()
     try {
-        block(scheduler, queues)
+        block(scheduler, ReactionOperations(jdbc, tasks))
     } finally {
         scheduler.stop()
         contract?.stop()
@@ -222,14 +224,44 @@ suspend fun runningReactor(
     }
 }
 
-/**
- * The stored data (as JSON, since the task-data class is internal to the module) of [policy]'s parked mapping of
- * [eventId], while it is still queued.
- */
-fun Scheduler.parkedMapping(
+/** [policy]'s parked mapping of event [eventId], while it is still parked. */
+fun ReactionOperations.parked(
     policy: String,
     eventId: String,
-): JsonObject? =
-    getScheduledExecutionsForTask(policy, String::class.java)
-        .firstOrNull { it.taskInstance.id.endsWith("$policy/$eventId/mapping") }
-        ?.let { Json.parseToJsonElement(it.data as String).jsonObject }
+): ParkedMapping? = parkedMappings(policy).singleOrNull { it.eventId == EventId(eventId) }
+
+/** The pending (not running) instances of [policy]'s task for aggregate line [key] (`<aggregateType>/<aggregateId>`). */
+fun Scheduler.lineInstances(
+    policy: String,
+    key: String,
+): List<String> = instanceIds(policy).filter { it.startsWith("line/$key/") }
+
+/** The ids of [queue]'s rows in `ddd_reaction_row`, by line and place in line. */
+fun JdbcContext.reactionRowIds(queue: String): List<String> =
+    withConnection { conn ->
+        conn
+            .prepareStatement(
+                "SELECT reaction_id FROM ddd_reaction_row WHERE queue_name = ? " +
+                    "ORDER BY line_key NULLS LAST, line_sequence, line_ordinal, reaction_id",
+            ).use { ps ->
+                ps.setString(1, queue)
+                ps.executeQuery().use { rs -> generateSequence { if (rs.next()) rs.getString(1) else null }.toList() }
+            }
+    }
+
+/**
+ * Runs [change] (an operator tool), trying again while it is refused because the work is running at that moment, as
+ * an operator would.
+ */
+suspend fun retryWhileRunning(change: suspend () -> Unit) {
+    withTimeout(10.seconds) {
+        while (true) {
+            try {
+                change()
+                return@withTimeout
+            } catch (e: IllegalStateException) {
+                delay(100)
+            }
+        }
+    }
+}

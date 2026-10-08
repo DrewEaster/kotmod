@@ -1,4 +1,4 @@
-package io.kotmod.event.reaction.dbscheduler
+package io.kotmod.scheduling.dbscheduler
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
