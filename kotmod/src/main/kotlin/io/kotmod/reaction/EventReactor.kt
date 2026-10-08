@@ -5,6 +5,7 @@ import io.kotmod.EventId
 import io.kotmod.EventLogPosition
 import io.kotmod.PersistedEvent
 import io.kotmod.event.reaction.ReactionRows
+import io.kotmod.event.reaction.rethrowIfCancelled
 import io.kotmod.jdbc.JdbcContext
 import io.kotmod.outbox.DomainEventPoller
 import io.kotmod.postgres.PostgresDomainPollingBackend
@@ -173,6 +174,7 @@ class EventReactor internal constructor(
             try {
                 runtime.sweep(sweepIdle)
             } catch (e: Exception) {
+                rethrowIfCancelled(e)
                 log.warn("Repair sweep of event policy {} failed; trying again next time", runtime.policy.name, e)
             }
         }

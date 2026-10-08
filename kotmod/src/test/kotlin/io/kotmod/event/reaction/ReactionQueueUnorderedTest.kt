@@ -66,6 +66,17 @@ class ReactionQueueUnorderedTest {
         }
 
     @Test
+    fun `Blocked on unordered work finishes it, since it has no line to block`(): Unit =
+        runBlocking {
+            val queue = queue()
+            queue.publish(Produced(EventReactionId("r-1"), "hello"))
+            queue.startWith { ItemResult.Blocked }
+            assertEquals(listOf<TaskOutcome>(TaskOutcome.Done), scheduler.queue("q").deliverAll())
+            assertEquals(1, seen.size)
+            assertTrue(scheduler.queue("q").pending.isEmpty())
+        }
+
+    @Test
     fun `publishing the same id while pending queues it once`(): Unit =
         runBlocking {
             val queue = queue()

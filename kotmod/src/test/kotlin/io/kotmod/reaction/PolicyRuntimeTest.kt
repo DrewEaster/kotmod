@@ -192,6 +192,26 @@ class PolicyRuntimeTest {
         }
 
     @Test
+    fun `a policy switched from unordered to BlockAggregate gives up on its pending unordered work once`() =
+        runBlocking {
+            val before = runtime(RecordingPolicy())
+            before.send(Confirm("a1"))
+            before.stop()
+            val after =
+                RecordingPolicy(ordering = ReactionOrdering.PerAggregate(OnGiveUp.BlockAggregate)).apply {
+                    failWith = { _, _ -> RuntimeException("down") }
+                    decide = { _, _, _ -> GiveUp }
+                }
+            runtime(after)
+
+            assertEquals(listOf<TaskOutcome>(TaskOutcome.Done), queue().deliverAll())
+            assertEquals(1, after.handled.size)
+            assertIs<ReactionResult.GaveUp>(after.completions.single().second)
+            assertTrue(queue().pending.isEmpty())
+            assertTrue(rows.rows("confirmations").isEmpty())
+        }
+
+    @Test
     fun `an ordered policy's ContinueWithNext give-up moves on to its line's next work`() =
         runBlocking {
             val policy =

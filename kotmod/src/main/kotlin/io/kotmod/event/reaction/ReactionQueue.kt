@@ -13,13 +13,20 @@ import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import org.slf4j.LoggerFactory
 import kotlin.time.Clock
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 
-/** Added to an item's timeout to give its lease: how long a started ordered item is protected from a duplicate run. */
+private val log = LoggerFactory.getLogger(ReactionQueue::class.java)
+
+/**
+ * Added to an item's timeout to give its lease: how long a started ordered item is protected from a duplicate run. The
+ * lease also covers the policy's `onFailure` and `onCompletion`, which run outside the timeout, so they must be quick.
+ */
 internal val LEASE_MARGIN: Duration = 30.seconds
+
 
 /** One delivery of [item], recognised by [id]; [attempt] counts earlier attempts, from 0. */
 internal data class Delivery<T>(
@@ -54,7 +61,7 @@ internal sealed interface ItemResult<out T> {
         val delay: Duration,
     ) : ItemResult<Nothing>
 
-    /** Gave up and holds back its line until an operator acts (ordered only). */
+    /** Gave up and holds back its line until an operator acts. Unordered or kept work has no line, so it just finishes. */
     data object Blocked : ItemResult<Nothing>
 
     /**
@@ -220,7 +227,12 @@ internal class ReactionQueue<T : Any>(
         return when (val result = handle(Delivery(EventReactionId(task.reactionId), decode(task.item), task.attempt))) {
             ItemResult.Completed -> TaskOutcome.Done
             is ItemResult.Retry -> TaskOutcome.RunAgain(clock() + result.delay, ReactionTasks.encode(task.copy(attempt = task.attempt + 1)))
-            ItemResult.Blocked, is ItemResult.Replaced -> error("Unordered reaction ${task.reactionId} in $name can't block or be replaced")
+            // A policy switched to ordered BlockAggregate can give up on work queued while it was unordered.
+            ItemResult.Blocked -> {
+                log.warn("Reaction {} in {} gave up and would block its line, but unordered work has no line to block; finishing it", task.reactionId, name)
+                TaskOutcome.Done
+            }
+            is ItemResult.Replaced -> error("Unordered reaction ${task.reactionId} in $name can't be replaced")
         }
     }
 
@@ -345,7 +357,11 @@ internal class ReactionQueue<T : Any>(
                 io { rows.inQueue(name) { get(row.reactionId)?.let { update(it.copy(attempts = it.attempts + 1)) } } }
                 TaskOutcome.RunAgain(clock() + result.delay, ReactionTasks.encode(task))
             }
-            ItemResult.Blocked -> error("Kept reaction ${row.reactionId} in $name can't block an aggregate")
+            ItemResult.Blocked -> {
+                log.warn("Kept reaction {} in {} would block its line, but kept work has no line to block; finishing it", row.reactionId, name)
+                io { rows.inQueue(name) { delete(row.reactionId) } }
+                TaskOutcome.Done
+            }
         }
     }
 

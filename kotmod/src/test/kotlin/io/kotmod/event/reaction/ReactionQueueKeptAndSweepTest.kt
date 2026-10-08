@@ -52,6 +52,18 @@ class ReactionQueueKeptAndSweepTest {
         }
 
     @Test
+    fun `Blocked on a kept item finishes and deletes it, since it has no line to block`(): Unit =
+        runBlocking {
+            val queue = queue().started()
+            results += ItemResult.Blocked
+            queue.keep(EventReactionId("k1"), "x")
+            assertEquals(TaskOutcome.Done, tasks.deliver("k1"))
+            assertEquals(1, seen.size)
+            assertTrue(rows.rows("q").isEmpty())
+            assertTrue(tasks.pending.isEmpty())
+        }
+
+    @Test
     fun `a kept item's failures are counted in its row`(): Unit =
         runBlocking {
             val queue = queue().started()

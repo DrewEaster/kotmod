@@ -54,6 +54,8 @@ abstract class EventPolicy<T : Any>(
     /**
      * How long one attempt at [handle] may run; longer is a failure, reported to [onFailure] as a [ReactionTimeoutException].
      * A `TimeoutCancellationException` escaping [handle] from the app's own inner `withTimeout` is reported the same way.
+     * [onFailure] and [onCompletion] run outside the timeout; keep them short. An ordered policy's work is protected from
+     * a duplicate run for this timeout plus 30 seconds, and that covers them too.
      */
     open val timeout: Duration = 60.seconds
 

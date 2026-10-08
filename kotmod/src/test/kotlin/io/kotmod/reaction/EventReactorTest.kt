@@ -13,10 +13,14 @@ import io.kotmod.support.OrderPlaced
 import io.kotmod.support.OrderShipped
 import io.kotmod.support.persistedEvent
 import io.kotmod.support.testOrderKind
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import java.util.concurrent.CountDownLatch
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
@@ -351,6 +355,39 @@ class EventReactorTest {
                 setOf(ReactionTasks.frontName("Order/o-9", "b/lost"), ReactionTasks.frontName("Order/o-1", "b/e-1/0")),
                 queue("b").names().toSet(),
             )
+        }
+
+    @Test
+    fun `a shutdown during a sweep cancels the tick instead of being logged as a sweep failure`() =
+        runBlocking<Unit> {
+            val sweeping = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            val slow =
+                object : ReactionRows by rows {
+                    override fun stale(
+                        queue: String,
+                        now: Instant,
+                        before: Instant,
+                    ): List<ReactionRow> {
+                        sweeping.countDown()
+                        release.await()
+                        return emptyList()
+                    }
+                }
+            val reactor = reactor(everyEvent("a"), rows = slow)
+            var finished = false
+
+            val tick =
+                launch(Dispatchers.Default) {
+                    reactor.tickForTest()
+                    finished = true
+                }
+            sweeping.await()
+            tick.cancel()
+            release.countDown()
+            tick.join()
+
+            assertFalse(finished)
         }
 
     @Test
