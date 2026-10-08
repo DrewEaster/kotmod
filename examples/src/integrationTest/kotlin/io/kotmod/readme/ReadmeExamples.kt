@@ -23,7 +23,6 @@ import io.kotmod.Repository
 import io.kotmod.contract.PublicEventContract
 import io.kotmod.event.reaction.OnGiveUp
 import io.kotmod.event.reaction.ReactionOrdering
-import io.kotmod.event.reaction.dbscheduler.DbSchedulerQueues
 import io.kotmod.jdbc.JdbcContext
 import io.kotmod.jdbc.transaction
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
@@ -41,6 +40,9 @@ import io.kotmod.process.transition
 import io.kotmod.reaction.EventReactor
 import io.kotmod.reaction.ReactionContext
 import io.kotmod.reaction.EventPolicy
+import io.kotmod.reaction.ReactionOperations
+import io.kotmod.scheduling.TaskScheduler
+import io.kotmod.scheduling.dbscheduler.DbSchedulerTaskScheduler
 import io.kotmod.serialization.jsonDataSerializationContext
 import io.kotmod.serialization.toEventSerializer
 import kotlinx.serialization.Serializable
@@ -255,28 +257,28 @@ fun startReactions(
     jdbc: JdbcContext,
     election: PostgresLeaderElection,
 ): Pair<EventReactor, Scheduler> {
-    val queues = DbSchedulerQueues(jdbc)
-    val reactor = EventReactor(jdbc, queues, isLeader = election::isLeader)
+    val scheduler = DbSchedulerTaskScheduler()
+    val reactor = EventReactor(jdbc, scheduler, isLeader = election::isLeader)
     reactor.register(OrderNotifications(::sendConfirmation))
     reactor.register(ReviewReminders())
     reactor.register(OrderStatusProjection(jdbc))
-    val scheduler =
+    val dbScheduler =
         Scheduler
-            .create(dataSource, *queues.tasks.toTypedArray())
+            .create(dataSource, *scheduler.tasks.toTypedArray())
             .threads(10)
             .enableImmediateExecution()
             .build()
-    queues.bind(scheduler)
+    scheduler.bind(dbScheduler)
     reactor.start()
-    scheduler.start()
-    return reactor to scheduler
+    dbScheduler.start()
+    return reactor to dbScheduler
 }
 
 fun cancelPendingConfirmation(
-    scheduler: Scheduler,
+    dbScheduler: Scheduler,
     eventId: EventId,
 ) {
-    scheduler.cancel(TaskInstanceId.of("order-notifications", "order-notifications/${eventId.value}/0"))
+    dbScheduler.cancel(TaskInstanceId.of("order-notifications", "order-notifications/${eventId.value}/0"))
 }
 
 // Guide: Ordered event policies
@@ -335,13 +337,14 @@ class OrderStatusProjection(
     }
 }
 
-fun retryBlockedProjection(
-    scheduler: Scheduler,
-    queues: DbSchedulerQueues,
+suspend fun retryBlockedProjection(
+    jdbc: JdbcContext,
+    scheduler: TaskScheduler,
 ) {
-    for (blocked in queues.blockedReactions(scheduler, "order-status-projection")) {
+    val operations = ReactionOperations(jdbc, scheduler)
+    for (blocked in operations.blockedReactions("order-status-projection")) {
         println("${blocked.key} is held back by ${blocked.reactionId.value} at sequence ${blocked.sequence}")
-        queues.retryBlocked(scheduler, "order-status-projection", blocked.reactionId)
+        operations.retryBlocked("order-status-projection", blocked.reactionId)
     }
 }
 
@@ -420,14 +423,14 @@ fun startBilling(
     orderEvents: PublicEventContract<*, OrderPublicEvent>,
     gateway: PaymentGateway,
 ): Scheduler {
-    val queues = DbSchedulerQueues(jdbc)
-    val reactor = EventReactor(jdbc, queues, isLeader = { true }, name = "billing-reactor")
+    val scheduler = DbSchedulerTaskScheduler()
+    val reactor = EventReactor(jdbc, scheduler, isLeader = { true }, name = "billing-reactor")
     reactor.register(CustomerBilling(orderEvents, gateway))
-    val scheduler = Scheduler.create(dataSource, *queues.tasks.toTypedArray()).enableImmediateExecution().build()
-    queues.bind(scheduler)
+    val dbScheduler = Scheduler.create(dataSource, *scheduler.tasks.toTypedArray()).enableImmediateExecution().build()
+    scheduler.bind(dbScheduler)
     reactor.start()
-    scheduler.start()
-    return scheduler
+    dbScheduler.start()
+    return dbScheduler
 }
 
 // Running in production
@@ -444,9 +447,9 @@ fun leaderElection(
 
 fun reactorWithLeaderElection(
     jdbc: JdbcContext,
-    queues: DbSchedulerQueues,
+    scheduler: TaskScheduler,
     election: PostgresLeaderElection,
-): EventReactor = EventReactor(jdbc, queues, isLeader = election::isLeader)
+): EventReactor = EventReactor(jdbc, scheduler, isLeader = election::isLeader)
 
 // Guide: Process managers
 
@@ -554,7 +557,7 @@ fun dispatchDeadlines(
     orders: AggregateManager<Order, OrderCommand, OrderEvent, OrderRejection>,
     deadlines: Repository<DispatchDeadline>,
     deadlineEvents: DataSerializationContext<DispatchDeadlineEvent>,
-    queues: DbSchedulerQueues,
+    scheduler: TaskScheduler,
 ): ProcessManager<DispatchDeadline, DispatchDeadlineInput, DispatchDeadlineEvent> {
     val offsets = PostgresOffsetManager(jdbc)
     return ProcessManager(
@@ -567,7 +570,7 @@ fun dispatchDeadlines(
         eventSerialization = deadlineEvents,
         translate = { event -> translateOrderEvent(event, serialization) },
         targets = listOf(target(orders) { _, rejection -> CancellationRefused(rejection) }),
-        queues = queues,
+        scheduler = scheduler,
         getPosition = { offsets.getPosition("dispatch-deadlines") },
         savePosition = { offsets.savePosition("dispatch-deadlines", it) },
         isLeader = { true },
@@ -582,13 +585,13 @@ fun startDispatchDeadlines(
     deadlines: Repository<DispatchDeadline>,
     deadlineEvents: DataSerializationContext<DispatchDeadlineEvent>,
 ): Scheduler {
-    val queues = DbSchedulerQueues(jdbc)
-    val process = dispatchDeadlines(jdbc, serialization, orders, deadlines, deadlineEvents, queues)
-    val scheduler = Scheduler.create(dataSource, *queues.tasks.toTypedArray()).enableImmediateExecution().build()
-    queues.bind(scheduler)
+    val scheduler = DbSchedulerTaskScheduler()
+    val process = dispatchDeadlines(jdbc, serialization, orders, deadlines, deadlineEvents, scheduler)
+    val dbScheduler = Scheduler.create(dataSource, *scheduler.tasks.toTypedArray()).enableImmediateExecution().build()
+    scheduler.bind(dbScheduler)
     process.start()
-    scheduler.start()
-    return scheduler
+    dbScheduler.start()
+    return dbScheduler
 }
 
 // Guide: When timeouts go stale

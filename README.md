@@ -19,12 +19,13 @@ in**, so those events reliably drive follow-up work in your own service and in o
   - [Event policies](#event-policies)
   - [Running event policies on db-scheduler](#running-event-policies-on-db-scheduler)
   - [Ordered event policies](#ordered-event-policies)
-  - [Using another queue (e.g. Google Pub/Sub)](#using-another-queue-eg-google-pubsub)
+  - [Using another scheduler](#using-another-scheduler)
   - [Publishing events to other contexts](#publishing-events-to-other-contexts)
   - [Consuming another context's events](#consuming-another-contexts-events)
   - [Process managers](#process-managers)
 - [Running in production](#running-in-production)
 - [Known limitations](#known-limitations)
+- [Upgrading from 0.3](#upgrading-from-03)
 - [Upgrading from 0.3.0](#upgrading-from-030)
 - [Upgrading from 0.2.0](#upgrading-from-020)
 - [Upgrading from 0.1.0](#upgrading-from-010)
@@ -42,10 +43,11 @@ kotmod writes an aggregate's new state, its events and the command that caused t
 transaction**. A reactor then reads those events in order and runs your *event policies* on them — durable, retried
 follow-up work, written as plain application code — and contracts publish them to other bounded contexts.
 
-Event policies run on whatever queue you choose. kotmod ships one built on
+Event policies run on whatever scheduler you choose. kotmod ships one built on
 [db-scheduler](https://github.com/kagkarlsson/db-scheduler), which needs nothing but the Postgres database
-you already have, and you can plug in another, such as Google Pub/Sub, by implementing one small factory and
-two small interfaces (see [Using another queue](#using-another-queue-eg-google-pubsub)).
+you already have, and you can plug in another by implementing two small interfaces (see
+[Using another scheduler](#using-another-scheduler)). kotmod keeps ordering, attempt counts and blocked work in its
+own table, so they behave the same on every scheduler.
 
 kotmod is not an event store, not a message broker and not a framework: it is a library you wire into
 your own application, on the Postgres database you already have.
@@ -60,9 +62,9 @@ plugins {
 }
 
 dependencies {
-    implementation("io.github.dreweaster:kotmod:0.3.1")
-    implementation("io.github.dreweaster:kotmod-db-scheduler:0.3.1") // optional: the ready-made reaction queue
-    // implementation("io.github.dreweaster:kotmod-sqldelight:0.3.1") // only if your app uses SQLDelight
+    implementation("io.github.dreweaster:kotmod:0.4.0")
+    implementation("io.github.dreweaster:kotmod-db-scheduler:0.4.0") // optional: the ready-made scheduler
+    // implementation("io.github.dreweaster:kotmod-sqldelight:0.4.0") // only if your app uses SQLDelight
 
     // Used directly by the code in this README:
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
@@ -81,17 +83,16 @@ kotmod is split into modules:
 
 - `kotmod` — aggregates, events, event policies, process managers and Postgres support, on plain JDBC with no other
   database library. This is the only module you need.
-- `kotmod-db-scheduler` — optional. A ready-made queue for event policies and process managers on
+- `kotmod-db-scheduler` — optional. A ready-made scheduler for event policies and process managers on
   [db-scheduler](https://github.com/kagkarlsson/db-scheduler) 16.12.0, which it brings in. Leave it out if
-  you run them on another queue, such as Google Pub/Sub
-  (see [Using another queue](#using-another-queue-eg-google-pubsub)).
+  you run them on another scheduler (see [Using another scheduler](#using-another-scheduler)).
 - `kotmod-sqldelight` — optional. Shares kotmod's transactions with SQLDelight.
 
 ## Quickstart
 
 This walks through a tiny orders domain: you place an order, ship it, and send a confirmation email
 whenever an order is placed. It uses kotmod's Postgres backends and runs follow-up work on db-scheduler,
-kotmod's ready-made queue; you could swap in another queue without changing the rest.
+kotmod's ready-made scheduler; you could swap in another scheduler without changing the rest.
 
 Snippets leave out imports. The complete, compiled code is in
 [`Quickstart.kt`](examples/src/integrationTest/kotlin/io/kotmod/readme/Quickstart.kt) and
@@ -112,8 +113,8 @@ CREATE TABLE IF NOT EXISTS orders (
 ```
 
 kotmod needs its own tables too. Copy the statements in `DddSchema.ddl` (in `io.kotmod.postgres`) into
-your migrations; they create the event log, aggregate bookkeeping, handled-command history and consumer
-offsets. Event policies run on db-scheduler, which needs its `scheduled_tasks` table: create it from
+your migrations; they create the event log, aggregate bookkeeping, handled-command history, consumer
+offsets and the rows that hold ordered work and parked mappings. Event policies run on db-scheduler, which needs its `scheduled_tasks` table: create it from
 db-scheduler's
 [`postgresql_tables.sql`](https://github.com/kagkarlsson/db-scheduler/blob/v16.12.0/db-scheduler/src/test/resources/postgresql_tables.sql).
 
@@ -393,37 +394,37 @@ fun sendConfirmation(orderId: String) {
 - `onCompletion` is told how the work ended: `ReactionResult.Completed` or `ReactionResult.GaveUp(error)`.
 
 The **reactor** runs a context's event policies. It reads the event log once, hands each event to every event policy
-that listens to it, and queues their triggers. They run on db-scheduler: `DbSchedulerQueues` gives each event policy
-its own db-scheduler task, which you register with your `Scheduler`. db-scheduler polls for due work every 10
-seconds by default; `enableImmediateExecution()` runs new work straight away:
+that listens to it, and queues their triggers. They run on db-scheduler: `DbSchedulerTaskScheduler` gives each event
+policy its own db-scheduler task, which you register with your db-scheduler `Scheduler`. db-scheduler polls for due
+work every 10 seconds by default; `enableImmediateExecution()` runs new work straight away:
 
 ```kotlin
-val queues = DbSchedulerQueues(jdbc)
+val scheduler = DbSchedulerTaskScheduler()
 
-val reactor = EventReactor(jdbc, queues, isLeader = { true })
+val reactor = EventReactor(jdbc, scheduler, isLeader = { true })
 reactor.register(OrderNotifications(::sendConfirmation))
 
-val scheduler =
+val dbScheduler =
     Scheduler
-        .create(dataSource, *queues.tasks.toTypedArray())
+        .create(dataSource, *scheduler.tasks.toTypedArray())
         .threads(4)
         .enableImmediateExecution()
         .build()
-queues.bind(scheduler)
+scheduler.bind(dbScheduler)
 ```
 
-Register every event policy before reading `queues.tasks`, and call `queues.bind(scheduler)` before starting the
-reactor: queueing work needs it. Then start the reactor, then the scheduler:
+Register every event policy before reading `scheduler.tasks`, and call `scheduler.bind(dbScheduler)` before starting
+the reactor: queueing work needs it. Then start the reactor, then the db-scheduler `Scheduler`:
 
 ```kotlin
 reactor.start()
-scheduler.start()
+dbScheduler.start()
 ```
 
 A new reactor starts at the head of the event log: it sees events written after it first starts, not history.
-Start it when your application starts, before it handles commands. To shut down, stop the scheduler, then the
-reactor: `scheduler.stop()`, then `reactor.stop()` (the reactor also handles its event policies' queues, so it stops
-after the scheduler that delivers their work). The quickstart passes `isLeader = { true }` because it runs on one
+Start it when your application starts, before it handles commands. To shut down, stop the db-scheduler `Scheduler`,
+then the reactor: `dbScheduler.stop()`, then `reactor.stop()` (the reactor also handles its event policies' queues,
+so it stops after the scheduler that delivers their work). The quickstart passes `isLeader = { true }` because it runs on one
 node; see [Running in production](#running-in-production) for leader election and the full shutdown order.
 The reactor saves its position under its name, `reactor` by default, so a second reactor on the same database
 needs its own `name = "..."` (see **Reading events** in [Postgres setup](#postgres-setup)).
@@ -457,7 +458,8 @@ flowchart LR
     AM -->|one transaction| E[(Events in ddd_domain_event)]
     E --> R[EventReactor]
     R --> U[Event policies]
-    U <--> D[(Your queue: db-scheduler, Pub/Sub, …)]
+    U <--> D[(Your scheduler: db-scheduler, …)]
+    U <--> RR[(Ordered work in ddd_reaction_row)]
     E --> P[PublicEventContract]
     P --> UO[Event policies in other contexts]
 ```
@@ -474,8 +476,10 @@ flowchart LR
 - **Trigger** — the stored input of one piece of an event policy's work, as serializable data.
 - **Reactor** — reads a context's event log once and queues every event policy's triggers, each event policy on its
   own queue.
-- **Queue** — where triggers wait until they run. kotmod ships one on db-scheduler; anything that implements
-  `ReactionQueues` works.
+- **Scheduler** — runs kotmod's work at a given time, with one queue per event policy and per process manager
+  channel. kotmod ships one on db-scheduler;
+  anything that implements `TaskScheduler` works. kotmod keeps ordered work, attempt counts and blocked work in its
+  own table, `ddd_reaction_row`, not in the scheduler.
 - **Public event** — a stable event published to other bounded contexts, mapped from internal domain
   events.
 - **Process manager** — a long-running workflow that reacts to events, keeps its own state, and asks for
@@ -696,7 +700,7 @@ If you don't want JSON, implement `DataSerializationContext` yourself.
 kotmod's Postgres classes use plain JDBC through a `JdbcContext`. For a plain `DataSource`, use
 `DataSourceJdbcContext(dataSource)`; SQLDelight users have an adapter (below).
 
-**Schema.** `DddSchema.ddl` creates four tables; copy it into your Flyway or Liquibase migrations:
+**Schema.** `DddSchema.ddl` creates five tables; copy it into your Flyway or Liquibase migrations:
 
 | Table | Holds |
 |---|---|
@@ -704,6 +708,7 @@ kotmod's Postgres classes use plain JDBC through a `JdbcContext`. For a plain `D
 | `ddd_domain_event` | The event log, ordered by `(transaction_id, global_offset)`, with each event's `aggregate_sequence` |
 | `ddd_command_history` | Which commands each aggregate has handled |
 | `ddd_consumer_offset` | How far the reactor, each contract and each process manager has read (a transaction id and offset) |
+| `ddd_reaction_row` | Ordered event policies' and process managers' work, one line per aggregate, and parked mappings (see [Ordered event policies](#ordered-event-policies)) |
 
 db-scheduler's `scheduled_tasks` table belongs to your application; create it from db-scheduler's
 [`postgresql_tables.sql`](https://github.com/kagkarlsson/db-scheduler/blob/v16.12.0/db-scheduler/src/test/resources/postgresql_tables.sql).
@@ -862,8 +867,8 @@ class ReviewReminders :
 ```
 
 - With db-scheduler, delayed work waits in `scheduled_tasks` until it is due, at no extra cost.
-- If a queue delivers work early, kotmod puts it back until it is due. It doesn't run, and it doesn't count as
-  a retry.
+- If a scheduler delivers work early, kotmod puts it back until it is due. It doesn't run, and it doesn't count
+  as a retry.
 - [Ordered event policies](#ordered-event-policies) can't produce delayed triggers: one would hold back every later
   reaction of its aggregate. If one does, its event is parked (below), so the mistake shows up loudly without
   stopping anything else.
@@ -872,36 +877,40 @@ class ReviewReminders :
 
 Sometimes an event policy can't turn an event into triggers: its `on(...)` block throws, the event can't be
 deserialized, or an ordered event policy produces a delayed trigger. The reactor doesn't stop. It **parks** the
-event in that event policy's own queue, as an item with id `<policy>/<eventId>/mapping`, logs the error, and moves
-on. Other event policies still get their triggers for the event.
+event for that event policy, as an item with id `<policy>/<eventId>/mapping`, logs the error, and moves on. Other
+event policies still get their triggers for the event.
+
+Parked mappings live in kotmod's `ddd_reaction_row` table, whichever scheduler you use:
+
+- For an [ordered event policy](#ordered-event-policies), the parked mapping takes the event's place in its
+  aggregate's line, so the aggregate's later work in that event policy waits behind it. Other aggregates and other
+  event policies are unaffected.
+- For an unordered event policy, it is kept on its own row, with its own task.
 
 A parked event is retried with capped backoff (1s, 2s, 4s… up to 10 minutes), forever, logging each failure; it
 is never dropped while the event policy still listens to its aggregate type. Each retry reads the event again and
 runs the event policy's current code, so deploying a fix is enough. The event's triggers are then queued with the
-ids they would have had, and run. With ordering, the aggregate's later work in that event policy waits behind the
-parked event; other aggregates and other event policies are unaffected. On db-scheduler the event's triggers then
-still run in order, before that later work, because ordered work runs in sequence order whenever it was queued.
-A queue that orders by publish time, such as Pub/Sub, runs them after the later work instead (see
-[Using another queue](#using-another-queue-eg-google-pubsub)). If the fixed code no longer listens to the
-event's aggregate type, the parked event is dropped with a warning.
+ids they would have had, and run: in an ordered event policy they take the parked mapping's place in the line, so
+they still run before the aggregate's later work. If the fixed code no longer listens to the event's aggregate
+type, the parked event is dropped with a warning.
 
-If an event will never map — say its payload is beyond repair — an operator can drop its parked mapping. On
-db-scheduler, `queues.parkedMappings(scheduler, policy)` lists an event policy's parked events (event id, reaction id
-and retry count), and `queues.skipParked(scheduler, policy, eventId)` drops one without retrying it: that
-event's work in the event policy never runs, and with ordering the aggregate's later work can then run. On another
-queue, delete the item with id `<policy>/<eventId>/mapping` with that queue's own tools.
+If an event will never map — say its payload is beyond repair — an operator can drop its parked mapping with
+`ReactionOperations` (see [Ordered event policies](#ordered-event-policies)). `parkedMappings(policy)` lists an
+event policy's parked events (event id, reaction id and failed attempts), and `skipParked(policy, eventId)` drops one
+without retrying it: that event's work in the event policy never runs, and with ordering the aggregate's later work
+can then run. Both work for ordered and unordered event policies. `skipParked` refuses a parked mapping that is being
+retried at that moment (with `IllegalStateException`); try again shortly.
 
 ### Running event policies on db-scheduler
 
-This is kotmod's ready-made queue, in the optional `kotmod-db-scheduler` module. It needs nothing but your
-Postgres database; to use a different queue instead, see
-[Using another queue](#using-another-queue-eg-google-pubsub).
+This is kotmod's ready-made scheduler, in the optional `kotmod-db-scheduler` module. It needs nothing but your
+Postgres database; to use a different one instead, see [Using another scheduler](#using-another-scheduler).
 
-`DbSchedulerQueues` stores work in db-scheduler's `scheduled_tasks` table and runs it on your db-scheduler
-`Scheduler`. Your application owns the `Scheduler` — its threads, polling and lifecycle. One `DbSchedulerQueues`
-serves a whole context: each event policy, and each [process manager](#process-managers) channel, becomes one
-db-scheduler task named after it, and each piece of work is an instance of that task. Register every event policy
-before reading `queues.tasks`:
+`DbSchedulerTaskScheduler` stores tasks in db-scheduler's `scheduled_tasks` table and runs them on your db-scheduler
+`Scheduler`. Your application owns the `Scheduler` — its threads, polling and lifecycle. One
+`DbSchedulerTaskScheduler` serves a whole context: each event policy, and each [process manager](#process-managers)
+channel, becomes one db-scheduler task named after it, and each piece of work is an instance of that task. Register
+every event policy before reading `scheduler.tasks`:
 
 ```kotlin
 fun startReactions(
@@ -909,43 +918,44 @@ fun startReactions(
     jdbc: JdbcContext,
     election: PostgresLeaderElection,
 ): Pair<EventReactor, Scheduler> {
-    val queues = DbSchedulerQueues(jdbc)
-    val reactor = EventReactor(jdbc, queues, isLeader = election::isLeader)
+    val scheduler = DbSchedulerTaskScheduler()
+    val reactor = EventReactor(jdbc, scheduler, isLeader = election::isLeader)
     reactor.register(OrderNotifications(::sendConfirmation))
     reactor.register(ReviewReminders())
     reactor.register(OrderStatusProjection(jdbc))
-    val scheduler =
+    val dbScheduler =
         Scheduler
-            .create(dataSource, *queues.tasks.toTypedArray())
+            .create(dataSource, *scheduler.tasks.toTypedArray())
             .threads(10)
             .enableImmediateExecution()
             .build()
-    queues.bind(scheduler)
+    scheduler.bind(dbScheduler)
     reactor.start()
-    scheduler.start()
-    return reactor to scheduler
+    dbScheduler.start()
+    return reactor to dbScheduler
 }
 ```
 
 How it behaves:
 
-- **Duplicates.** Queuing an id that is already pending does nothing.
-- **Retries.** A `Retry(delay)` reschedules the work with its attempt count incremented, so backoff keeps
-  growing across restarts.
-- **Startup order.** If the scheduler runs work before the reactor has started, the work is pushed back a few
-  seconds (without counting an attempt) and a warning is logged.
+- **Duplicates.** Scheduling work that is already pending does nothing.
+- **Retries.** A `Retry(delay)` reschedules the same task instance. kotmod counts the attempts itself (in the task's
+  data for unordered work, in `ddd_reaction_row` for ordered work), so backoff keeps growing across restarts.
+- **Startup order.** If the `Scheduler` runs work before the reactor has started, the work is pushed back 5
+  seconds (`unsubscribedRetryDelay`, without counting an attempt) and a warning is logged.
 - **Unreadable data.** If stored work can't be decoded — say a trigger class was renamed — db-scheduler retries
   it with backoff from 10 seconds up to 1 hour until a fix is deployed. Keep old names readable with
   `@SerialName`.
 - **Removing pending work.** To stop pending unordered work for good, cancel its task instance; its id is the
-  reaction id, `<policy>/<eventId>/<n>` (for ordered work, see [Ordered event policies](#ordered-event-policies)):
+  reaction id, `<policy>/<eventId>/<n>`. Ordered work lives in `ddd_reaction_row`, not in its task (see
+  [Ordered event policies](#ordered-event-policies)).
 
 ```kotlin
 fun cancelPendingConfirmation(
-    scheduler: Scheduler,
+    dbScheduler: Scheduler,
     eventId: EventId,
 ) {
-    scheduler.cancel(TaskInstanceId.of("order-notifications", "order-notifications/${eventId.value}/0"))
+    dbScheduler.cancel(TaskInstanceId.of("order-notifications", "order-notifications/${eventId.value}/0"))
 }
 ```
 
@@ -1022,9 +1032,19 @@ aggregate instance and per event policy: different aggregates never wait on each
 event policies. A policy with several sources gets ordering per aggregate of each; since an aggregate type
 reaches a policy through only one source, their orders never mix.
 
-Ordering needs support from the queue. `DbSchedulerQueues` has it (for Pub/Sub, see
-[Using another queue](#using-another-queue-eg-google-pubsub)); a queue without it fails when the event policy is
-registered, rather than running unordered.
+**Each aggregate's line.** kotmod keeps an ordered event policy's work in its own table, `ddd_reaction_row`: one line
+per aggregate (keyed `<aggregateType>/<aggregateId>`) and event policy, in event order. Only the front of each line
+is scheduled, as one task. When it finishes, kotmod removes it and schedules the next one straight away. Nothing
+waits and checks again, and ordering works the same on every scheduler. Each change to a line runs in a short
+transaction that holds a Postgres advisory lock on that line; `handle`, `onFailure` and `onCompletion` never run
+while it is held. One aggregate's work in an event policy therefore runs on at most one thread at a time; different
+aggregates still run in parallel.
+
+**Attempts and leases.** An ordered attempt is counted when it starts, so a crash while `handle` runs counts as a
+failed attempt, and `context.attempt` shows it. A graceful shutdown that interrupts the attempt gives it back.
+While an attempt runs, its work is leased for the event policy's `timeout` plus 30 seconds: a duplicate delivery
+waits until the lease ends, and after a crash the work runs again once its lease has expired. `onFailure` and
+`onCompletion` run inside the lease but outside the timeout, so keep them short.
 
 **When work gives up.** Work gives up when `onFailure` returns `GiveUp`. The `OnGiveUp` setting says what happens
 to the aggregate's later work in this event policy:
@@ -1035,213 +1055,99 @@ to the aggregate's later work in this event policy:
 | `OnGiveUp.BlockAggregate` | The aggregate's later work waits until an operator retries or skips the failed one |
 
 Use `BlockAggregate` when running later work after a missed one would leave wrong data, such as a projection that
-skipped an event. Other aggregates are not affected. To find and clear blocked work, use the helpers on
-`DbSchedulerQueues`, passing your `Scheduler` (or any `SchedulerClient`) and the event policy's name:
+skipped an event. Other aggregates are not affected. To find and clear blocked work, use `ReactionOperations`
+(in `io.kotmod.reaction`), built from your `JdbcContext` and your scheduler, with the event policy's name. It works the
+same on every scheduler and doesn't need a running reactor, so you can call it from an admin endpoint or a script:
 
-- `blockedReactions(client, policy)` lists each blocked reaction with its aggregate key, reaction id and
-  sequence number.
-- `retryBlocked(client, policy, id)` runs it again now, with its attempt count reset.
-- `skipBlocked(client, policy, id)` drops it without running it, so the aggregate's next work can run.
+- `blockedReactions(policy)` lists each blocked reaction with its line's key, reaction id, sequence number and
+  attempts.
+- `retryBlocked(policy, id)` runs it again now, with its attempt count reset.
+- `skipBlocked(policy, id)` drops it without running it, and schedules the aggregate's next work.
+- `parkedMappings(policy)` and `skipParked(policy, eventId)` do the same for
+  [parked mappings](#when-a-mapping-fails).
+
+Each change takes the line's lock, so it is safe while the reactor and the scheduler run. A change to work that
+isn't there any more (already retried, skipped or finished) throws `IllegalArgumentException`. The changes are
+`suspend` functions; the lists are not.
 
 ```kotlin
-fun retryBlockedProjection(
-    scheduler: Scheduler,
-    queues: DbSchedulerQueues,
+suspend fun retryBlockedProjection(
+    jdbc: JdbcContext,
+    scheduler: TaskScheduler,
 ) {
-    for (blocked in queues.blockedReactions(scheduler, "order-status-projection")) {
+    val operations = ReactionOperations(jdbc, scheduler)
+    for (blocked in operations.blockedReactions("order-status-projection")) {
         println("${blocked.key} is held back by ${blocked.reactionId.value} at sequence ${blocked.sequence}")
-        queues.retryBlocked(scheduler, "order-status-projection", blocked.reactionId)
+        operations.retryBlocked("order-status-projection", blocked.reactionId)
     }
 }
 ```
 
-Ordered work's db-scheduler instance id is built from its aggregate, sequence number and reaction id, so
-`TaskInstanceId.of(policy, reactionId)` does not find it; use these helpers instead.
-
-**How waiting works.** Ordered work only runs when no earlier work of the same aggregate is still pending in its
-event policy's queue. Otherwise it waits and checks again, starting after `DbSchedulerQueues`'
-`orderedRecheckDelay` (2 seconds by default) and doubling each time up to 1 minute. When work finishes, kotmod
-nudges the aggregate's next work to run immediately, so a backlog normally runs back to back. The cost of
-ordering is therefore a little extra database work for waiting work, and one aggregate's work in an event policy runs
-on at most one thread at a time; different aggregates still run in parallel.
-
-**Recommended index.** The pending check looks work up by task and instance id, so add this to your own
-`scheduled_tasks` migration (it is optional, but worth having once much work can be waiting; use your table name
-if you pass a custom `tableName`):
-
-```sql
-CREATE INDEX scheduled_tasks_ordered_idx ON scheduled_tasks (task_name, task_instance COLLATE "C");
-```
+**Repair sweep.** Finishing ordered work and scheduling the next is two writes, one to Postgres and one to the
+scheduler; after a crash between them, the old task is delivered again and schedules the line's current front. In
+case a scheduler loses a task anyway, the reactor runs a repair sweep on the leader when it first reads and then
+about every 10 minutes: it schedules again every line front that isn't blocked and every parked mapping that has
+sat idle for 30 minutes and isn't leased. Scheduling is idempotent, so the sweep changes nothing when no task was
+lost. Process managers sweep their own queues the same way.
 
 **Delivery is still at least once.** In one rare case, ordering can briefly be broken: if the reactor crashes
 after queueing several triggers from the same event but before saving its position, an earlier one that had
-already completed can run again at the same time as a later one. Keep ordered work idempotent too.
+already completed is added to its line again, and can run at the same time as a later one. Keep ordered work
+idempotent too.
 
-### Using another queue (e.g. Google Pub/Sub)
+### Using another scheduler
 
 db-scheduler is a convenient default, not a requirement. The reactor and process managers only need a
-`ReactionQueues`: given a queue name, whether it must be ordered and how to store its items, it returns a
-`ReactionChannel` made of two interfaces from the core `kotmod` module:
-
-- **`EventReactionTriggerSink`** — `publish(id, trigger, ordering, notBefore)` queues an item. Publishing an id
-  that is already queued should not queue it twice; if your queue can't guarantee that, rely on `handle` being
-  idempotent (it must be anyway, since delivery is at least once). Carry `notBefore` with the message, and if
-  your queue can delay delivery, don't deliver before it.
-- **`EventReactionTriggerSource`** — `subscribe(block)` starts delivering queued items. For each delivery, call
-  `block` with the reaction id, a fresh execution id, the item, the retry count and its `notBefore`, and act on
-  what it returns:
-  - `ReactionOutcome.Finished` — it is done (succeeded or gave up): remove it from the queue.
-  - `ReactionOutcome.Retry(delay)` — deliver it again after about `delay`, counting a retry.
-  - `ReactionOutcome.Wait(delay)` — it isn't due yet: deliver it again after about `delay` without counting a
-    retry.
-  - An exception — deliver it again later.
-
-kotmod asks for one queue per event policy (named after it) and one per process manager channel
-(`<process type>-<channel>`). It stores its own items in them — your triggers, wrapped with what kotmod needs to
-run them, and [parked mappings](#when-a-mapping-fails) — so your queue only moves them between publish and
-delivery. Timeouts, `onFailure`, `onCompletion` and parked mappings work the same whichever queue you use, with
-one difference for ordered event policies: on a queue that orders by publish time, a parked mapping's triggers run
-after its aggregate's later work (see the Pub/Sub notes below). Leave out the `kotmod-db-scheduler` dependency if
-you don't use it.
-
-Here is a sketch for Google Pub/Sub, using the official Java client (`com.google.cloud:google-cloud-pubsub`).
-It is not part of kotmod and is not compiled or tested here; a ready-made Pub/Sub module is planned.
+`TaskScheduler` (in `io.kotmod.scheduling`, in the core `kotmod` module), which runs named tasks at a time. kotmod
+keeps ordering, attempt counts, blocked work and parked mappings itself, in `ddd_reaction_row`, so a scheduler
+doesn't need to order anything or count retries. The interface, without its comments:
 
 <!-- not-compiled -->
 ```kotlin
-class PubSubQueues(
-    // One topic for every queue: each message carries its queue's name, and each queue has its own subscription,
-    // filtered on it (attributes.queue = "<name>"). Enable message ordering on the subscriptions of ordered queues.
-    private val topic: TopicName,
-    private val subscriptionFor: (queue: String) -> ProjectSubscriptionName,
-) : ReactionQueues {
-    override fun <T : EventReactionTrigger> channel(
-        name: String,
-        triggerSerializer: EventReactionTriggerSerializer<T>,
-        ordered: Boolean,
-    ): ReactionChannel<T> {
-        val publisher = Publisher.newBuilder(topic).setEnableMessageOrdering(ordered).build()
-        val queue = PubSubQueue(name, publisher, subscriptionFor(name), triggerSerializer, supportsOrdering = ordered)
-        return ReactionChannel(queue, queue)
-    }
+interface TaskScheduler {
+    fun queue(name: String): TaskQueue
 }
 
-class PubSubQueue<T : EventReactionTrigger>(
-    private val name: String,
-    private val publisher: Publisher,
-    private val subscription: ProjectSubscriptionName,
-    private val serializer: EventReactionTriggerSerializer<T>,
-    override val supportsOrdering: Boolean,
-) : EventReactionTriggerSink<T>, EventReactionTriggerSource<T> {
-    override suspend fun publish(
-        id: EventReactionId,
-        trigger: T,
-        ordering: DispatchOrdering?,
-        notBefore: Instant?,
-    ) {
-        val message =
-            PubsubMessage.newBuilder()
-                .setData(ByteString.copyFromUtf8(serializer.serialize(trigger)))
-                .putAttributes("queue", name)
-                .putAttributes("reactionId", id.value)
-                .apply { if (ordering != null) setOrderingKey(ordering.key) }
-                // Carry notBefore with the message; Pub/Sub can't hold it back (see "Delays on Google Cloud").
-                .apply { if (notBefore != null) putAttributes("notBefore", notBefore.toString()) }
-                .build()
-        // Wait for Pub/Sub to accept it: the reactor only moves on once publish returns.
-        withContext(Dispatchers.IO) { publisher.publish(message).get() }
-    }
+interface TaskQueue {
+    suspend fun schedule(name: String, payload: String, at: Instant)
 
-    override fun subscribe(
-        block: suspend (EventReactionId, EventReactionExecutionId, T, RetryCount, Instant?) -> ReactionOutcome,
-    ): Cancellable {
-        val receiver =
-            MessageReceiver { message, reply ->
-                // Pub/Sub calls this on its own threads; run the attempt to completion before replying.
-                val outcome =
-                    runBlocking {
-                        try {
-                            block(
-                                EventReactionId(message.getAttributesOrThrow("reactionId")),
-                                EventReactionExecutionId(UUID.randomUUID().toString()),
-                                serializer.deserialize(message.data.toStringUtf8()),
-                                // Delivery attempts are only counted when the subscription has a dead-letter policy.
-                                (Subscriber.getDeliveryAttempt(message) ?: 1) - 1,
-                                message.attributesMap["notBefore"]?.let { Instant.parse(it) },
-                            )
-                        } catch (e: Exception) {
-                            ReactionOutcome.Retry(Duration.ZERO)
-                        }
-                    }
-                when (outcome) {
-                    is ReactionOutcome.Finished -> reply.ack()
-                    is ReactionOutcome.Retry -> reply.nack()
-                    // A nack ignores the delay, so this only suits waits of a few minutes. For longer ones, hand
-                    // the message back to Cloud Tasks for `outcome.delay` and ack this one instead (see
-                    // "Delays on Google Cloud"). Pub/Sub counts a nack as a delivery attempt, which a
-                    // dead-letter policy would treat as a failure.
-                    is ReactionOutcome.Wait -> reply.nack()
-                }
-            }
-        val subscriber = Subscriber.newBuilder(subscription, receiver).build()
-        subscriber.startAsync().awaitRunning()
-        return object : Cancellable {
-            override fun cancel() {
-                subscriber.stopAsync().awaitTerminated()
-            }
-        }
-    }
+    fun subscribe(handler: suspend (name: String, payload: String) -> TaskOutcome): Cancellable
+}
+
+sealed interface TaskOutcome {
+    data object Done : TaskOutcome
+
+    data class RunAgain(val at: Instant, val payload: String) : TaskOutcome
 }
 ```
 
-Pass a `PubSubQueues` to `EventReactor` (and to your process managers) where the quickstart passes
-`DbSchedulerQueues`.
+What a scheduler must do:
 
-How Pub/Sub differs from db-scheduler:
+- **Queues.** kotmod asks for one queue per event policy (named after it) and one per process manager channel
+  (`<process type>-<channel>`), before starting. Asking for a name again returns a queue for the same tasks.
+- **`schedule(name, payload, at)`** runs the task at `at` or later. Scheduling a name that is already pending in the
+  queue does nothing. kotmod sometimes schedules a name again after its earlier task finished: an operator's
+  `retryBlocked` and the repair sweep schedule a line's front under its usual name. A scheduler must accept that
+  (db-scheduler does). One that refuses recently finished names, as Cloud Tasks does, must still make such a
+  schedule succeed, for example by deriving a unique name.
+- **`subscribe(handler)`** delivers due tasks, at least once each and never before their `at`, until the returned
+  handle is cancelled. On `Done`, remove the task. On `RunAgain(at, payload)`, run it again at `at` or later with
+  the new payload, under the same name (a scheduler that can't edit tasks can create a follow-up task and finish the
+  original). If the handler throws, deliver the task again later, after your own backoff.
+- **Names and payloads are opaque.** Payloads are kotmod's own JSON. An adapter may transform names (hash them, say)
+  as long as one name always means one task.
 
-- **One subscription per queue.** Each event policy's queue, and each process manager channel, maps to one
-  subscription: a topic per queue, or, as in the sketch, one topic with a `queue` attribute and a filtered
-  subscription per queue.
-- **Retry delays are approximate.** Pub/Sub can't redeliver a message after a chosen delay; a `nack()` is
-  redelivered according to the subscription's retry policy. Set its minimum and maximum backoff to suit your
-  event policies, or treat `onFailure`'s delays only as a guide.
-- **No deduplication by reaction id.** Pub/Sub may deliver a message more than once, and the reactor may publish
-  a trigger again after a restart. Keep `handle` and `onCompletion` idempotent, and pass `context.reactionId` as
-  the idempotency key of external calls.
-- **Retry counts need a dead-letter policy.** Pub/Sub only counts delivery attempts when the subscription has
-  one; without it, `context.attempt` is always 0. A dead-letter topic is also where messages go after too many
-  failed deliveries.
-- **Ordering uses ordering keys.** `DispatchOrdering.key` is `<aggregateType>/<aggregateId>`, so publishing with
-  `setOrderingKey(ordering.key)` makes Pub/Sub deliver each aggregate's work in order, one at a time, and a
-  `nack()` holds back that aggregate's later messages until it is redelivered. If a publish fails, the client
-  pauses that ordering key until you call `publisher.resumePublish(key)`.
-- **A parked mapping breaks order for its aggregate.** A parked mapping is a message with its event's ordering
-  key, so while it fails it holds back that aggregate's later work, and only that aggregate's. But Pub/Sub
-  orders by publish time: when it finally succeeds, the event's triggers are published behind the later work
-  that was already queued, so they run after it. In an ordered event policy on Pub/Sub, treat a parked mapping as
-  breaking order for that aggregate, and keep `on(...)` blocks from throwing. db-scheduler doesn't have this
-  problem: it runs ordered work in sequence order.
-- **Parked mappings read your database.** A parked mapping reads its event again from the event log, so the
-  subscriber must run in your application, with access to its database.
-- **`OnGiveUp.BlockAggregate` has no direct equivalent.** In this sketch, work that gives up is acknowledged and
-  the aggregate's next work runs, as with `ContinueWithNext`. Record failures in `onCompletion` (or route them to
-  a dead-letter topic) to deal with them. A stuck ordering key shows up as redelivery or dead-lettering, not as a
-  row you can list.
-- **`ReactionOutcome.Wait` only suits short waits.** A `nack()` ignores the delay: the message comes back
-  according to the subscription's retry policy (at most 10 minutes later), and each redelivery counts towards the
-  dead-letter limit (at most 100 attempts). Work that must wait longer than a few minutes would be redelivered
-  many times, or dead-lettered before it is due. For longer waits, hand the message to a scheduler such as Cloud
-  Tasks and ack the original (see below).
-- **Long work is fine.** The client keeps extending a message's acknowledgement deadline while `block` runs, up
-  to its maximum extension period (one hour by default).
-- **No leader election is needed for the queue.** As with db-scheduler, every node can run subscribers; only the
-  reactor, contracts and process managers need [one active poller](#running-in-production).
+Timeouts, `onFailure`, `onCompletion`, ordering, blocked work and parked mappings then work the same on your scheduler
+as on db-scheduler. As with db-scheduler, every node can subscribe; only the reactor, contracts and process managers
+need [one active poller](#running-in-production). Leave out the `kotmod-db-scheduler` dependency if you don't use it.
 
-**Delays on Google Cloud.** Pub/Sub can't hold a message back until a time. A sink can instead hand delayed work
-to **Cloud Tasks** with a schedule time, and have the task publish it to Pub/Sub when it's due. Cloud Tasks can
-only schedule about 30 days ahead, so for a longer delay the work is scheduled for the furthest time allowed and
-arrives before its `notBefore`. kotmod then returns `Wait` without running it, and the source should hand the
-message to Cloud Tasks again for the remaining time and ack the original.
+**Testing a scheduler.** `TaskSchedulerContract`, in `kotmod`'s test fixtures (`kotmod/src/testFixtures`), is the
+JUnit test suite every scheduler must pass; `kotmod-db-scheduler` runs it. Extend it and implement `scheduler()`,
+`start()` and `stop()`. The test fixtures aren't published to Maven Central, so copy the class (and the
+`eventually` helper it uses) from the repository.
+
+**Google Pub/Sub doesn't qualify.** It can't hold a message back until a chosen time, or run one again at a chosen
+time, so it can't honour `at` or `RunAgain`. A ready-made Cloud Tasks scheduler is planned.
 
 ### Publishing events to other contexts
 
@@ -1343,14 +1249,14 @@ fun startBilling(
     orderEvents: PublicEventContract<*, OrderPublicEvent>,
     gateway: PaymentGateway,
 ): Scheduler {
-    val queues = DbSchedulerQueues(jdbc)
-    val reactor = EventReactor(jdbc, queues, isLeader = { true }, name = "billing-reactor")
+    val scheduler = DbSchedulerTaskScheduler()
+    val reactor = EventReactor(jdbc, scheduler, isLeader = { true }, name = "billing-reactor")
     reactor.register(CustomerBilling(orderEvents, gateway))
-    val scheduler = Scheduler.create(dataSource, *queues.tasks.toTypedArray()).enableImmediateExecution().build()
-    queues.bind(scheduler)
+    val dbScheduler = Scheduler.create(dataSource, *scheduler.tasks.toTypedArray()).enableImmediateExecution().build()
+    scheduler.bind(dbScheduler)
     reactor.start()
-    scheduler.start()
-    return scheduler
+    dbScheduler.start()
+    return dbScheduler
 }
 ```
 
@@ -1361,8 +1267,8 @@ fun startBilling(
   policy's queue. Register it before the publishing context starts the contract.
 - Reaction ids and ordering work as for local sources: ids are `<policy>/<eventId>/<n>` with the original
   event's id, and ordering is per original aggregate.
-- If the event policy's block throws, the event is parked in its queue, as for a local source, and the contract's
-  reader moves on. If the contract itself can't read an event (its `serialization` or `internalToPublic` throws),
+- If the event policy's block throws, the event is [parked](#when-a-mapping-fails), as for a local source, and the
+  contract's reader moves on. If the contract itself can't read an event (its `serialization` or `internalToPublic` throws),
   the contract stops at that event, for everyone listening, until the publishing context fixes it.
 - Both contexts share the database. Consuming a context that lives in another service or database is not
   supported.
@@ -1605,7 +1511,7 @@ fun dispatchDeadlines(
     orders: AggregateManager<Order, OrderCommand, OrderEvent, OrderRejection>,
     deadlines: Repository<DispatchDeadline>,
     deadlineEvents: DataSerializationContext<DispatchDeadlineEvent>,
-    queues: DbSchedulerQueues,
+    scheduler: TaskScheduler,
 ): ProcessManager<DispatchDeadline, DispatchDeadlineInput, DispatchDeadlineEvent> {
     val offsets = PostgresOffsetManager(jdbc)
     return ProcessManager(
@@ -1618,7 +1524,7 @@ fun dispatchDeadlines(
         eventSerialization = deadlineEvents,
         translate = { event -> translateOrderEvent(event, serialization) },
         targets = listOf(target(orders) { _, rejection -> CancellationRefused(rejection) }),
-        queues = queues,
+        scheduler = scheduler,
         getPosition = { offsets.getPosition("dispatch-deadlines") },
         savePosition = { offsets.savePosition("dispatch-deadlines", it) },
         isLeader = { true },
@@ -1633,25 +1539,28 @@ fun startDispatchDeadlines(
     deadlines: Repository<DispatchDeadline>,
     deadlineEvents: DataSerializationContext<DispatchDeadlineEvent>,
 ): Scheduler {
-    val queues = DbSchedulerQueues(jdbc)
-    val process = dispatchDeadlines(jdbc, serialization, orders, deadlines, deadlineEvents, queues)
-    val scheduler = Scheduler.create(dataSource, *queues.tasks.toTypedArray()).enableImmediateExecution().build()
-    queues.bind(scheduler)
+    val scheduler = DbSchedulerTaskScheduler()
+    val process = dispatchDeadlines(jdbc, serialization, orders, deadlines, deadlineEvents, scheduler)
+    val dbScheduler = Scheduler.create(dataSource, *scheduler.tasks.toTypedArray()).enableImmediateExecution().build()
+    scheduler.bind(dbScheduler)
     process.start()
-    scheduler.start()
-    return scheduler
+    dbScheduler.start()
+    return dbScheduler
 }
 ```
 
-- Start the process manager before the scheduler, and stop it after.
-- Read `queues.tasks` only after the process manager and all its `subscribeTo` calls are built. A channel
+- Start the process manager before the db-scheduler `Scheduler`, and stop it after. A stopped process manager
+  can't be started again; build a new one.
+- Read `scheduler.tasks` only after the process manager and all its `subscribeTo` calls are built. A channel
   created later wouldn't be registered with the scheduler.
 - Per-aggregate ordering (`inputOrdering`) delivers an order's events in order, which this process relies on:
   an input the initial state ignores is gone, so out-of-order delivery could lose "shipped".
 - There is one channel per kind of work, each a db-scheduler task named after the process type: inputs (ordered
   per source aggregate here, `DispatchDeadline-inputs`), internal (timeouts and rejection feedback,
   `DispatchDeadline-internal`), commands (`DispatchDeadline-commands`), and `DispatchDeadline-contract-<name>` for each
-  `subscribeTo`. One `DbSchedulerQueues` serves every process manager and event policy of the context.
+  `subscribeTo`. One `DbSchedulerTaskScheduler` serves every process manager and event policy of the context.
+- Ordered inputs wait in their source aggregate's line in `ddd_reaction_row`, one line per channel, exactly as an
+  [ordered event policy](#ordered-event-policies)'s work does.
 - Inputs are stored as JSON with the input class's name. Renaming an input class breaks inputs that are already
   scheduled or in flight, so keep the old name with `@SerialName`.
 
@@ -1666,9 +1575,8 @@ recorded, and it is retried until you fix the wiring.
   for, so those wait too.
 - With ordered inputs, an input that keeps failing holds back the later inputs from the same source aggregate
   until it succeeds.
-- The internal channel must be able to hold a reaction until its `notBefore` for as long as your timeouts are.
-  db-scheduler does; a plain Pub/Sub subscription doesn't (see
-  [Using another queue](#using-another-queue-eg-google-pubsub)).
+- Timeouts wait in the scheduler until they are due. If a scheduler delivers one early (one that can only
+  schedule a limited time ahead, say), kotmod schedules it again for its time without running it.
 
 ## Running in production
 
@@ -1698,17 +1606,17 @@ it left off, and new events sort after the migrated ones.
 **Reaction ids are deterministic.** kotmod builds each reaction id from the event policy, the event and the
 trigger's position in the block's output (`<policy>/<eventId>/<n>`), so an event read again while its work is
 pending is recognised. Keep each `on(...)` block deterministic: the same event must produce the same triggers, in
-the same order. A queue forgets an id once its work has run, so moving the reactor's position back runs finished
+the same order. A scheduler forgets an id once its work has run, so moving the reactor's position back runs finished
 work again.
 
 **Start and stop in order.** Register every event policy and build every process manager, then read
-`queues.tasks`, build the `Scheduler` and call `queues.bind(scheduler)`. Start the reactor and process managers,
+`scheduler.tasks`, build the db-scheduler `Scheduler` and call `scheduler.bind(dbScheduler)`. Start the reactor and process managers,
 then the `Scheduler`, then the leader election, then any public contracts. To stop:
 
 1. Stop the public contracts.
 2. Stop the `Scheduler`, so no more work runs on this node.
 3. Stop the reactor and process managers. They stop reading, then stop handling their queues; anything they
-   queued in between waits in `scheduled_tasks` for the next node.
+   queued in between waits in `scheduled_tasks` and `ddd_reaction_row` for the next node.
 4. Stop the leader election, which hands the lock to another node.
 
 Getting it wrong doesn't lose anything — work that arrives before its event policy is running is rescheduled with a
@@ -1740,9 +1648,58 @@ Pass `isLeader = election::isLeader` to the reactor, and to each contract and pr
 ```kotlin
 fun reactorWithLeaderElection(
     jdbc: JdbcContext,
-    queues: DbSchedulerQueues,
+    scheduler: TaskScheduler,
     election: PostgresLeaderElection,
-): EventReactor = EventReactor(jdbc, queues, isLeader = election::isLeader)
+): EventReactor = EventReactor(jdbc, scheduler, isLeader = election::isLeader)
+
+// Guide: Process managers
+
+@Serializable
+sealed interface DispatchDeadlineInput
+
+@Serializable
+data class OrderWasPlaced(
+    val orderId: String,
+    val placedAt: Instant,
+) : DispatchDeadlineInput
+
+@Serializable
+data object OrderWasShipped : DispatchDeadlineInput
+
+@Serializable
+data object OrderWasCancelled : DispatchDeadlineInput
+
+@Serializable
+data object DeadlinePassed : DispatchDeadlineInput
+
+@Serializable
+data class CancellationRefused(
+    val rejection: OrderRejection,
+) : DispatchDeadlineInput
+
+@Serializable
+sealed interface DispatchDeadlineEvent : DomainEvent
+
+@Serializable
+data class DispatchDeadlineMissed(
+    val orderId: String,
+) : DispatchDeadlineEvent
+
+typealias DispatchDeadlineOutcome = ProcessOutcome<DispatchDeadline, DispatchDeadlineEvent, DispatchDeadlineInput>
+
+sealed interface DispatchDeadline : ProcessState<DispatchDeadline, DispatchDeadlineInput, DispatchDeadlineEvent>
+
+object NoDispatchDeadline : ProcessInitialState<DispatchDeadline, DispatchDeadlineInput, DispatchDeadlineEvent> {
+    override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome =
+        when (input) {
+            is OrderWasPlaced ->
+                transition(
+                    AwaitingDispatch(input.orderId),
+                    schedule = listOf(schedule(DeadlinePassed, at = input.placedAt + 2.days)),
+                )
+            OrderWasShipped, OrderWasCancelled, DeadlinePassed, is CancellationRefused -> ignore()
+        }
+}
 ```
 
 - **One election per application** is the simple default: one node polls for every consumer. To spread
@@ -1766,13 +1723,14 @@ fun reactorWithLeaderElection(
 | Situation | Behaviour |
 |---|---|
 | `handle` throws or times out | `onFailure` decides: `Retry(delay)` or `GiveUp` (by default it retries with capped backoff, forever). With ordering, only that aggregate's later work in that event policy waits |
-| An event policy's `on(...)` block throws, or its event can't be deserialized | The event is [parked](#when-a-mapping-fails) in that event policy's queue and retried with capped backoff, forever, logging each failure; other event policies and the reactor carry on |
+| An event policy's `on(...)` block throws, or its event can't be deserialized | The event is [parked](#when-a-mapping-fails) for that event policy and retried with capped backoff, forever, logging each failure; other event policies and the reactor carry on |
 | `onFailure` or `onCompletion` throws | The work is retried after a backoff, so `handle` may run again |
 | Stored work can't be read (e.g. a trigger class was renamed) | Retried with backoff from 10 seconds up to 1 hour |
-| A node crashes mid-work | db-scheduler notices the missing heartbeat and runs it again |
-| The database or queue is down while the reactor queues work | The reactor stops the batch and resumes from its last saved position on the next poll |
+| A node crashes mid-work | db-scheduler notices the missing heartbeat and runs it again. Ordered work runs again once its lease has expired, and the crash counts as an attempt |
+| The scheduler loses a task | For ordered work and parked mappings, the [repair sweep](#ordered-event-policies) schedules it again within about 40 minutes |
+| The database or scheduler is down while the reactor queues work | The reactor stops the batch and resumes from its last saved position on the next poll |
 | A contract can't read or map an event | The contract stops at that event and retries it every poll, for everyone listening to it |
-| An event policy fed by a contract can't queue its work (the queue is down, or `DbSchedulerQueues` isn't bound yet) | The contract's reader stops at that event and retries it every poll, for everyone listening to the contract |
+| An event policy fed by a contract can't queue its work (the scheduler is down, or `DbSchedulerTaskScheduler` isn't bound yet) | The contract's reader stops at that event and retries it every poll, for everyone listening to the contract |
 | A command loses a concurrent update | `handle` reads and decides again, up to `maxConflictRetries` times (5 by default). `OptimisticConcurrencyException` only surfaces when those run out: reduce contention on that aggregate or raise `maxConflictRetries`. Inside an outer `jdbc.transaction { }` there are no retries: retry the whole transaction (see [Several aggregates in one transaction](#several-aggregates-in-one-transaction)) |
 
 **Tune throughput.** The reactor, contracts and process managers poll every 500ms (`pollInterval`) and read up
@@ -1807,7 +1765,7 @@ failure in a specific spot to show up.
 
 **Event policies**
 
-- **Replays repeat finished work.** A queue recognises a reaction id only while its work is pending. Moving the
+- **Replays repeat finished work.** A scheduler recognises a reaction id only while its work is pending. Moving the
   reactor's position back, or a crash between queueing work and saving the position after the work has already
   run, runs it again. `handle` must be idempotent.
 - **An event policy's blocks must be deterministic.** Reaction ids number an event's triggers by their position in the
@@ -1815,35 +1773,94 @@ failure in a specific spot to show up.
   order.
 - **A new event policy doesn't see history.** It shares the reactor's position, so it sees events from when it is
   first deployed. Backfilling one event policy is not supported.
-- **Removing an event policy abandons its queued work.** Its db-scheduler task is no longer registered, so its rows in
+- **A crash during unordered work doesn't count as an attempt.** Unordered work counts failures only, so work that
+  crashes its node every time is delivered again and again, with no attempt count for `onFailure` to give up on.
+  Ordered work counts attempts when they start, so a crash counts there.
+- **`onFailure` and `onCompletion` run outside the event policy's timeout.** Keep them short. For ordered work they
+  run inside the lease (the timeout plus 30 seconds); one that runs past it lets a duplicate delivery start the
+  same work again.
+- **Removing an event policy abandons its work.** Its db-scheduler task is no longer registered, so its rows in
   `scheduled_tasks` never run. db-scheduler logs a warning when it finds them due, and once they have been due
   for longer than the `Scheduler`'s `deleteUnresolvedAfter` (14 days by default in db-scheduler 16.12.0) it
-  deletes every row of that task: pending work and parked mappings alike. Let its work finish before removing
-  it, or cancel its rows deliberately.
-- **At most 9,999 triggers per event in an ordered event policy.** Beyond that, they sort in the wrong order. This
-  is not checked.
-- **Aggregate types containing `/` can share ordering keys.** The ordering key is
-  `"<aggregate type>/<aggregate id>"`, so type `a/b` with id `c` and type `a` with id `b/c` share one key.
-  Their work then waits unnecessarily; nothing runs out of order.
-- **Unreadable stored work affects the operator helpers.** If any pending work of the event policy has stored data
-  that can't be decoded, `blockedReactions`, `retryBlocked`, `skipBlocked`, `parkedMappings` and `skipParked`
-  fail. Work whose trigger can't be decoded holds back its aggregate's later work without being listed by
-  `blockedReactions`.
+  deletes them. Its rows in `ddd_reaction_row` (ordered work and parked mappings) stay there: skip its parked
+  mappings and blocked work with `ReactionOperations`, and delete any other rows yourself
+  (`DELETE FROM ddd_reaction_row WHERE queue_name = '<policy>'`). Let its work finish before removing it.
+- **Switching an ordered event policy to unordered can drop a delay.** If it has a parked mapping in a line when it
+  is switched, and the fixed mapping then produces a delayed trigger, that trigger runs without its delay.
+- **Aggregate types containing `/` can share a line.** A line's key is `"<aggregate type>/<aggregate id>"`, so
+  type `a/b` with id `c` and type `a` with id `b/c` share one line. Their work then waits unnecessarily; nothing
+  runs out of order.
+- **Unreadable ordered work holds back its line unlisted.** Ordered work whose trigger can't be decoded is retried
+  with db-scheduler's backoff until a fix is deployed. Meanwhile it holds back its aggregate's later work, and
+  `blockedReactions` doesn't list it, because it hasn't given up.
 - **Prompt hand-over needs immediate execution.** When ordered work finishes, the aggregate's next work is
-  rescheduled to run now. It only starts straight away if the `Scheduler` uses `enableImmediateExecution()`;
+  scheduled to run now. It only starts straight away if the `Scheduler` uses `enableImmediateExecution()`;
   otherwise it starts on db-scheduler's next poll.
 - **Replaying an aggregate that was once written out of order is slow.** For such an aggregate, every event
   pays a full check whose cost grows with the aggregate's history. This only applies to aggregates written by
   an outer transaction that changed several aggregates in a racing order, and only matters for very long
   histories.
 
+**Process managers**
+
+- **A process manager can't be started again after `stop()`.** `start()` then does nothing. Build a new one (an
+  `EventReactor` can be started again).
+
+## Upgrading from 0.3
+
+0.4.0 moves per-aggregate ordering out of the queue and into kotmod's own table, `ddd_reaction_row`, and runs all
+reaction work on a small [`TaskScheduler`](#using-another-scheduler) interface. There is no compatibility layer. To
+upgrade:
+
+1. **Drain in-flight work first.** Work queued by 0.3 is stored in a different shape and wouldn't run. Stop
+   writing commands and let pending reactions and process manager work finish (or cancel what you no longer
+   need), then deploy 0.4.0.
+2. **Create `ddd_reaction_row`.** Copy its statements from `DddSchema.ddl`:
+
+   ```sql
+   CREATE TABLE ddd_reaction_row (
+       queue_name    TEXT        NOT NULL,
+       reaction_id   TEXT        NOT NULL,
+       kind          TEXT        NOT NULL,
+       line_key      TEXT,
+       line_sequence BIGINT,
+       line_ordinal  INT,
+       item          TEXT        NOT NULL,
+       attempts      INT         NOT NULL DEFAULT 0,
+       blocked       BOOLEAN     NOT NULL DEFAULT FALSE,
+       lease_until   TIMESTAMPTZ,
+       updated_at    TIMESTAMPTZ NOT NULL,
+       PRIMARY KEY (queue_name, reaction_id)
+   );
+   CREATE UNIQUE INDEX ddd_reaction_row_line ON ddd_reaction_row (queue_name, line_key, line_sequence, line_ordinal);
+   ```
+
+   The `scheduled_tasks_ordered_idx` index that 0.3 recommended is no longer used; you can drop it.
+3. **`DbSchedulerQueues(jdbc)` becomes `DbSchedulerTaskScheduler()`**, in `io.kotmod.scheduling.dbscheduler`.
+   `tasks` and `bind` work as before. `orderedRecheckDelay` is gone: nothing waits and checks again.
+4. **`EventReactor` and `ProcessManager` take the scheduler:** `EventReactor(jdbc, scheduler, isLeader = …)` and
+   `ProcessManager(…, scheduler = …)` (it was `queues = …`).
+5. **The operator tools move to `ReactionOperations(jdbc, scheduler)`**, in `io.kotmod.reaction`, and work on every
+   scheduler: `blockedReactions(policy)`, `retryBlocked(policy, id)`, `skipBlocked(policy, id)`,
+   `parkedMappings(policy)` and `skipParked(policy, eventId)`, without the `SchedulerClient` argument. The changes
+   are now `suspend` functions.
+6. **A custom queue implements `TaskScheduler`.** `ReactionQueues`, `ReactionChannel`, `EventReactionTriggerSink`,
+   `EventReactionTriggerSource`, `EventReactionTriggerSerializer`, `EventReactionTrigger`, `DispatchOrdering` and
+   `ReactionOutcome` are removed. See [Using another scheduler](#using-another-scheduler).
+7. **The deprecated `Reactions<T>` and `ReactionsDsl` aliases are removed.** Extend `EventPolicy<T>` (see
+   [Upgrading from 0.3.0](#upgrading-from-030)).
+
+Behaviour changes: ordered attempts are counted when they start, so a crash counts as an attempt; a recovered
+parked mapping's triggers now run before its aggregate's later work on every scheduler; and an ordered event policy
+is no longer limited to 9,999 triggers per event.
+
 ## Upgrading from 0.3.0
 
 0.3.1 renames the class you extend for follow-up work from `Reactions<T>` to `EventPolicy<T>`; the docs now call it
 an event policy.
 
-1. **Extend `EventPolicy<T>`.** `Reactions<T>` still compiles, as a deprecated alias with a quick fix, and may
-   be removed in a later release. The same goes for the `ReactionsDsl` marker, now `EventPolicyDsl`.
+1. **Extend `EventPolicy<T>`.** In 0.3.1, `Reactions<T>` still compiled, as a deprecated alias with a quick fix;
+   0.4.0 removes it. The same goes for the `ReactionsDsl` marker, now `EventPolicyDsl`.
 2. **Renamed parameters.** Parameters named `useCase` are now `policy`, in the same position:
    `EventReactor.register(policy)` and `DbSchedulerQueues`' `parkedMappings`, `skipParked`, `blockedReactions`,
    `retryBlocked` and `skipBlocked`. Only calls that pass them by name (`useCase = …`) need changing, to `policy = …`.
@@ -1859,7 +1876,7 @@ an event policy.
 [event policies](#event-policies) (classes extending `EventPolicy<T>`) run by an `EventReactor`. These steps go
 straight to 0.3.1; 0.3.0 named the class `Reactions<T>` (see [Upgrading from 0.3.0](#upgrading-from-030)). Code
 blocks below marked as before/after are sketches, not compiled; the [quickstart](#4-react-to-events) and the guides
-show compiled code. To upgrade:
+show compiled code. Then follow [Upgrading from 0.3](#upgrading-from-03) to reach 0.4.0. To upgrade:
 
 1. **Drain in-flight work first.** Queue names change: each event policy's queue is named after the policy, and
    process manager channels become `<process type>-<channel>`. Work queued under 0.2.0's task names would never

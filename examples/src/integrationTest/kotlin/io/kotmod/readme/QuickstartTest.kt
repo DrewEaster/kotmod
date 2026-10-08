@@ -6,12 +6,12 @@ import com.github.kagkarlsson.scheduler.Scheduler
 import io.kotmod.AggregateId
 import io.kotmod.AggregateManager
 import io.kotmod.CommandResult
-import io.kotmod.event.reaction.dbscheduler.DbSchedulerQueues
 import io.kotmod.jdbc.DataSourceJdbcContext
 import io.kotmod.postgres.PostgresDomainPersistenceBackend
 import io.kotmod.postgres.support.IntegrationTest
 import io.kotmod.postgres.support.eventually
 import io.kotmod.reaction.EventReactor
+import io.kotmod.scheduling.dbscheduler.DbSchedulerTaskScheduler
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.BeforeEach
@@ -50,21 +50,21 @@ class QuickstartTest : IntegrationTest() {
                     initial = NoOrder,
                 )
 
-            val queues = DbSchedulerQueues(jdbc)
+            val scheduler = DbSchedulerTaskScheduler()
 
-            val reactor = EventReactor(jdbc, queues, isLeader = { true })
+            val reactor = EventReactor(jdbc, scheduler, isLeader = { true })
             reactor.register(OrderNotifications(::sendConfirmation))
 
-            val scheduler =
+            val dbScheduler =
                 Scheduler
-                    .create(dataSource, *queues.tasks.toTypedArray())
+                    .create(dataSource, *scheduler.tasks.toTypedArray())
                     .threads(4)
                     .enableImmediateExecution()
                     .build()
-            queues.bind(scheduler)
+            scheduler.bind(dbScheduler)
 
             reactor.start()
-            scheduler.start()
+            dbScheduler.start()
 
             try {
                 // Another aggregate type writing to the same event log, as an app with an audit log would.
@@ -80,7 +80,7 @@ class QuickstartTest : IntegrationTest() {
                 eventually(15.seconds) { sentConfirmations.isNotEmpty() }
                 delay(500) // give a duplicate time to show up
             } finally {
-                scheduler.stop()
+                dbScheduler.stop()
                 reactor.stop()
             }
 
