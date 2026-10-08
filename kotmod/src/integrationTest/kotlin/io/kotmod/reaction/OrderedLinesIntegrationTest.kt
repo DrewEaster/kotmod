@@ -70,6 +70,10 @@ class OrderedLinesIntegrationTest : IntegrationTest() {
             lines.start { handled += it.item; ItemResult.Completed }
             lines.publishOrdered(listOf(e(0)))
 
+            // Guards against ReactionQueue reading a line's next front outside the lock that deletes the finished item
+            // (e.g. before the locked change): a publish landing in between sees the finished item still in front, its
+            // schedule is ignored, and nothing schedules the new item. That mutation is caught within the first sweep
+            // of the publish delay below, as long as a delivery here takes less than its 0-8ms range.
             for (n in 0 until 200) {
                 // e(n) is the line's pending front; publish e(n + 1) while e(n) finishes, on two threads at once.
                 val go = CompletableDeferred<Unit>()

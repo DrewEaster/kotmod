@@ -144,7 +144,8 @@ internal suspend fun rethrowIfCancelled(error: Throwable) {
  *   leases it (its timeout plus [LEASE_MARGIN]), then runs it without the lock. Finishing it deletes or replaces the
  *   row and schedules the new front before returning, so a crash in between is repaired when the backend delivers the
  *   task again. Leases compare times from this node's clock; the margin absorbs normal clock differences.
- * - **Kept work** (unordered parked mappings) lives in [rows] without a line, with its own task.
+ * - **Kept work** (unordered parked mappings) lives in [rows] without a line, with its own task. A delivery leases the
+ *   row while it runs (so the operator tools can refuse to skip it), but doesn't wait for another delivery's lease.
  *
  * Every write to [rows] and every schedule is idempotent, so any step can be repeated after a crash.
  */
@@ -295,9 +296,15 @@ internal class ReactionQueue<T : Any>(
             ItemResult.Completed -> advance(task.key) { delete(row.reactionId) }
             is ItemResult.Replaced ->
                 advance(task.key) {
-                    delete(row.reactionId)
-                    result.items.forEachIndexed { n, work ->
-                        insert(ReactionRow(name, work.id.value, RowKind.ORDERED, task.key, row.sequence, n, encode(work.item)))
+                    if (get(row.reactionId) == null) {
+                        // Removed while it ran (the operator tools refuse that, but its lease may have run out): its
+                        // replacements would jump ahead of work already done, so drop them.
+                        log.info("Reaction {} in {} was removed while it ran; dropping its {} replacements", row.reactionId, name, result.items.size)
+                    } else {
+                        delete(row.reactionId)
+                        result.items.forEachIndexed { n, work ->
+                            insert(ReactionRow(name, work.id.value, RowKind.ORDERED, task.key, row.sequence, n, encode(work.item)))
+                        }
                     }
                 }
             is ItemResult.Retry -> {
@@ -342,19 +349,28 @@ internal class ReactionQueue<T : Any>(
         task: TaskPayload.Kept,
         handle: suspend (Delivery<T>) -> ItemResult<T>,
     ): TaskOutcome {
-        val row = io { rows.inQueue(name) { get(task.reactionId) } } ?: return TaskOutcome.Done
+        val now = clock()
+        // Leased while it runs, so the operator tools can tell it is running.
+        val row =
+            io { rows.inQueue(name) { get(task.reactionId)?.also { update(it.copy(leaseUntil = now + lease)) } } }
+                ?: return TaskOutcome.Done
         return when (val result = handle(Delivery(EventReactionId(row.reactionId), decode(row.item), row.attempts))) {
             ItemResult.Completed -> {
                 io { rows.inQueue(name) { delete(row.reactionId) } }
                 TaskOutcome.Done
             }
             is ItemResult.Replaced -> {
-                result.items.forEach { publish(it) }
-                io { rows.inQueue(name) { delete(row.reactionId) } }
+                // Queued before the row is deleted, so a crash in between repeats them rather than losing them.
+                if (io { rows.inQueue(name) { get(row.reactionId) } } == null) {
+                    log.info("Kept reaction {} in {} was removed while it ran; dropping its {} replacements", row.reactionId, name, result.items.size)
+                } else {
+                    result.items.forEach { publish(it) }
+                    io { rows.inQueue(name) { delete(row.reactionId) } }
+                }
                 TaskOutcome.Done
             }
             is ItemResult.Retry -> {
-                io { rows.inQueue(name) { get(row.reactionId)?.let { update(it.copy(attempts = it.attempts + 1)) } } }
+                io { rows.inQueue(name) { get(row.reactionId)?.let { update(it.copy(attempts = it.attempts + 1, leaseUntil = null)) } } }
                 TaskOutcome.RunAgain(clock() + result.delay, ReactionTasks.encode(task))
             }
             ItemResult.Blocked -> {

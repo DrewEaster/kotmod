@@ -2,6 +2,8 @@ package io.kotmod.event.reaction
 
 import io.kotmod.scheduling.ManualTaskScheduler
 import io.kotmod.scheduling.TaskOutcome
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.builtins.serializer
 import org.junit.jupiter.api.Test
@@ -147,5 +149,51 @@ class ReactionQueueKeptAndSweepTest {
             now += 1.minutes
             queue.sweep(30.minutes)
             assertEquals(listOf(ReactionTasks.frontName("D", "d1")), tasks.pending.map { it.name })
+        }
+
+    @Test
+    fun `a kept item is leased while it runs, and a retry clears the lease`(): Unit =
+        runBlocking {
+            val started = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            val queue = queue()
+            queue.start {
+                started.complete(Unit)
+                release.await()
+                ItemResult.Retry(5.seconds)
+            }
+            queue.keep(EventReactionId("k1"), "x")
+            val delivery = async { tasks.deliver("k1") }
+            started.await()
+            assertEquals(now + 90.seconds, rows.rows("q").single().leaseUntil)
+
+            release.complete(Unit)
+            delivery.await()
+            assertEquals(null, rows.rows("q").single().leaseUntil)
+            assertEquals(1, rows.rows("q").single().attempts)
+        }
+
+    @Test
+    fun `a replaced kept item whose row vanished while it ran queues no replacements`(): Unit =
+        runBlocking {
+            val started = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            val queue = queue()
+            queue.start {
+                started.complete(Unit)
+                release.await()
+                ItemResult.Replaced(listOf(Produced(EventReactionId("t1"), "a")))
+            }
+            queue.keep(EventReactionId("k1"), "x")
+            val delivery = async { tasks.deliver("k1") }
+            started.await()
+
+            // An operator skips k1 while it runs.
+            rows.inQueue("q") { delete("k1") }
+            release.complete(Unit)
+
+            assertEquals(TaskOutcome.Done, delivery.await())
+            assertTrue(tasks.pending.isEmpty())
+            assertTrue(rows.rows("q").isEmpty())
         }
 }

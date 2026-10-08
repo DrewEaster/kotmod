@@ -17,9 +17,14 @@ import io.kotmod.postgres.support.orderEventSerialization
 import io.kotmod.scheduling.ManualTaskScheduler
 import io.kotmod.support.OrderPlaced
 import io.kotmod.support.testOrders
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.builtins.serializer
 import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -65,8 +70,13 @@ class ReactionOperationsIntegrationTest : IntegrationTest() {
         @Volatile
         var broken = true
 
+        /** Runs at the start of every mapping (the test can hold a mapping here). */
+        @Volatile
+        var onMap: () -> Unit = {}
+
         init {
             on(testOrders) { _, metadata ->
+                onMap()
                 mappings.incrementAndGet()
                 check(!(broken && metadata.sequence == 1L)) { "can't map ${metadata.eventId.value}" }
                 trigger("${metadata.aggregateId.value}#${metadata.sequence}")
@@ -265,6 +275,57 @@ class ReactionOperationsIntegrationTest : IntegrationTest() {
             assertEquals(mappingsBefore, unordered.mappings.get())
             assertEquals(listOf("o-1#2"), unordered.handled)
             assertEquals(emptyList(), rows.list("unordered-mapping"))
+        }
+
+    /**
+     * Holds [policy]'s parked mapping of e-1 mid-run (fixed, so it will succeed) through task [task], runs [during],
+     * then lets it finish.
+     */
+    private suspend fun whileMappingRuns(
+        policy: Mapping,
+        task: String,
+        during: suspend () -> Unit,
+    ) = coroutineScope {
+        val running = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        policy.broken = false
+        policy.onMap = {
+            running.countDown()
+            release.await(10, TimeUnit.SECONDS)
+        }
+        val delivery = async(Dispatchers.IO) { scheduler.queue(policy.name).deliver(task) }
+        try {
+            assertTrue(running.await(10, TimeUnit.SECONDS), "the mapping started")
+            during()
+        } finally {
+            release.countDown()
+        }
+        delivery.await()
+        policy.onMap = {}
+    }
+
+    @Test
+    fun `skipParked refuses a parked mapping that is running`(): Unit =
+        runBlocking {
+            val (ordered, unordered) = parkMappings()
+            val ops = operations()
+
+            whileMappingRuns(ordered, front("Order/o-1", "ordered-mapping/e-1/mapping")) {
+                val refused = assertFailsWith<IllegalStateException> { ops.skipParked("ordered-mapping", EventId("e-1")) }
+                assertTrue("running" in refused.message.orEmpty())
+            }
+            whileMappingRuns(unordered, "unordered-mapping/e-1/mapping") {
+                assertFailsWith<IllegalStateException> { ops.skipParked("unordered-mapping", EventId("e-1")) }
+            }
+
+            // Both mappings recovered, so the events' work runs once each, in order.
+            scheduler.queue("ordered-mapping").deliverAll()
+            scheduler.queue("unordered-mapping").deliverAll()
+            assertEquals(listOf("o-1#1", "o-1#2"), ordered.handled)
+            assertEquals(setOf("o-1#1", "o-1#2"), unordered.handled.toSet())
+            assertEquals(2, unordered.handled.size)
+            assertEquals(emptyList(), ops.parkedMappings("ordered-mapping"))
+            assertEquals(emptyList(), ops.parkedMappings("unordered-mapping"))
         }
 
     @Test

@@ -364,4 +364,31 @@ class ReactionQueueOrderedTest {
             assertTrue(rows.rows("q").isEmpty())
             assertTrue(tasks.pending.isEmpty())
         }
+
+    @Test
+    fun `a replaced item whose row vanished while it ran inserts no replacements, and the line moves on`(): Unit =
+        runBlocking {
+            val queue = queue().started()
+            queue.publishOrdered(listOf(item("m5", 5), item("e6", 6)))
+            val started = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            behaviour["m5"] = {
+                started.complete(Unit)
+                release.await()
+                ItemResult.Replaced(listOf(Produced(EventReactionId("t5a"), "t5a")))
+            }
+            val delivery = async { tasks.deliverNext() }
+            started.await()
+
+            // An operator skips m5 while it runs.
+            rows.inLine("q", key) { delete("m5") }
+            release.complete(Unit)
+
+            assertEquals(TaskOutcome.Done, delivery.await())
+            assertEquals(listOf("e6"), rows.rows("q").map { it.reactionId })
+            assertEquals(listOf(front("e6")), tasks.pending.map { it.name })
+            tasks.deliverAll()
+            assertEquals(listOf("m5", "e6"), handled())
+            assertTrue(rows.rows("q").isEmpty())
+        }
 }

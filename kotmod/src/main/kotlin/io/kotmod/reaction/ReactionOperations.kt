@@ -6,6 +6,7 @@ import io.kotmod.event.reaction.ReactionRow
 import io.kotmod.event.reaction.ReactionRows
 import io.kotmod.event.reaction.ReactionTasks
 import io.kotmod.event.reaction.RowKind
+import io.kotmod.event.reaction.RowTx
 import io.kotmod.jdbc.JdbcContext
 import io.kotmod.postgres.PostgresReactionRows
 import io.kotmod.scheduling.TaskScheduler
@@ -50,15 +51,17 @@ class ReactionOperations internal constructor(
             BlockedReaction(checkNotNull(it.key), EventReactionId(it.reactionId), checkNotNull(it.sequence), it.attempts)
         }
 
-    /** Unblocks reaction [id] of [queue] with its attempts reset to 0, and schedules it: it is its line's front. */
+    /**
+     * Unblocks reaction [id] of [queue] with its attempts reset to 0, and schedules its line's front (normally the
+     * retried reaction).
+     */
     suspend fun retryBlocked(
         queue: String,
         id: EventReactionId,
     ) {
-        val key = blockedKey(queue, id)
         val front =
             io {
-                rows.inLine(queue, key) {
+                rows.inLine(queue, lineOf(queue, id)) {
                     val row = get(id.value)
                     require(row != null && row.blocked) { "Reaction ${id.value} of $queue is not blocked" }
                     update(row.copy(attempts = 0, blocked = false, leaseUntil = null))
@@ -73,10 +76,9 @@ class ReactionOperations internal constructor(
         queue: String,
         id: EventReactionId,
     ) {
-        val key = blockedKey(queue, id)
         val front =
             io {
-                rows.inLine(queue, key) {
+                rows.inLine(queue, lineOf(queue, id)) {
                     val row = get(id.value)
                     require(row != null && row.blocked) { "Reaction ${id.value} of $queue is not blocked" }
                     delete(id.value)
@@ -94,45 +96,36 @@ class ReactionOperations internal constructor(
 
     /**
      * Deletes [policy]'s parked mapping of event [eventId]: the event is never mapped. For an ordered policy, the next
-     * reaction of its aggregate's line is scheduled.
+     * reaction of its aggregate's line is scheduled. Refused with [IllegalStateException] while the mapping is being
+     * retried (try again shortly).
      */
     suspend fun skipParked(
         policy: String,
         eventId: EventId,
     ) {
         val id = "$policy/${eventId.value}$MAPPING_SUFFIX"
-        val row = io { rows.inQueue(policy) { get(id) } }
-        requireNotNull(row) { "Event policy $policy has no parked mapping of event ${eventId.value}" }
-        when (row.kind) {
-            RowKind.KEPT ->
-                io {
-                    rows.inQueue(policy) {
-                        require(get(id) != null) { "Event policy $policy has no parked mapping of event ${eventId.value}" }
-                        delete(id)
-                    }
-                }
-            RowKind.ORDERED -> {
-                val front =
-                    io {
-                        rows.inLine(policy, checkNotNull(row.key)) {
-                            require(get(id) != null) { "Event policy $policy has no parked mapping of event ${eventId.value}" }
-                            delete(id)
-                            front()?.takeUnless { it.blocked }
-                        }
-                    }
-                scheduleFront(policy, front)
-            }
+        val missing = "Event policy $policy has no parked mapping of event ${eventId.value}"
+        val key = io { rows.inQueue(policy) { requireNotNull(get(id)) { missing } } }.key
+        val skip: RowTx.() -> Unit = {
+            val row = requireNotNull(get(id)) { missing }
+            val leaseUntil = row.leaseUntil
+            check(leaseUntil == null || leaseUntil <= clock()) { "The parked mapping of event ${eventId.value} in $policy is running; try again" }
+            delete(id)
+        }
+        if (key == null) {
+            io { rows.inQueue(policy) { skip() } }
+        } else {
+            scheduleFront(policy, io { rows.inLine(policy, key) { skip(); front()?.takeUnless { it.blocked } } })
         }
     }
 
-    /** The line of ordered reaction [id], read without its lock; the caller checks the row again under the lock. */
-    private suspend fun blockedKey(
+    /** The line of ordered reaction [id], read without its lock: every check on the row is made again under it. */
+    private fun lineOf(
         queue: String,
         id: EventReactionId,
     ): String {
-        val row = io { rows.inQueue(queue) { get(id.value) } }
-        require(row != null && row.kind == RowKind.ORDERED && row.blocked) { "Reaction ${id.value} of $queue is not blocked" }
-        return checkNotNull(row.key)
+        val row = rows.inQueue(queue) { get(id.value) }
+        return requireNotNull(row?.key) { "Reaction ${id.value} of $queue is not blocked" }
     }
 
     private suspend fun scheduleFront(
