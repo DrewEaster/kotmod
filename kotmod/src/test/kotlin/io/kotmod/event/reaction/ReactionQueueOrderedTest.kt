@@ -93,9 +93,19 @@ class ReactionQueueOrderedTest {
             val queue = queue().started()
             queue.publishOrdered(listOf(item("m5", 5), item("e6", 6)))
             results("m5", ItemResult.Replaced(listOf(Produced(EventReactionId("t5a"), "t5a"), Produced(EventReactionId("t5b"), "t5b"))))
+            results("t5a", ItemResult.Retry(1.minutes), ItemResult.Completed)
+
+            tasks.deliverNext()
+            assertEquals(
+                listOf(Triple("t5a", 5L, 0), Triple("t5b", 5L, 1), Triple("e6", 6L, 0)),
+                rows.rows("q").map { Triple(it.reactionId, it.sequence, it.ordinal) },
+            )
+            assertEquals(listOf(front("t5a")), tasks.pending.map { it.name })
+
+            // t5a retrying holds back t5b and e6: the replacements are in line, not queued beside it.
             tasks.deliverAll()
-            assertEquals(listOf("m5", "t5a", "t5b", "e6"), handled())
-            assertEquals(listOf("m5", "t5a", "t5b", "e6"), seen.map { it.item })
+            assertEquals(listOf("m5", "t5a", "t5a", "t5b", "e6"), handled())
+            assertEquals(listOf("m5", "t5a", "t5a", "t5b", "e6"), seen.map { it.item })
             assertTrue(rows.rows("q").isEmpty())
         }
 
@@ -154,6 +164,8 @@ class ReactionQueueOrderedTest {
             val queue = queue().started()
             queue.publishOrdered(listOf(item("e5", 5), item("e6", 6)))
             tasks.schedule(front("e6"), ReactionTasks.encode(TaskPayload.Front(key, "e6")), now)
+            tasks.lose(front("e5"))
+            assertEquals(listOf(front("e6")), tasks.pending.map { it.name })
             assertEquals(TaskOutcome.Done, tasks.deliver(front("e6")))
             assertTrue(seen.isEmpty())
             assertEquals(listOf(front("e5")), tasks.pending.map { it.name })
@@ -340,6 +352,7 @@ class ReactionQueueOrderedTest {
     @Test
     fun `a line's front task still runs after its policy stops being ordered`(): Unit =
         runBlocking {
+            // Guards against a queue only handling front tasks while its policy is ordered, stranding rows left behind.
             queue().publishOrdered(listOf(item("e5", 5)))
             assertEquals(listOf(front("e5")), tasks.pending.map { it.name })
 
