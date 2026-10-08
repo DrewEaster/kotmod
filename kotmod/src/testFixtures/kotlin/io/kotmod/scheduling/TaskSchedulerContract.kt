@@ -3,12 +3,14 @@ package io.kotmod.scheduling
 import io.kotmod.postgres.support.eventually
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 import kotlin.time.Clock
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -59,6 +61,27 @@ abstract class TaskSchedulerContract {
             eventually { seen.isNotEmpty() }
             delay(1.seconds)
             assertEquals(listOf("t-1" to "first"), seen)
+        }
+
+    @Test
+    fun `a name can be scheduled again after its task finished`() =
+        runBlocking<Unit> {
+            val queue = scheduler().queue(QUEUE_A)
+            val seen = recording(queue)
+            queue.schedule("t-1", "first", Clock.System.now())
+            start()
+            eventually { seen.isNotEmpty() }
+            // kotmod's operator tools and repair sweep schedule a finished line front again under its usual name. The
+            // backend may still hold the first task for a moment after the handler returns, and scheduling a pending
+            // name does nothing, so schedule until the second delivery arrives.
+            withTimeout(10.seconds) {
+                while (seen.size < 2) {
+                    queue.schedule("t-1", "second", Clock.System.now())
+                    delay(200.milliseconds)
+                }
+            }
+            delay(1.seconds)
+            assertEquals(listOf("t-1" to "first", "t-1" to "second"), seen)
         }
 
     @Test
