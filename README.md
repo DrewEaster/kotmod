@@ -112,10 +112,10 @@ CREATE TABLE IF NOT EXISTS orders (
 )
 ```
 
-kotmod needs its own tables too. Copy the statements in `DddSchema.ddl` (in `io.kotmod.postgres`) into
-your migrations; they create the event log, aggregate bookkeeping, handled-command history, consumer
-offsets and the rows that hold ordered work and parked mappings. Event policies run on db-scheduler, which needs its `scheduled_tasks` table: create it from
-db-scheduler's
+kotmod needs its own tables too. Copy the statements in `DddSchema.ddl` (in `io.kotmod.postgres`) into your
+migrations; they create the event log, aggregate bookkeeping, handled-command history, consumer offsets and the rows
+that hold ordered work and parked mappings. Event policies run on db-scheduler, which needs its `scheduled_tasks`
+table: create it from db-scheduler's
 [`postgresql_tables.sql`](https://github.com/kagkarlsson/db-scheduler/blob/v16.12.0/db-scheduler/src/test/resources/postgresql_tables.sql).
 
 ### 2. Define state, events, commands and rejections
@@ -421,13 +421,13 @@ reactor.start()
 dbScheduler.start()
 ```
 
-A new reactor starts at the head of the event log: it sees events written after it first starts, not history.
-Start it when your application starts, before it handles commands. To shut down, stop the db-scheduler `Scheduler`,
-then the reactor: `dbScheduler.stop()`, then `reactor.stop()` (the reactor also handles its event policies' queues,
-so it stops after the scheduler that delivers their work). The quickstart passes `isLeader = { true }` because it runs on one
-node; see [Running in production](#running-in-production) for leader election and the full shutdown order.
-The reactor saves its position under its name, `reactor` by default, so a second reactor on the same database
-needs its own `name = "..."` (see **Reading events** in [Postgres setup](#postgres-setup)).
+A new reactor starts at the head of the event log: it sees events written after it first starts, not history. Start
+it when your application starts, before it handles commands. To shut down, stop the db-scheduler `Scheduler`, then
+the reactor: `dbScheduler.stop()`, then `reactor.stop()` (the reactor also handles its event policies' queues, so it
+stops after the scheduler that delivers their work). The quickstart passes `isLeader = { true }` because it runs on
+one node; see [Running in production](#running-in-production) for leader election and the full shutdown order. The
+reactor saves its position under its name, `reactor` by default, so a second reactor on the same database needs its
+own `name = "..."` (see **Reading events** in [Postgres setup](#postgres-setup)).
 
 ### 5. Run commands
 
@@ -943,9 +943,10 @@ How it behaves:
   data for unordered work, in `ddd_reaction_row` for ordered work), so backoff keeps growing across restarts.
 - **Startup order.** If the `Scheduler` runs work before the reactor has started, the work is pushed back 5
   seconds (`unsubscribedRetryDelay`, without counting an attempt) and a warning is logged.
-- **Unreadable data.** If stored work can't be decoded — say a trigger class was renamed — db-scheduler retries
-  it with backoff from 10 seconds up to 1 hour until a fix is deployed. Keep old names readable with
-  `@SerialName`.
+- **Unreadable data.** If stored work can't be decoded — say a trigger class was renamed — it is retried until a
+  fix is deployed. Unordered work is retried with db-scheduler's backoff, from 10 seconds up to 1 hour. Ordered
+  work keeps its lease when decoding fails, so it is retried about every `timeout` plus 30 seconds, and each try
+  counts an attempt. Keep old names readable with `@SerialName`.
 - **Removing pending work.** To stop pending unordered work for good, cancel its task instance; its id is the
   reaction id, `<policy>/<eventId>/<n>`. Ordered work lives in `ddd_reaction_row`, not in its task (see
   [Ordered event policies](#ordered-event-policies)).
@@ -1085,10 +1086,12 @@ suspend fun retryBlockedProjection(
 
 **Repair sweep.** Finishing ordered work and scheduling the next is two writes, one to Postgres and one to the
 scheduler; after a crash between them, the old task is delivered again and schedules the line's current front. In
-case a scheduler loses a task anyway, the reactor runs a repair sweep on the leader when it first reads and then
-about every 10 minutes: it schedules again every line front that isn't blocked and every parked mapping that has
-sat idle for 30 minutes and isn't leased. Scheduling is idempotent, so the sweep changes nothing when no task was
-lost. Process managers sweep their own queues the same way.
+case a scheduler loses a task anyway, the reactor runs a repair sweep on the leader while it is reading normally:
+after its first successful read, and then about every 10 minutes, it schedules again every line front and parked
+mapping that isn't blocked or leased and has sat idle for 30 minutes. Scheduling is idempotent, so the sweep changes
+nothing when no task was lost. The sweep runs after a successful read, so it doesn't run while the reader is stuck
+on an event that keeps failing (say, while the scheduler is down). Process managers sweep their own queues the same
+way.
 
 **Delivery is still at least once.** In one rare case, ordering can briefly be broken: if the reactor crashes
 after queueing several triggers from the same event but before saving its position, an earlier one that had
@@ -1268,8 +1271,8 @@ fun startBilling(
 - Reaction ids and ordering work as for local sources: ids are `<policy>/<eventId>/<n>` with the original
   event's id, and ordering is per original aggregate.
 - If the event policy's block throws, the event is [parked](#when-a-mapping-fails), as for a local source, and the
-  contract's reader moves on. If the contract itself can't read an event (its `serialization` or `internalToPublic` throws),
-  the contract stops at that event, for everyone listening, until the publishing context fixes it.
+  contract's reader moves on. If the contract itself can't read an event (its `serialization` or `internalToPublic`
+  throws), the contract stops at that event, for everyone listening, until the publishing context fixes it.
 - Both contexts share the database. Consuming a context that lives in another service or database is not
   supported.
 
@@ -1610,8 +1613,8 @@ the same order. A scheduler forgets an id once its work has run, so moving the r
 work again.
 
 **Start and stop in order.** Register every event policy and build every process manager, then read
-`scheduler.tasks`, build the db-scheduler `Scheduler` and call `scheduler.bind(dbScheduler)`. Start the reactor and process managers,
-then the `Scheduler`, then the leader election, then any public contracts. To stop:
+`scheduler.tasks`, build the db-scheduler `Scheduler` and call `scheduler.bind(dbScheduler)`. Start the reactor and
+process managers, then the `Scheduler`, then the leader election, then any public contracts. To stop:
 
 1. Stop the public contracts.
 2. Stop the `Scheduler`, so no more work runs on this node.
@@ -1651,55 +1654,6 @@ fun reactorWithLeaderElection(
     scheduler: TaskScheduler,
     election: PostgresLeaderElection,
 ): EventReactor = EventReactor(jdbc, scheduler, isLeader = election::isLeader)
-
-// Guide: Process managers
-
-@Serializable
-sealed interface DispatchDeadlineInput
-
-@Serializable
-data class OrderWasPlaced(
-    val orderId: String,
-    val placedAt: Instant,
-) : DispatchDeadlineInput
-
-@Serializable
-data object OrderWasShipped : DispatchDeadlineInput
-
-@Serializable
-data object OrderWasCancelled : DispatchDeadlineInput
-
-@Serializable
-data object DeadlinePassed : DispatchDeadlineInput
-
-@Serializable
-data class CancellationRefused(
-    val rejection: OrderRejection,
-) : DispatchDeadlineInput
-
-@Serializable
-sealed interface DispatchDeadlineEvent : DomainEvent
-
-@Serializable
-data class DispatchDeadlineMissed(
-    val orderId: String,
-) : DispatchDeadlineEvent
-
-typealias DispatchDeadlineOutcome = ProcessOutcome<DispatchDeadline, DispatchDeadlineEvent, DispatchDeadlineInput>
-
-sealed interface DispatchDeadline : ProcessState<DispatchDeadline, DispatchDeadlineInput, DispatchDeadlineEvent>
-
-object NoDispatchDeadline : ProcessInitialState<DispatchDeadline, DispatchDeadlineInput, DispatchDeadlineEvent> {
-    override suspend fun handle(input: DispatchDeadlineInput): DispatchDeadlineOutcome =
-        when (input) {
-            is OrderWasPlaced ->
-                transition(
-                    AwaitingDispatch(input.orderId),
-                    schedule = listOf(schedule(DeadlinePassed, at = input.placedAt + 2.days)),
-                )
-            OrderWasShipped, OrderWasCancelled, DeadlinePassed, is CancellationRefused -> ignore()
-        }
-}
 ```
 
 - **One election per application** is the simple default: one node polls for every consumer. To spread
@@ -1725,9 +1679,9 @@ object NoDispatchDeadline : ProcessInitialState<DispatchDeadline, DispatchDeadli
 | `handle` throws or times out | `onFailure` decides: `Retry(delay)` or `GiveUp` (by default it retries with capped backoff, forever). With ordering, only that aggregate's later work in that event policy waits |
 | An event policy's `on(...)` block throws, or its event can't be deserialized | The event is [parked](#when-a-mapping-fails) for that event policy and retried with capped backoff, forever, logging each failure; other event policies and the reactor carry on |
 | `onFailure` or `onCompletion` throws | The work is retried after a backoff, so `handle` may run again |
-| Stored work can't be read (e.g. a trigger class was renamed) | Retried with backoff from 10 seconds up to 1 hour |
+| Stored work can't be read (e.g. a trigger class was renamed) | Unordered work is retried with backoff from 10 seconds up to 1 hour; ordered work about every `timeout` plus 30 seconds, counting an attempt each time |
 | A node crashes mid-work | db-scheduler notices the missing heartbeat and runs it again. Ordered work runs again once its lease has expired, and the crash counts as an attempt |
-| The scheduler loses a task | For ordered work and parked mappings, the [repair sweep](#ordered-event-policies) schedules it again within about 40 minutes |
+| The scheduler loses a task | For ordered work and parked mappings, the [repair sweep](#ordered-event-policies) schedules it again within about 40 minutes, as long as the reactor (or process manager) is reading normally |
 | The database or scheduler is down while the reactor queues work | The reactor stops the batch and resumes from its last saved position on the next poll |
 | A contract can't read or map an event | The contract stops at that event and retries it every poll, for everyone listening to it |
 | An event policy fed by a contract can't queue its work (the scheduler is down, or `DbSchedulerTaskScheduler` isn't bound yet) | The contract's reader stops at that event and retries it every poll, for everyone listening to the contract |
@@ -1791,8 +1745,9 @@ failure in a specific spot to show up.
   type `a/b` with id `c` and type `a` with id `b/c` share one line. Their work then waits unnecessarily; nothing
   runs out of order.
 - **Unreadable ordered work holds back its line unlisted.** Ordered work whose trigger can't be decoded is retried
-  with db-scheduler's backoff until a fix is deployed. Meanwhile it holds back its aggregate's later work, and
-  `blockedReactions` doesn't list it, because it hasn't given up.
+  about every `timeout` plus 30 seconds until a fix is deployed (it keeps its lease when decoding fails), and each
+  try counts an attempt. Meanwhile it holds back its aggregate's later work, and `blockedReactions` doesn't list it,
+  because it hasn't given up.
 - **Prompt hand-over needs immediate execution.** When ordered work finishes, the aggregate's next work is
   scheduled to run now. It only starts straight away if the `Scheduler` uses `enableImmediateExecution()`;
   otherwise it starts on db-scheduler's next poll.
