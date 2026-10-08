@@ -235,6 +235,44 @@ class ReactionQueueOrderedTest {
         }
 
     @Test
+    fun `an attempt whose lease ran out and was overtaken by a later attempt leaves the row to that attempt`(): Unit =
+        runBlocking {
+            val queue = queue().started()
+            queue.publishOrdered(listOf(item("e5", 5), item("e6", 6)))
+            val started = List(2) { CompletableDeferred<Unit>() }
+            val release = List(2) { CompletableDeferred<Unit>() }
+            behaviour["e5"] = { delivery ->
+                started[delivery.attempt].complete(Unit)
+                release[delivery.attempt].await()
+                ItemResult.Completed
+            }
+
+            // Attempt 1 starts, then hangs past its lease; a duplicate delivery starts attempt 2.
+            val first = async { tasks.deliverNext() }
+            started[0].await()
+            now += 2.minutes
+            val second = async { tasks.deliverDuplicate(front("e5")) }
+            started[1].await()
+            assertEquals(2, row("e5").attempts)
+
+            // Attempt 1 finishes late: the row belongs to attempt 2, so it is left alone and the line doesn't move.
+            release[0].complete(Unit)
+            assertEquals(TaskOutcome.Done, first.await())
+            assertEquals(listOf("e5", "e6"), rows.rows("q").map { it.reactionId })
+            assertEquals(2, row("e5").attempts)
+            assertTrue(tasks.pending.isEmpty())
+
+            // Attempt 2's completion advances the line.
+            release[1].complete(Unit)
+            assertEquals(TaskOutcome.Done, second.await())
+            assertEquals(listOf("e6"), rows.rows("q").map { it.reactionId })
+            assertEquals(listOf(front("e6")), tasks.pending.map { it.name })
+            tasks.deliverAll()
+            assertEquals(listOf("e5", "e5", "e6"), handled())
+            assertTrue(rows.rows("q").isEmpty())
+        }
+
+    @Test
     fun `a shutdown mid-run gives the attempt back`(): Unit =
         runBlocking {
             val queue = queue().started()

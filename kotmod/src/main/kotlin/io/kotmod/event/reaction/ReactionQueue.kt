@@ -27,7 +27,6 @@ private val log = LoggerFactory.getLogger(ReactionQueue::class.java)
  */
 internal val LEASE_MARGIN: Duration = 30.seconds
 
-
 /** One delivery of [item], recognised by [id]; [attempt] counts earlier attempts, from 0. */
 internal data class Delivery<T>(
     val id: EventReactionId,
@@ -143,7 +142,7 @@ internal suspend fun rethrowIfCancelled(error: Throwable) {
  *   it. A delivery takes the line's lock, checks the item is still the front and not running, counts the attempt and
  *   leases it (its timeout plus [LEASE_MARGIN]), then runs it without the lock. Finishing it deletes or replaces the
  *   row and schedules the new front before returning, so a crash in between is repaired when the backend delivers the
- *   task again. Leases compare times from this node's clock; the margin absorbs normal clock differences.
+ *   task again. An attempt only changes the row while no later attempt has started (its attempt count is unchanged). Leases compare times from this node's clock; the margin absorbs normal clock differences.
  * - **Kept work** (unordered parked mappings) lives in [rows] without a line, with its own task. A delivery leases the
  *   row while it runs (so the operator tools can refuse to skip it), but doesn't wait for another delivery's lease.
  *
@@ -279,6 +278,10 @@ internal class ReactionQueue<T : Any>(
         }
     }
 
+    /**
+     * Finishes the attempt that set [row]'s attempt count. Every change is fenced on that count: if the row is gone or a
+     * later attempt has started (this one's lease ran out), the row is left alone, and the task is done.
+     */
     private suspend fun runStarted(
         task: TaskPayload.Front,
         row: ReactionRow,
@@ -289,46 +292,59 @@ internal class ReactionQueue<T : Any>(
                 handle(Delivery(EventReactionId(row.reactionId), decode(row.item), row.attempts - 1))
             } catch (e: CancellationException) {
                 // A shutdown interrupted the attempt: give it back, so restarts don't use up attempts.
-                if (!currentCoroutineContext().isActive) withContext(NonCancellable) { release(task.key, row.reactionId, giveBack = true) }
+                if (!currentCoroutineContext().isActive) withContext(NonCancellable) { release(task.key, row, giveBack = true) }
                 throw e
             }
         return when (result) {
-            ItemResult.Completed -> advance(task.key) { delete(row.reactionId) }
+            ItemResult.Completed ->
+                advance(task.key) {
+                    if (owned(row) != null) delete(row.reactionId) else logOvertaken(row)
+                }
             is ItemResult.Replaced ->
                 advance(task.key) {
-                    if (get(row.reactionId) == null) {
-                        // Removed while it ran (the operator tools refuse that, but its lease may have run out): its
-                        // replacements would jump ahead of work already done, so drop them.
-                        log.info("Reaction {} in {} was removed while it ran; dropping its {} replacements", row.reactionId, name, result.items.size)
-                    } else {
+                    if (owned(row) != null) {
                         delete(row.reactionId)
                         result.items.forEachIndexed { n, work ->
                             insert(ReactionRow(name, work.id.value, RowKind.ORDERED, task.key, row.sequence, n, encode(work.item)))
                         }
+                    } else {
+                        // Its replacements would jump ahead of work already done, or race the attempt now running.
+                        log.info("Dropping the {} replacements of reaction {} in {}", result.items.size, row.reactionId, name)
+                        logOvertaken(row)
                     }
                 }
-            is ItemResult.Retry -> {
-                release(task.key, row.reactionId, giveBack = false)
-                TaskOutcome.RunAgain(clock() + result.delay, ReactionTasks.encode(task))
-            }
+            is ItemResult.Retry ->
+                if (release(task.key, row, giveBack = false)) {
+                    TaskOutcome.RunAgain(clock() + result.delay, ReactionTasks.encode(task))
+                } else {
+                    TaskOutcome.Done
+                }
             ItemResult.Blocked -> {
-                io { rows.inLine(name, task.key) { get(row.reactionId)?.let { update(it.copy(blocked = true, leaseUntil = null)) } } }
+                io { rows.inLine(name, task.key) { owned(row)?.let { update(it.copy(blocked = true, leaseUntil = null)) } ?: logOvertaken(row) } }
                 TaskOutcome.Done
             }
         }
     }
 
+    /** [row] as stored now, if the attempt that set its attempt count still owns it (no later attempt started). */
+    private fun LineTx.owned(row: ReactionRow): ReactionRow? = get(row.reactionId)?.takeIf { it.attempts == row.attempts }
+
+    private fun logOvertaken(row: ReactionRow) =
+        log.info("Reaction {} in {} was removed or started again while attempt {} ran; leaving it alone", row.reactionId, name, row.attempts)
+
+    /** Ends [row]'s lease, giving the attempt back if [giveBack]. Returns false, changing nothing, if not [owned]. */
     private suspend fun release(
         key: String,
-        reactionId: String,
+        row: ReactionRow,
         giveBack: Boolean,
-    ) {
+    ): Boolean =
         io {
             rows.inLine(name, key) {
-                get(reactionId)?.let { update(it.copy(attempts = if (giveBack) it.attempts - 1 else it.attempts, leaseUntil = null)) }
+                val current = owned(row)
+                if (current != null) update(current.copy(attempts = if (giveBack) current.attempts - 1 else current.attempts, leaseUntil = null)) else logOvertaken(row)
+                current != null
             }
         }
-    }
 
     private suspend fun advance(
         key: String,
