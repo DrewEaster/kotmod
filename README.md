@@ -1072,6 +1072,13 @@ Each change takes the line's lock, so it is safe while the reactor and the sched
 isn't there any more (already retried, skipped or finished) throws `IllegalArgumentException`. The changes are
 `suspend` functions; the lists are not.
 
+A change is saved first and its work scheduled after, so the scheduler must be ready to schedule. In your
+application, `DbSchedulerTaskScheduler` is bound at startup. A script must build its own and `bind` it to a
+db-scheduler `SchedulerClient` on the same database (for example `SchedulerClient.Builder.create(dataSource).build()`,
+with the same serializer as your `Scheduler`) before using `ReactionOperations`; unbound, the change is saved and
+then scheduling throws. If scheduling fails after a change, the change stays, and the
+[repair sweep](#ordered-event-policies) schedules the line's work later.
+
 ```kotlin
 suspend fun retryBlockedProjection(
     jdbc: JdbcContext,

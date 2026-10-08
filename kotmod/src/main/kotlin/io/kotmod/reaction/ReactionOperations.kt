@@ -37,6 +37,9 @@ data class ParkedMapping(
  *
  * Each change runs under the lock of the line it touches, so it is safe while the reactor and the scheduler run. A
  * change refused because the work isn't there (already finished, skipped or retried) throws [IllegalArgumentException].
+ *
+ * A change is saved before its work is scheduled, so [scheduler] must be able to schedule (a `DbSchedulerTaskScheduler`
+ * must be bound). If scheduling fails, the change stays and the reactor's repair sweep schedules the line later.
  */
 class ReactionOperations internal constructor(
     private val rows: ReactionRows,

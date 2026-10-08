@@ -26,7 +26,8 @@ private val log = LoggerFactory.getLogger(DbSchedulerTaskScheduler::class.java)
 /**
  * [TaskScheduler] on db-scheduler: each queue is a db-scheduler task named after it, and each task an instance of it in
  * your `scheduled_tasks` table. Ask for every queue (register your event policies and build your process managers)
- * before reading [tasks]; register [tasks] when building the `Scheduler`; call [bind] before starting the reactor. A
+ * before reading [tasks]; register [tasks] when building the `Scheduler`; call [bind] before starting the reactor (or,
+ * in a script using `ReactionOperations`, bind a `SchedulerClient` on the same database before using it). A
  * handler exception is retried with capped exponential backoff (10 seconds doubling to an hour). A task delivered while
  * nothing is subscribed to its queue (e.g. the reactor isn't started yet) runs again after [unsubscribedRetryDelay].
  */
@@ -88,7 +89,11 @@ class DbSchedulerTaskScheduler(
             payload: String,
             at: Instant,
         ) {
-            val bound = checkNotNull(client) { "Call bind(scheduler) on DbSchedulerTaskScheduler before starting" }
+            val bound =
+                checkNotNull(client) {
+                    "DbSchedulerTaskScheduler isn't bound: call bind with your Scheduler before starting the reactor, " +
+                        "or, in a script using ReactionOperations, with a SchedulerClient on the same database"
+                }
             withContext(Dispatchers.IO) { bound.scheduleIfNotExists(TaskInstance(taskName, name, payload), at.toJavaInstant()) }
         }
 
