@@ -93,4 +93,61 @@ class OuterJoinsTest {
         assertEquals(known(), OuterJoins.nullableTables("INSERT INTO a (x) VALUES (${'$'}1) RETURNING id"))
         assertEquals(known(), OuterJoins.nullableTables("DELETE FROM a WHERE id = ${'$'}1 RETURNING id"))
     }
+
+    @Test fun `outer joins nested in the FROM are unknown`() {
+        for (sql in listOf(
+            "SELECT * FROM (a LEFT JOIN b ON a.id = b.id) JOIN c ON c.id = a.id",
+            "SELECT * FROM a JOIN (b LEFT JOIN c ON c.id = b.id) ON b.id = a.id",
+            "SELECT * FROM (SELECT * FROM x LEFT JOIN y ON y.id = x.id) s",
+        )) {
+            assertEquals(NullableTables.Unknown, OuterJoins.nullableTables(sql), sql)
+        }
+    }
+
+    @Test fun `CTEs with outer joins are unknown`() {
+        assertEquals(
+            NullableTables.Unknown,
+            OuterJoins.nullableTables("WITH x AS (SELECT a.v FROM a LEFT JOIN b ON b.id = a.id) SELECT x.v FROM x"),
+        )
+    }
+
+    @Test fun `set operations with outer joins are unknown`() {
+        assertEquals(
+            NullableTables.Unknown,
+            OuterJoins.nullableTables("(SELECT a.v FROM a LEFT JOIN b ON b.id = a.id) UNION (SELECT 1)"),
+        )
+        assertEquals(
+            NullableTables.Unknown,
+            OuterJoins.nullableTables("SELECT v FROM a UNION ALL SELECT v FROM c LEFT JOIN d ON d.id = c.id"),
+        )
+    }
+
+    @Test fun `quoted identifiers never match keywords`() {
+        assertEquals(
+            known("group"),
+            OuterJoins.nullableTables("""SELECT * FROM "order" o LEFT JOIN "group" g ON g.id = o.g"""),
+        )
+    }
+
+    @Test fun `IS DISTINCT FROM beside an outer join is unknown`() {
+        assertEquals(
+            NullableTables.Unknown,
+            OuterJoins.nullableTables("SELECT a IS DISTINCT FROM b FROM t RIGHT JOIN u ON true"),
+        )
+    }
+
+    @Test fun `DML with an outer join is unknown`() {
+        assertEquals(
+            NullableTables.Unknown,
+            OuterJoins.nullableTables("DELETE FROM a USING b RIGHT JOIN c ON c.id = b.id WHERE a.id = c.id"),
+        )
+    }
+
+    @Test fun `left as a function is not a join`() {
+        assertEquals(known(), OuterJoins.nullableTables("SELECT left(b.k, 1) FROM a JOIN b ON left(a.k, 1) = b.k JOIN c ON true"))
+    }
+
+    @Test fun `FROM ONLY names the table`() {
+        assertEquals(known("b"), OuterJoins.nullableTables("SELECT * FROM ONLY a LEFT JOIN ONLY b ON b.id = a.id"))
+    }
 }

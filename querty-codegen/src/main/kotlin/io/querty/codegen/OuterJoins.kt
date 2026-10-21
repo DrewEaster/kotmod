@@ -17,14 +17,28 @@ object OuterJoins {
         "for", "returning",
     )
 
-    private class Token(val text: String, val isWord: Boolean)
+    private class Token(val text: String, val isWord: Boolean, val quoted: Boolean = false) {
+        /** The lower-cased text if this is an unquoted word (a possible keyword), otherwise null. */
+        val keyword: String? = if (isWord && !quoted) text.lowercase() else null
+    }
+
+    private val unsafeAnywhere = setOf("with", "union", "intersect", "except")
 
     fun nullableTables(sql: String): NullableTables {
-        val from = fromClause(tokenize(sql))
+        val all = tokenize(sql)
+        val outerJoins = all.indices.count { isOuterJoin(all, it) }
+        if (outerJoins == 0) return NullableTables.Known(emptySet())
+        // Only a plain SELECT with one top-level FROM is attributed precisely; anything else is Unknown.
+        if (all.first().keyword != "select") return NullableTables.Unknown
+        if (all.any { it.keyword in unsafeAnywhere }) return NullableTables.Unknown
+        if (all.indices.any { all[it].keyword == "distinct" && all.getOrNull(it + 1)?.keyword == "from" }) {
+            return NullableTables.Unknown
+        }
+        val from = fromClause(all)
         val nullable = mutableSetOf<String>()
         val tables = mutableListOf<String>()
         var complex = false
-        var outer = false
+        var outer = 0
         var expectTable = true
         var inCondition = false
         var kind: String? = null
@@ -32,7 +46,7 @@ object OuterJoins {
         var i = 0
         while (i < from.size) {
             val token = from[i++]
-            val word = if (token.isWord) token.text.lowercase() else null
+            val word = token.keyword
             when {
                 token.text == "(" -> {
                     if (depth == 0 && !inCondition) complex = true
@@ -45,7 +59,8 @@ object OuterJoins {
                     inCondition = false
                 }
                 word == "lateral" -> complex = true
-                word == "left" || word == "right" || word == "full" -> kind = word
+                (word == "left" || word == "right" || word == "full") && isOuterJoin(from, i - 1) -> kind = word
+                word == "only" && expectTable -> {}
                 word == "join" -> {
                     expectTable = true
                     inCondition = false
@@ -68,15 +83,22 @@ object OuterJoins {
                             nullable += tables
                         }
                     }
-                    if (kind != null) outer = true
+                    if (kind != null) outer++
                     kind = null
                     tables += name
                 }
                 else -> {}
             }
         }
-        if (!outer) return NullableTables.Known(emptySet())
-        return if (complex) NullableTables.Unknown else NullableTables.Known(nullable)
+        // Every outer join must have been seen at depth 0 of this FROM; otherwise one is hidden somewhere we do not look.
+        return if (complex || outer != outerJoins) NullableTables.Unknown else NullableTables.Known(nullable)
+    }
+
+    /** True if token [i] is `LEFT`/`RIGHT`/`FULL` followed by `JOIN` or `OUTER JOIN`, all unquoted. */
+    private fun isOuterJoin(tokens: List<Token>, i: Int): Boolean {
+        if (tokens[i].keyword !in setOf("left", "right", "full")) return false
+        val next = tokens.getOrNull(i + 1)?.keyword
+        return next == "join" || (next == "outer" && tokens.getOrNull(i + 2)?.keyword == "join")
     }
 
     /** The tokens of the first parenthesis-depth-0 FROM, up to the keyword that ends the clause. */
@@ -86,7 +108,7 @@ object OuterJoins {
         for ((index, token) in tokens.withIndex()) {
             if (token.text == "(") depth++
             else if (token.text == ")") depth--
-            else if (depth == 0 && token.isWord && token.text.equals("from", ignoreCase = true)) {
+            else if (depth == 0 && token.keyword == "from") {
                 start = index + 1
                 break
             }
@@ -98,7 +120,7 @@ object OuterJoins {
             if (token.text == "(") depth++
             else if (token.text == ")") depth--
             else if (depth == 0 && token.text == ";") break
-            else if (depth == 0 && token.isWord && token.text.lowercase() in fromEnd) break
+            else if (depth == 0 && token.keyword in fromEnd) break
             clause += token
         }
         return clause
@@ -113,7 +135,7 @@ object OuterJoins {
             val after = SqlLexer.skipNonCode(sql, i)
             when {
                 c == '"' && after > i -> {
-                    tokens += Token(sql.substring(i + 1, (after - 1).coerceAtLeast(i + 1)).replace("\"\"", "\""), true)
+                    tokens += Token(sql.substring(i + 1, (after - 1).coerceAtLeast(i + 1)).replace("\"\"", "\""), true, quoted = true)
                     i = after
                 }
                 after > i -> i = after
