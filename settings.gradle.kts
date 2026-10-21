@@ -10,4 +10,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "kotmod-root"
 
-include("kotmod", "kotmod-sqldelight", "kotmod-db-scheduler", "examples")
+include("kotmod", "querty","kotmod-sqldelight", "kotmod-db-scheduler", "examples")
