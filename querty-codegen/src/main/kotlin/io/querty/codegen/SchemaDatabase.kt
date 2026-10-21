@@ -2,6 +2,7 @@ package io.querty.codegen
 
 import org.postgresql.util.PSQLException
 import org.testcontainers.postgresql.PostgreSQLContainer
+import java.math.BigInteger
 import java.nio.file.Path
 import java.sql.Connection
 import java.sql.DriverManager
@@ -31,12 +32,12 @@ object SchemaScripts {
             }
         }
 
-    private fun versionOf(path: Path): List<Int>? =
-        versioned.matchEntire(path.name)?.groupValues?.get(1)?.split('.', '_')?.map { it.toInt() }
+    private fun versionOf(path: Path): List<BigInteger>? =
+        versioned.matchEntire(path.name)?.groupValues?.get(1)?.split('.', '_')?.map { it.toBigInteger() }
 
-    private fun compareVersions(a: List<Int>, b: List<Int>): Int {
+    private fun compareVersions(a: List<BigInteger>, b: List<BigInteger>): Int {
         for (i in 0 until maxOf(a.size, b.size)) {
-            val c = (a.getOrElse(i) { 0 }).compareTo(b.getOrElse(i) { 0 })
+            val c = (a.getOrElse(i) { BigInteger.ZERO }).compareTo(b.getOrElse(i) { BigInteger.ZERO })
             if (c != 0) return c
         }
         return 0

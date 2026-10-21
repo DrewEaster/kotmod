@@ -37,6 +37,18 @@ class SchemaScriptsTest {
     }
 
     @Test
+    fun `timestamp style versions order without overflow`() {
+        file(dir, "V20240201090000__b.sql")
+        file(dir, "V20240101120000__a.sql")
+        file(dir, "V2__c.sql")
+
+        assertEquals(
+            listOf("V2__c.sql", "V20240101120000__a.sql", "V20240201090000__b.sql"),
+            SchemaScripts.ordered(listOf(dir)).map { it.name },
+        )
+    }
+
+    @Test
     fun `explicit files keep their position relative to directories`() {
         val first = dir.resolve("a").also { it.createDirectories() }
         val second = dir.resolve("b").also { it.createDirectories() }
