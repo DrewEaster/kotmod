@@ -213,7 +213,7 @@ Base mapping from Postgres types (as reported by describe) to Kotlin (*my call*)
 | `uuid` | `java.util.UUID` |
 | `bytea` | `ByteArray` |
 | `json`, `jsonb` | `String` |
-| one-dimensional arrays of the above | `List<T?>` in results, `List<T>` in parameters |
+| one-dimensional arrays of the above, except `bytea` | `List<T?>` in results, `List<T>` in parameters |
 
 Array result elements are nullable because Postgres can't say otherwise; there is no element-level
 override in v1 (*my call*). Any other type is a generation error naming the file, query and column, telling the user to cast it in SQL

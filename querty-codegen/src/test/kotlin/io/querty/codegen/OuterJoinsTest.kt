@@ -54,6 +54,13 @@ class OuterJoinsTest {
         )
     }
 
+    @Test fun `rollup, cube and grouping sets are unknown, even without an outer join`() {
+        assertEquals(NullableTables.Unknown, OuterJoins.nullableTables("select s, count(*) from t group by rollup(s)"))
+        assertEquals(NullableTables.Unknown, OuterJoins.nullableTables("SELECT a, b, count(*) FROM t GROUP BY CUBE (a, b)"))
+        assertEquals(NullableTables.Unknown, OuterJoins.nullableTables("SELECT a, count(*) FROM t GROUP BY GROUPING SETS ((a), ())"))
+        assertEquals(known(), OuterJoins.nullableTables("SELECT \"rollup\", 'cube' FROM t -- grouping sets"))
+    }
+
     @Test fun `a subquery without an outer join is not unknown`() {
         assertEquals(known(), OuterJoins.nullableTables("SELECT * FROM (SELECT 1) x"))
     }

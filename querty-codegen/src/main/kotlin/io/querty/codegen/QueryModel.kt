@@ -58,7 +58,16 @@ object QueryModelBuilder {
                 error(def.line, "Parameter '$name' has unsupported type ${type.name}; cast it in SQL (e.g. :$name::text)")
                 return@mapNotNull null
             }
-            ParamModel(name, Naming.propertyName(name), type, base, def.types[name], nullable = name in def.nullable)
+            val kotlinName = Naming.propertyName(name)
+            if (!Naming.isValid(kotlinName)) {
+                error(def.line, "Parameter '$name' needs a name that is a valid Kotlin name")
+                return@mapNotNull null
+            }
+            ParamModel(name, kotlinName, type, base, def.types[name], nullable = name in def.nullable)
+        }
+        params.groupBy { it.kotlinName }.filterValues { it.size > 1 }.forEach { (kotlinName, same) ->
+            val names = same.joinToString(" and ") { "'${it.sqlName}'" }
+            error(def.line, "Parameters $names both become '$kotlinName' in Kotlin; rename one of them")
         }
 
         val described = description.columns
@@ -80,10 +89,19 @@ object QueryModelBuilder {
                 error(def.line, "Column '${column.label}' has unsupported type ${column.type.name}; cast it in SQL (e.g. ${column.label}::text)")
                 return@mapNotNull null
             }
+            val kotlinName = Naming.propertyName(column.label)
+            if (!Naming.isValid(kotlinName)) {
+                error(def.line, "Column '${column.label}' needs an alias that is a valid Kotlin name")
+                return@mapNotNull null
+            }
             val notNull = column.label in def.notNull ||
                 (column.baseTable != null && column.baseNotNull && outerJoined is NullableTables.Known && column.baseTable !in outerJoined.tables)
-            ColumnModel(column.label, Naming.propertyName(column.label), column.type, base, def.types[column.label], nullable = !notNull)
+            ColumnModel(column.label, kotlinName, column.type, base, def.types[column.label], nullable = !notNull)
         }.takeIf { def.shape != Shape.AFFECTED }.orEmpty()
+        columns.distinctBy { it.label }.groupBy { it.kotlinName }.filterValues { it.size > 1 }.forEach { (kotlinName, same) ->
+            val labels = same.joinToString(" and ") { "'${it.label}'" }
+            error(def.line, "Columns $labels both become '$kotlinName' in Kotlin; alias one of them")
+        }
 
         val labels = described.map { it.label }.toSet()
         val paramNames = rewritten.paramNames.toSet()

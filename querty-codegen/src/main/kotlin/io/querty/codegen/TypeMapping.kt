@@ -27,9 +27,15 @@ object TypeMapping {
         "jsonb" to BaseType("String", "string"),
     )
 
+    /** Element types that cannot be arrays: pgjdbc cannot bind a `bytea[]` parameter. */
+    private val notInArrays = setOf("bytea")
+
     /** The mapping for [type]; for an array type, its element's mapping with `readCall = "list"`. Null if unsupported. */
     fun base(type: PgType): BaseType? {
-        if (type.isArray) return scalars[type.elementType.name]?.copy(readCall = "list")
+        if (type.isArray) {
+            if (type.elementType.name in notInArrays) return null
+            return scalars[type.elementType.name]?.copy(readCall = "list")
+        }
         return scalars[type.name]
     }
 }

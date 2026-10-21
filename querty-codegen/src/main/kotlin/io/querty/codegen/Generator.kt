@@ -92,8 +92,26 @@ object Generator {
         parsed.filter { it.queries.isNotEmpty() }.groupBy { outputPath(it.path) }.values.filter { it.size > 1 }.forEach { clash ->
             clash.drop(1).forEach { errors += QuertyError(it.path, 1, "Generates the same file as ${clash.first().path}; rename one of them") }
         }
+        errors += objectClashes(parsed)
         if (errors.isNotEmpty()) throw QuertyException(errors)
         return parsed
+    }
+
+    /** Queries in one package whose objects would have the same name; an error at each later query. */
+    private fun objectClashes(parsed: List<ParsedFile>): List<QuertyError> {
+        val first = mutableMapOf<Pair<String, String>, QueryDef>()
+        return parsed.filter { '/' in it.path }.flatMap { file ->
+            val packageName = file.path.substringBeforeLast('/').replace('/', '.')
+            file.queries.mapNotNull { query ->
+                val objectName = Naming.objectName(query.name)
+                val other = first.putIfAbsent(packageName to objectName, query) ?: return@mapNotNull null
+                QuertyError(
+                    query.body.file,
+                    query.line,
+                    "Query '${query.name}' generates object $objectName in package $packageName, as does ${other.body.file}:${other.line}; rename one of them",
+                )
+            }
+        }
     }
 
     /** `shop/orders.sql` generates `shop/OrdersQueries.kt`: the package's directory and the file's name. */

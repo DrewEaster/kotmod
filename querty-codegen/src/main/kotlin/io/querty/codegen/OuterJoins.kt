@@ -10,7 +10,10 @@ sealed interface NullableTables {
     data object Unknown : NullableTables
 }
 
-/** Finds which tables of a query's top-level FROM clause an outer join can make null. */
+/**
+ * Finds which tables of a query's top-level FROM clause an outer join can make null. ROLLUP, CUBE and GROUPING SETS
+ * also null out grouped columns, so a query using any of them is Unknown.
+ */
 object OuterJoins {
     private val fromEnd = setOf(
         "where", "group", "order", "having", "limit", "offset", "union", "intersect", "except", "window", "fetch",
@@ -26,6 +29,7 @@ object OuterJoins {
 
     fun nullableTables(sql: String): NullableTables {
         val all = tokenize(sql)
+        if (all.indices.any { isGroupingSet(all, it) }) return NullableTables.Unknown
         val outerJoins = all.indices.count { isOuterJoin(all, it) }
         if (outerJoins == 0) return NullableTables.Known(emptySet())
         // Only a plain SELECT with one top-level FROM is attributed precisely; anything else is Unknown.
@@ -92,6 +96,13 @@ object OuterJoins {
         }
         // Every outer join must have been seen at depth 0 of this FROM; otherwise one is hidden somewhere we do not look.
         return if (complex || outer != outerJoins) NullableTables.Unknown else NullableTables.Known(nullable)
+    }
+
+    /** True if token [i] is an unquoted `ROLLUP` or `CUBE`, or starts an unquoted `GROUPING SETS`. */
+    private fun isGroupingSet(tokens: List<Token>, i: Int): Boolean = when (tokens[i].keyword) {
+        "rollup", "cube" -> true
+        "grouping" -> tokens.getOrNull(i + 1)?.keyword == "sets"
+        else -> false
     }
 
     /** True if token [i] is `LEFT`/`RIGHT`/`FULL` followed by `JOIN` or `OUTER JOIN`, all unquoted. */

@@ -40,5 +40,6 @@ class TypeMappingTest {
     @Test fun `unsupported types map to null`() {
         assertNull(TypeMapping.base(PgType("xid8")))
         assertNull(TypeMapping.base(PgType("_xid8")))
+        assertNull(TypeMapping.base(PgType("_bytea")))
     }
 }

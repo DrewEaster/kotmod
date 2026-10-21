@@ -133,6 +133,19 @@ class GeneratorIntegrationTest {
     }
 
     @Test
+    fun `the same object name in two files of one package is an error at the second query`() {
+        copyFixture()
+        sql.resolve("shop/zz.sql").writeText("-- :name q :many\nSELECT 1 AS n\n\n-- :name find-order :many\nSELECT 1 AS n\n")
+
+        val ex = assertThrows<QuertyException> { Generator.generate(config) }
+
+        assertEquals(
+            listOf(QuertyError("shop/zz.sql", 4, "Query 'find-order' generates object FindOrder in package shop, as does shop/orders.sql:6; rename one of them")),
+            ex.errors,
+        )
+    }
+
+    @Test
     fun `deleting a sql file removes its generated file on the next run`() {
         copyFixture()
         Generator.generate(config)

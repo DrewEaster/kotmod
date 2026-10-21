@@ -157,4 +157,34 @@ class QueryModelBuilderTest {
         val m = model("-- :name q :affected\n-- :nullable b\nUPDATE t SET a = :a, b = :b", listOf("text", "text"))
         assertEquals(listOf(false, true), m.params.map { it.nullable })
     }
+    @Test fun `a column label that is no valid Kotlin name is an error`() {
+        val error = errorOf("\n-- :name q :many\nSELECT 1", columns = listOf(col("?column?", "int4")))
+        assertEquals(QuertyError("orders.sql", 2, "Column '?column?' needs an alias that is a valid Kotlin name"), error)
+        val spaced = errorOf("-- :name q :many\nSELECT 1 AS \"order id\"", columns = listOf(col("order id", "int4")))
+        assertEquals("Column 'order id' needs an alias that is a valid Kotlin name", spaced.message)
+    }
+
+    @Test fun `a keyword column label is fine, escaped`() {
+        assertEquals("`class`", model("-- :name q :many\nSELECT 1 AS class", columns = listOf(col("class", "int4"))).columns.single().kotlinName)
+    }
+
+    @Test fun `a param that is no valid Kotlin name is an error`() {
+        val error = errorOf("-- :name q :affected\nDELETE FROM t WHERE id = :_", listOf("int4"))
+        assertEquals(QuertyError("orders.sql", 1, "Parameter '_' needs a name that is a valid Kotlin name"), error)
+    }
+
+    @Test fun `column labels with the same Kotlin name are an error`() {
+        val error = errorOf(
+            "-- :name q :many\nSELECT placed_at, \"placedAt\" FROM t",
+            columns = listOf(col("placed_at", "int4"), col("placedAt", "int4")),
+        )
+        assertEquals("Columns 'placed_at' and 'placedAt' both become 'placedAt' in Kotlin; alias one of them", error.message)
+        val underscores = errorOf("-- :name q :many\nSELECT a_b, a__b FROM t", columns = listOf(col("a_b", "int4"), col("a__b", "int4")))
+        assertEquals("Columns 'a_b' and 'a__b' both become 'aB' in Kotlin; alias one of them", underscores.message)
+    }
+
+    @Test fun `params with the same Kotlin name are an error`() {
+        val error = errorOf("-- :name q :affected\nUPDATE t SET a = :a_b, b = :a__b", listOf("int4", "int4"))
+        assertEquals(QuertyError("orders.sql", 1, "Parameters 'a_b' and 'a__b' both become 'aB' in Kotlin; rename one of them"), error)
+    }
 }
