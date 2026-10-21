@@ -48,7 +48,7 @@ object SqlFileParser {
             }
             val source = SourceText(path, first, sql)
             if (item.isSnippet) {
-                snippets += SnippetDef(item.name, source)
+                snippets += SnippetDef(item.name, source, item.line)
             } else {
                 val shape = item.shape ?: return
                 queries += QueryDef(

@@ -30,7 +30,8 @@ data class QueryDef(
     fun lineOf(directive: String, name: String): Int = directiveLines["$directive $name"] ?: line
 }
 
-data class SnippetDef(val name: String, val body: SourceText)
+/** [line] is the file line of the snippet's `-- :snippet` directive. */
+data class SnippetDef(val name: String, val body: SourceText, val line: Int)
 
 data class ParsedFile(
     val path: String,

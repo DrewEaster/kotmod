@@ -35,6 +35,12 @@ class SqlFileParserTest {
         assertEquals("o.id, o.customer_id, o.status, o.item, o.reason, o.placed_at", file.snippets.single().body.text)
     }
 
+    @Test fun `a snippet records its directive line`() {
+        val snippet = SqlFileParser.parse("q.sql", "-- :name q :many\nSELECT 1\n\n-- :snippet cols\n\nx, y").snippets.single()
+        assertEquals(4, snippet.line)
+        assertEquals(6, snippet.body.firstLine)
+    }
+
     @Test fun `parses doc lines, imports, not-null and nullable`() {
         val q = SqlFileParser.parse(
             "q.sql",

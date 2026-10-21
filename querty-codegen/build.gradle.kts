@@ -8,4 +8,6 @@ dependencies {
     implementation(project(":querty"))
     implementation("org.testcontainers:testcontainers-postgresql:2.0.5")
     implementation("org.postgresql:postgresql:42.7.13")
+
+    "integrationTestImplementation"("org.jetbrains.kotlin:kotlin-compiler-embeddable:2.4.20")
 }

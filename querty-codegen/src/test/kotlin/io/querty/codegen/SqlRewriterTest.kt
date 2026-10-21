@@ -9,7 +9,7 @@ private fun query(sql: String, file: String = "q.sql", firstLine: Int = 1) =
     QueryDef("q", Shape.MANY, null, emptyMap(), emptyList(), emptySet(), emptySet(), SourceText(file, firstLine, sql), 1, emptyMap())
 
 private fun snippet(name: String, sql: String, file: String = "q.sql", firstLine: Int = 1) =
-    name to SnippetDef(name, SourceText(file, firstLine, sql))
+    name to SnippetDef(name, SourceText(file, firstLine, sql), firstLine)
 
 private fun rewrite(sql: String, vararg snippets: Pair<String, SnippetDef>) = SqlRewriter.rewrite(query(sql), mapOf(*snippets))
 
