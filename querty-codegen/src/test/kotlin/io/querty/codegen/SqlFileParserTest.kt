@@ -55,6 +55,17 @@ class SqlFileParserTest {
         assertEquals("SELECT 1", q.body.text)
     }
 
+    @Test fun `records the lines of the name and of each directive`() {
+        val q = SqlFileParser.parse(
+            "q.sql",
+            "\n-- :name x :many\n-- :type id OrderId\n-- :not-null total\n-- :nullable note\nSELECT 1",
+        ).queries.single()
+        assertEquals(2, q.line)
+        assertEquals(mapOf("type id" to 3, "not-null total" to 4, "nullable note" to 5), q.directiveLines)
+        assertEquals(4, q.lineOf("not-null", "total"))
+        assertEquals(2, q.lineOf("type", "other"))
+    }
+
     @Test fun `type with enum flag`() {
         val q = SqlFileParser.parse("q.sql", "-- :name x :one\n-- :type status OrderStatus enum\nSELECT 1").queries.single()
         assertEquals(TypeDecl("OrderStatus", isEnum = true), q.types["status"])

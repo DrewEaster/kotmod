@@ -10,6 +10,10 @@ data class TypeDecl(val kotlinType: String, val isEnum: Boolean)
  */
 data class SourceText(val file: String, val firstLine: Int, val text: String)
 
+/**
+ * [line] is the file line of the query's `-- :name` directive. [directiveLines] gives the line of each
+ * `:type`, `:not-null` and `:nullable` directive, keyed by the directive and the name it is about, like `"type id"`.
+ */
 data class QueryDef(
     val name: String,
     val shape: Shape,
@@ -19,7 +23,12 @@ data class QueryDef(
     val notNull: Set<String>,
     val nullable: Set<String>,
     val body: SourceText,
-)
+    val line: Int,
+    val directiveLines: Map<String, Int>,
+) {
+    /** The line of the [directive] about [name], or of the `-- :name` line if there is none. */
+    fun lineOf(directive: String, name: String): Int = directiveLines["$directive $name"] ?: line
+}
 
 data class SnippetDef(val name: String, val body: SourceText)
 

@@ -6,7 +6,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 private fun query(sql: String, file: String = "q.sql", firstLine: Int = 1) =
-    QueryDef("q", Shape.MANY, null, emptyMap(), emptyList(), emptySet(), emptySet(), SourceText(file, firstLine, sql))
+    QueryDef("q", Shape.MANY, null, emptyMap(), emptyList(), emptySet(), emptySet(), SourceText(file, firstLine, sql), 1, emptyMap())
 
 private fun snippet(name: String, sql: String, file: String = "q.sql", firstLine: Int = 1) =
     name to SnippetDef(name, SourceText(file, firstLine, sql))

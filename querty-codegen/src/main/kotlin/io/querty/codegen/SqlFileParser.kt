@@ -13,6 +13,7 @@ object SqlFileParser {
         val imports = mutableListOf<String>()
         val notNull = linkedSetOf<String>()
         val nullable = linkedSetOf<String>()
+        val directiveLines = linkedMapOf<String, Int>()
         val body = mutableListOf<String>()
         var bodyFirstLine = 0
         var broken = false
@@ -59,6 +60,8 @@ object SqlFileParser {
                     item.notNull,
                     item.nullable,
                     source,
+                    item.line,
+                    item.directiveLines,
                 )
             }
         }
@@ -105,11 +108,16 @@ object SqlFileParser {
                         error(line, "Duplicate ':type' for '${parts[0]}'")
                     } else {
                         item.types[parts[0]] = TypeDecl(parts[1], parts.size == 3)
+                        item.directiveLines["type ${parts[0]}"] = line
                     }
                 }
                 "import" -> if (args.isBlank()) error(line, "Expected ':import <fully.qualified.Name>'") else item.imports += args
-                "not-null" -> if (args.isBlank()) error(line, "Expected ':not-null <column>'") else item.notNull += args
-                "nullable" -> if (args.isBlank()) error(line, "Expected ':nullable <param>'") else item.nullable += args
+                "not-null", "nullable" -> if (args.isBlank()) {
+                    error(line, if (keyword == "not-null") "Expected ':not-null <column>'" else "Expected ':nullable <param>'")
+                } else {
+                    (if (keyword == "not-null") item.notNull else item.nullable) += args
+                    item.directiveLines.putIfAbsent("$keyword $args", line)
+                }
                 else -> error(line, "Unknown directive ':$keyword'")
             }
         }
