@@ -55,9 +55,12 @@ order?.reason   // String?, because reason is nullable
 
 ## Status
 
-Querty is new and lives in the Kotmod repo for now. It is not published to Maven Central yet, so
-use it as a project dependency from inside this build. Only Postgres is supported, and the only
-engine so far is blocking JDBC (`querty-jdbc`).
+Querty is new (0.1.0) and lives in the Kotmod repo for now, versioned independently of Kotmod. It is
+published to Maven Central as `io.github.dreweaster:querty`, `querty-jdbc` and `querty-codegen`.
+Only Postgres is supported, and the only engine so far is blocking JDBC (`querty-jdbc`). It is
+pre-1.0: the API may change between releases.
+
+Requirements: a JVM 25 toolchain and Kotlin 2.4, plus Docker wherever you run the generator.
 
 ## Modules
 
@@ -80,9 +83,10 @@ In your module's `build.gradle.kts`:
 val querty by configurations.creating
 
 dependencies {
-    implementation(project(":querty"))
-    implementation(project(":querty-jdbc"))
-    querty(project(":querty-codegen"))
+    implementation("io.github.dreweaster:querty:0.1.0")
+    implementation("io.github.dreweaster:querty-jdbc:0.1.0")
+    implementation("org.postgresql:postgresql:42.7.13") // your JDBC driver
+    querty("io.github.dreweaster:querty-codegen:0.1.0")
 }
 
 // Generated code is committed; compile it with the rest of main.
@@ -485,7 +489,7 @@ domain:
 
 - **Postgres only, blocking JDBC only.** The runtime is designed for other engines, such as R2DBC or
   Vert.x with `suspend`/`Flow`, but none exist yet.
-- **Not published, and no Gradle plugin yet.** The `JavaExec` tasks above stand in for a plugin.
+- **No Gradle plugin yet.** The `JavaExec` tasks above stand in for one.
 - **No batch execution.** Run a statement once per row, or write a multi-row `INSERT … SELECT
   unnest(…)`.
 - **Outer-join detection is cautious.** If an outer join appears anywhere Querty can't attribute it

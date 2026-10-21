@@ -1,5 +1,5 @@
 plugins {
-    id("kotmod.library")
+    id("kotmod.published")
 }
 
 description = "Querty runtime: typed queries generated from plain SQL files."

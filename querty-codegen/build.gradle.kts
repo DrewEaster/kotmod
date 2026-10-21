@@ -1,5 +1,5 @@
 plugins {
-    id("kotmod.library")
+    id("kotmod.published")
 }
 
 description = "Querty code generator: reads .sql files, asks Postgres to describe them and emits typed Kotlin."

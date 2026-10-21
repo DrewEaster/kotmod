@@ -1,5 +1,5 @@
 plugins {
-    id("kotmod.library")
+    id("kotmod.published")
 }
 
 description = "Querty blocking JDBC engine: runs Querty statements on a java.sql.Connection."
