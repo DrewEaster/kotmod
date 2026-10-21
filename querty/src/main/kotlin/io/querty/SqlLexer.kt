@@ -1,7 +1,7 @@
-package io.querty.codegen
+package io.querty
 
-/** Character-level SQL scanning: finds the spans where SQL text is not code. */
-internal object SqlLexer {
+/** Finds the spans of SQL text that are not code; shared by the runtime and Querty's code generator. */
+object SqlLexer {
     /**
      * If a string literal, quoted identifier, comment or dollar-quoted string starts at [i], returns the
      * index just past it (the end of [text] when it is unterminated); otherwise returns [i].

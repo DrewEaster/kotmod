@@ -79,6 +79,14 @@ class SqlRewriterTest {
         assertEquals("q.sql" to 1, r.locateServerOffset(server.indexOf("\$2") + 1))
     }
 
+    @Test fun `server offsets after a question mark literal map to the right line`() {
+        val r = rewrite("SELECT '?', :a\n, nope")
+        val server = "SELECT '?', \$1\n, nope"
+        assertEquals("SELECT '?', ?\n, nope", r.positionalSql())
+        assertEquals("q.sql" to 2, r.locateServerOffset(server.indexOf("nope")))
+        assertEquals("q.sql" to 1, r.locateServerOffset(server.indexOf("\n") - 1))
+    }
+
     @Test fun `server offsets account for two-digit placeholder numbers`() {
         val r = rewrite((1..10).joinToString(", ", "SELECT ") { ":a" } + ",\nnope")
         val server = (1..10).joinToString(", ", "SELECT ") { "\$$it" } + ",\nnope"

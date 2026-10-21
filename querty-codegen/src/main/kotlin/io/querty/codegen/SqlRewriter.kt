@@ -1,6 +1,7 @@
 package io.querty.codegen
 
 import io.querty.PlaceholderStyle
+import io.querty.SqlLexer
 import io.querty.SqlTemplate
 
 /**
@@ -31,7 +32,9 @@ class SourceMap internal constructor(private val segments: List<Segment>) {
 
 /**
  * Maps a 0-based [offset] into the SQL pgjdbc sends for [RewrittenQuery.positionalSql] (its k-th `?` sent as
- * `$k` and `??` as `?`), which is what Postgres error positions count in, back to a file and line.
+ * `$k` and `??` in code as `?`), which is what Postgres error positions count in, back to a file and line.
+ * Positional rendering doubles exactly the `?`s in code and pgjdbc collapses exactly those, so each part
+ * reaches the server as its own text.
  */
 fun RewrittenQuery.locateServerOffset(offset: Int): Pair<String, Int> {
     var server = 0

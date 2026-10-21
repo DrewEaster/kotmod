@@ -24,6 +24,13 @@ class SqlTemplateTest {
             SqlTemplate(listOf("SELECT '{}'::jsonb ? 'a' AND ", ""), listOf(0)).render(PlaceholderStyle.POSITIONAL),
         )
 
+    @Test fun `positional rendering leaves question marks in quotes and comments alone`() =
+        assertEquals(
+            "SELECT '?', \"a?\", \$q\$?\$q\$, x ?? 'k', ? -- ?\n/* ? */",
+            SqlTemplate(listOf("SELECT '?', \"a?\", \$q\$?\$q\$, x ? 'k', ", " -- ?\n/* ? */"), listOf(0))
+                .render(PlaceholderStyle.POSITIONAL),
+        )
+
     @Test fun `mismatched parts and refs are rejected`() {
         assertFailsWith<IllegalArgumentException> { SqlTemplate(listOf("a"), listOf(0)) }
     }

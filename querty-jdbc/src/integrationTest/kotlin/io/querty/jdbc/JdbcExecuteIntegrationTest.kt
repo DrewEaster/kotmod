@@ -214,6 +214,12 @@ class JdbcExecuteIntegrationTest {
     }
 
     @Test
+    fun `question marks in string literals reach the server unchanged`() {
+        val query = OneQuery(sql("SELECT '?'::text"), emptyList()) { notNull(it.string(0), "r") }
+        connection().use { assertEquals("?", query.execute(it)) }
+    }
+
+    @Test
     fun `joins the caller's transaction`() {
         connection().use { conn ->
             conn.autoCommit = false

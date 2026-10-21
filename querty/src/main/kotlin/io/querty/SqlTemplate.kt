@@ -19,9 +19,24 @@ class SqlTemplate(val parts: List<String>, val refs: List<Int>) {
 
     fun render(style: PlaceholderStyle): String = buildString {
         parts.forEachIndexed { k, part ->
-            append(if (style == PlaceholderStyle.POSITIONAL) part.replace("?", "??") else part)
+            if (style == PlaceholderStyle.POSITIONAL) appendEscaped(part) else append(part)
             if (k < refs.size) {
                 if (style == PlaceholderStyle.NUMBERED) append('$').append(refs[k] + 1) else append('?')
+            }
+        }
+    }
+
+    /** Doubles each `?` in code, as JDBC expects; a `?` in a string, quoted identifier or comment stays single. */
+    private fun StringBuilder.appendEscaped(part: String) {
+        var i = 0
+        while (i < part.length) {
+            val end = SqlLexer.skipNonCode(part, i)
+            if (end > i) {
+                append(part, i, end)
+                i = end
+            } else {
+                append(if (part[i] == '?') "??" else part[i].toString())
+                i++
             }
         }
     }
