@@ -208,6 +208,59 @@ class JdbcExecuteIntegrationTest {
     }
 
     @Test
+    fun `arrays of every supported element type round-trip as their Kotlin types`() {
+        val cases = listOf(
+            PgType.TEXT to listOf("a", null, "b"),
+            PgType.VARCHAR to listOf("a", "b"),
+            PgType.BPCHAR to listOf("a", "b"),
+            PgType.NAME to listOf("a", "b"),
+            PgType.INT2 to listOf(1, null, -2),
+            PgType.INT4 to listOf(1, null, -2),
+            PgType.INT8 to listOf(9_000_000_000L, null),
+            PgType.BOOL to listOf(true, null, false),
+            PgType.FLOAT4 to listOf(1.5f, null),
+            PgType.FLOAT8 to listOf(1.5, null),
+            PgType.NUMERIC to listOf(BigDecimal("12345.6789"), null),
+            PgType.TIMESTAMP to listOf(LocalDateTime.of(2026, 10, 21, 12, 30, 15, 250_000_000), null),
+            PgType.DATE to listOf(LocalDate.of(2026, 10, 21), null),
+            PgType.UUID to listOf(UUID.randomUUID(), null),
+            PgType.JSON to listOf("""{"a": 1}""", null),
+            PgType.JSONB to listOf("""{"a": 1}""", null),
+        )
+        val failures = connection().use { conn ->
+            cases.mapNotNull { (type, values) ->
+                val query = OneQuery(
+                    SqlTemplate(listOf("SELECT ", "::${type.name}[]"), listOf(0)),
+                    listOf(Param("xs", values, PgType("_${type.name}"))),
+                ) { it.list(0, type) }
+                val read = runCatching { query.execute(conn) }.getOrElse { return@mapNotNull "${type.name}: $it" }
+                val classes = read?.map { v -> v?.let { it::class } }
+                "${type.name}: $read ($classes)".takeIf { read != values || classes != values.map { v -> v?.let { it::class } } }
+            }
+        }
+        assertEquals(emptyList(), failures)
+    }
+
+    @Test
+    fun `one and optional detect a second row without mapping it`() {
+        connection().use { conn ->
+            listOf(1, 2).forEach { insert(Everything(id = it)).execute(conn) }
+            fun throwingOnSecondCall(): (RowReader) -> Int {
+                var calls = 0
+                return { r ->
+                    check(++calls == 1) { "mapped a second row" }
+                    notNull(r.int(0), "id")
+                }
+            }
+            val sql = sql("SELECT id FROM everything ORDER BY id")
+            val one = assertFailsWith<UnexpectedRowCountException> { OneQuery(sql, emptyList(), throwingOnSecondCall()).execute(conn) }
+            assertEquals(2, one.actual)
+            val optional = assertFailsWith<UnexpectedRowCountException> { OptionalQuery(sql, emptyList(), throwingOnSecondCall()).execute(conn) }
+            assertEquals(2, optional.actual)
+        }
+    }
+
+    @Test
     fun `literal question-mark operator survives`() {
         val query = OneQuery(sql("""SELECT '{"a":1}'::jsonb ? 'a'"""), emptyList()) { notNull(it.boolean(0), "r") }
         connection().use { assertTrue(query.execute(it)) }

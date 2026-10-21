@@ -31,14 +31,22 @@ internal class JdbcRowReader(private val rs: ResultSet) : RowReader {
         val array = rs.getArray(i + 1) ?: return null
         try {
             val elements = array.array as Array<*>
-            return elements.map { if (elementType == PgType.TIMESTAMPTZ) toInstant(it) else it }
+            return elements.map { it?.let { element(elementType, it) } }
         } finally {
             array.free()
         }
     }
 
-    private fun toInstant(element: Any?): Instant? = when (element) {
-        null -> null
+    /** pgjdbc gives array elements its default classes; convert those that differ from the types generated code casts to. */
+    private fun element(elementType: PgType, element: Any): Any = when (elementType) {
+        PgType.TIMESTAMPTZ -> toInstant(element)
+        PgType.INT2 -> (element as Number).toInt()
+        PgType.DATE -> (element as java.sql.Date).toLocalDate()
+        PgType.TIMESTAMP -> (element as Timestamp).toLocalDateTime()
+        else -> element
+    }
+
+    private fun toInstant(element: Any): Instant = when (element) {
         is Timestamp -> element.toInstant().toKotlinInstant()
         is OffsetDateTime -> element.toInstant().toKotlinInstant()
         else -> error("Unexpected timestamptz array element of type ${element::class.java.name}")

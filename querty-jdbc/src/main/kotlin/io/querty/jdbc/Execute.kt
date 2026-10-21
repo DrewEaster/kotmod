@@ -18,33 +18,41 @@ import java.sql.PreparedStatement
 
 /** Runs the query and returns its single row; throws [UnexpectedRowCountException] for any other count. */
 fun <R> OneQuery<R>.execute(connection: Connection): R =
-    readRows(connection, mapper, limit = 2).let { rows ->
-        if (rows.size != 1) throw UnexpectedRowCountException("exactly one", rows.size, sql)
+    readAtMostOne(connection, mapper, "exactly one").let { rows ->
+        if (rows.isEmpty()) throw UnexpectedRowCountException("exactly one", 0, sql)
         rows.single()
     }
 
 /** Runs the query and returns its row, or null when there is none; throws if there are two or more. */
 fun <R> OptionalQuery<R>.execute(connection: Connection): R? =
-    readRows(connection, mapper, limit = 2).let { rows ->
-        if (rows.size > 1) throw UnexpectedRowCountException("at most one", rows.size, sql)
-        rows.firstOrNull()
-    }
+    readAtMostOne(connection, mapper, "at most one").firstOrNull()
 
 /** Runs the query and returns all its rows in order. */
 fun <R> ManyQuery<R>.execute(connection: Connection): List<R> =
-    readRows(connection, mapper, limit = Int.MAX_VALUE)
+    prepare(connection).use { ps ->
+        ps.executeQuery().use { rs ->
+            val reader = JdbcRowReader(rs)
+            buildList { while (rs.next()) add(mapper(reader)) }
+        }
+    }
 
 /** Runs the statement and returns the number of rows it affected. */
 fun AffectedQuery.execute(connection: Connection): Long =
     prepare(connection).use { it.executeLargeUpdate() }
 
-/** Reads at most [limit] rows, so a query that must have one row stops after the second. */
-private fun <R> Statement.readRows(connection: Connection, mapper: (RowReader) -> R, limit: Int): List<R> =
+/**
+ * Maps the first row, if any, and throws if there is a second. The second row is never mapped, so a mapper that
+ * fails on it cannot hide the wrong count.
+ */
+private fun <R> Statement.readAtMostOne(connection: Connection, mapper: (RowReader) -> R, expected: String): List<R> =
     prepare(connection).use { ps ->
         ps.executeQuery().use { rs ->
-            val reader = JdbcRowReader(rs)
-            buildList {
-                while (size < limit && rs.next()) add(mapper(reader))
+            if (!rs.next()) {
+                emptyList()
+            } else {
+                val row = mapper(JdbcRowReader(rs))
+                if (rs.next()) throw UnexpectedRowCountException(expected, 2, sql)
+                listOf(row)
             }
         }
     }
